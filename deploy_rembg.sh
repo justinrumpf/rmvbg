@@ -1,20 +1,34 @@
-# Install dependencies if needed
-apt update && apt install -y git python3-pip python3-venv ffmpeg tmux
+#!/bin/bash
 
-# Go to workspace
+set -e
+
+echo "🔧 Updating system packages..."
+apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip
+
 cd /workspace
 
-# Clone your repo
-git -c credential.helper= clone https://github.com/justinrumpf/rmvbg.git
-cd rembg-server
+if [ -d "rmvbg" ]; then
+    echo "⚠️  Directory 'rmvbg' already exists. Skipping clone."
+else
+    echo "📥 Cloning repo..."
+    git -c credential.helper= clone https://github.com/justinrumpf/rmvbg.git
+fi
 
-# Create and activate virtual environment
-python3 -m venv venv
+cd rmvbg
+
+if [ ! -d "venv" ]; then
+    echo "🐍 Creating virtual environment..."
+    python3 -m venv venv
+fi
+
 source venv/bin/activate
 
-# Install Python requirements
+echo "📦 Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Start the server inside tmux to keep it alive
-tmux new-session -d -s rembg "source venv/bin/activate && uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000"
+echo "🚀 Launching server in tmux..."
+tmux kill-session -t rembg || true
+tmux new-session -d -s rembg "uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000"
+
+echo "✅ Deployment complete. Access your server on port 7000."
