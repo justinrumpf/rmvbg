@@ -16,6 +16,13 @@ fi
 
 cd rmvbg
 
+# 🔁 Prompt for Pod ID and update Python file
+read -p "🌐 Enter your RunPod Pod ID (e.g., abc123): " pod_id
+proxy_url="https://${pod_id}-7000.proxy.runpod.net"
+
+echo "🛠️  Inserting public proxy URL into rembg_queue_server.py..."
+sed -i "s|{public_url}|$proxy_url|g" rembg_queue_server.py
+
 # Create virtual environment if missing
 if [ ! -d "venv" ]; then
     echo "🐍 Creating virtual environment..."
@@ -28,11 +35,6 @@ echo "📦 Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Download the logo and store it in assets
-echo "🖼️  Downloading logo for watermarking..."
-mkdir -p /workspace/rmvbg/assets
-curl -sSL https://help.resale1.com/wp-content/uploads/2025/02/CM.png -o /workspace/rmvbg/assets/logo.png
-
 echo "🚀 Launching server in tmux..."
 tmux kill-session -t rembg 2>/dev/null || true
 tmux new-session -d -s rembg "
@@ -41,4 +43,4 @@ source venv/bin/activate && \
 uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000
 "
 
-echo "✅ Done! Your Rembg server is now running at port 7000."
+echo "✅ Done! Your Rembg server is now running at: $proxy_url"
