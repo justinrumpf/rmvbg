@@ -9,7 +9,7 @@ import asyncio, uuid, io, os, requests
 app = FastAPI()
 
 MAX_CONCURRENT_TASKS = 1
-ESTIMATED_TIME_PER_JOB = 5
+ESTIMATED_TIME_PER_JOB = 9
 PROCESSED_DIR = "/workspace/processed"
 LOGO_PATH = "/workspace/rmvbg/CM.png"  # Updated to use bundled logo
 
