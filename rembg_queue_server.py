@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from fastapi import Request
 from fastapi.staticfiles import StaticFiles
 from rembg import remove
 from PIL import Image
@@ -20,29 +21,31 @@ results = {}
 BASE_IMAGE_URL = "https://<your-pod-id>-7000.proxy.runpod.net/images"
 
 @app.post("/submit")
-async def submit_image(file: UploadFile = File(...)):
+async def submit_image(request: Request, file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
     contents = await file.read()
     await queue.put((job_id, contents))
     results[job_id] = None
 
-    # Queue position is approximate based on current size
     position = queue.qsize()
     eta_seconds = position * ESTIMATED_TIME_PER_JOB
 
+    base_url = str(request.base_url).rstrip("/")
+
     return {
         "status": "processing",
-        "image_links": [f"{BASE_IMAGE_URL}/{job_id}.png"],
+        "image_links": [f"{base_url}/images/{job_id}.png"],
         "eta": eta_seconds,
         "id": job_id
     }
 
-@app.get("/status/{job_id}")
-async def check_status(job_id: str):
-    result = results.get(job_id)
-    image_url = f"{BASE_IMAGE_URL}/{job_id}.png"
 
-    # Calculate position to return ETA if still queued
+@app.get("/status/{job_id}")
+async def check_status(request: Request, job_id: str):
+    result = results.get(job_id)
+    base_url = str(request.base_url).rstrip("/")
+    image_url = f"{base_url}/images/{job_id}.png"
+
     job_keys = list(queue._queue)
     position = next((i for i, (k, _) in enumerate(job_keys) if k == job_id), None)
     eta_seconds = (position * ESTIMATED_TIME_PER_JOB) if position is not None else 0
