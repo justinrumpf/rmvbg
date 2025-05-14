@@ -3,77 +3,390 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Batch Background Removal</title>
+  <title>Batch Background Removal v2</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <style>
+    .image-card { margin-bottom: 20px; }
+    .slider-container {
+      position: relative;
+      width: 100%; /* Or fixed size */
+      aspect-ratio: 1 / 1; /* Make it square */
+      overflow: hidden;
+      border: 1px solid #ccc;
+      cursor: col-resize;
+    }
+    .slider-container img {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain; /* Or cover, depending on desired look */
+    }
+    .slider-container .img-after {
+      clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%);
+    }
+    .img-placeholder {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #f0f0f0;
+        color: #aaa;
+        font-size: 1.2em;
+    }
+    .status-badge { font-size: 0.8em; }
+    .card-footer { background-color: #f8f9fa; }
+  </style>
 </head>
 <body class="bg-light">
   <div class="container py-5">
-    <h1 class="mb-4">Batch Image Background Removal</h1>
-    <form id="imageForm">
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h1>Batch Image Background Removal</h1>
+        <button id="uploadItemButton" class="btn btn-success btn-lg" disabled>Upload Selected Item(s)</button>
+    </div>
+
+    <form id="uploadForm" class="mb-4">
       <div class="mb-3">
-        <label for="imageCount" class="form-label">How many images to submit?</label>
-        <input type="number" class="form-control" id="imageCount" value="5" min="1">
+        <label for="imageFiles" class="form-label">Select Images (PNG, JPG, WebP):</label>
+        <input type="file" class="form-control" id="imageFiles" multiple accept="image/png, image/jpeg, image/webp">
       </div>
-      <button type="submit" class="btn btn-primary">Submit Batch</button>
+      <div class="row">
+        <div class="col-md-4 mb-3">
+            <label for="modelSelect" class="form-label">Model:</label>
+            <select id="modelSelect" class="form-select">
+                <option value="u2net" selected>U2Net (General Purpose)</option>
+                <option value="u2netp">U2Netp (Lightweight)</option>
+                <option value="u2net_human_seg">U2Net Human Segmentation</option>
+                <option value="u2net_cloth_seg">U2Net Cloth Segmentation</option>
+                <option value="silueta">Silueta (Alternative to U2Net)</option>
+                <option value="isnet-general-use">IS-Net General Use</option>
+                <option value="isnet-anime">IS-Net Anime</option>
+                <!-- Add other models rembg supports as needed -->
+            </select>
+        </div>
+        <div class="col-md-4 mb-3 d-flex align-items-end">
+             <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="postProcessCheck">
+                <label class="form-check-label" for="postProcessCheck">
+                    Enable Post-Processing (Alpha Matting)
+                </label>
+            </div>
+        </div>
+        <div class="col-md-4 mb-3 d-flex align-items-end">
+            <button type="submit" class="btn btn-primary w-100">Process Selected Images</button>
+        </div>
+      </div>
     </form>
 
     <hr>
-    <div id="results" class="row mt-4"></div>
+    <div id="results" class="row mt-4">
+      <!-- Image cards will be appended here -->
+    </div>
   </div>
 
   <script>
-    const apiUrl = '/submit';
-    const statusUrl = '/status/';
-    const testImageUrl = 'https://odsv4storage.blob.core.windows.net/itemimages/205/205-205368-12262-1.png';
+    const submitApiUrl = '/submit';
+    const statusApiUrl = '/status/';
+    const apiKey = 'secretApiKey'; // WARNING: Not secure for production!
+    
+    // Store file objects for re-submission
+    let jobFileMap = {}; // jobId -> File object
 
-    function pollStatus(jobId, card) {
-      $.getJSON(statusUrl + jobId, function(data) {
+    function createSlider(container) {
+      const beforeImg = $(container).find('.img-before');
+      const afterImg = $(container).find('.img-after');
+      if (!beforeImg.length || !afterImg.length) return;
+
+      $(container).on('mousemove touchmove', function(e) {
+        let eventX = e.pageX || (e.originalEvent.touches && e.originalEvent.touches[0].pageX);
+        if (eventX === undefined) return;
+
+        let rect = this.getBoundingClientRect();
+        let x = eventX - rect.left;
+        let width = rect.width;
+        let percentage = (x / width) * 100;
+        percentage = Math.max(0, Math.min(100, percentage)); // Clamp between 0 and 100
+        $(afterImg).css('clip-path', `polygon(${percentage}% 0, 100% 0, 100% 100%, ${percentage}% 100%)`);
+      });
+       // Initial position
+      $(afterImg).css('clip-path', `polygon(50% 0, 100% 0, 100% 100%, 50% 100%)`);
+    }
+
+    function updateUploadButtonStatus() {
+        const anySelected = $('#results input[type="radio"]:checked').length > 0;
+        $('#uploadItemButton').prop('disabled', !anySelected);
+    }
+
+    function pollStatus(jobId, cardElement) {
+      const $card = $(cardElement);
+      const $statusText = $card.find('.status-text');
+      const $progressBar = $card.find('.progress-bar');
+      const $afterImg = $card.find('.img-after');
+      const $sliderContainer = $card.find('.slider-container');
+      const $refreshButton = $card.find('.refresh-btn');
+
+      $.getJSON(statusApiUrl + jobId, function(data) {
+        $statusText.text(data.status.charAt(0).toUpperCase() + data.status.slice(1) + (data.eta > 0 ? ` (ETA: ${data.eta}s)` : ''));
+        $refreshButton.prop('disabled', data.status === 'processing' || data.status === 'queued');
+
         if (data.status === 'done') {
-          $(card).find('img').attr('src', data.image_links[0]);
-          $(card).find('.status').text('✅ Done');
+          $statusText.html('<span class="badge bg-success status-badge">✅ Done</span>');
+          $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-success').css('width', '100%');
+          if (data.processed_image_url) {
+             // Preload image before showing
+            $('<img>').attr('src', data.processed_image_url + `?t=${new Date().getTime()}`).on('load', function() {
+                $afterImg.attr('src', data.processed_image_url + `?t=${new Date().getTime()}`);
+                $afterImg.removeClass('img-placeholder');
+                createSlider($sliderContainer[0]); // Initialize slider after both images are potentially loaded
+            }).on('error', function() {
+                $afterImg.addClass('img-placeholder').text('Error loading processed');
+            });
+          } else {
+             $afterImg.addClass('img-placeholder').text('No processed image');
+          }
+          $card.data('processed-url', data.processed_image_url);
+          $card.find('input[name="image_choice_' + jobId + '"][value="processed"]').data('url', data.processed_image_url);
         } else if (data.status === 'error') {
-          $(card).find('.status').text('❌ Error');
-        } else {
-          setTimeout(() => pollStatus(jobId, card), 1000);
+          $statusText.html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${data.error_message || 'Unknown error'}`);
+          $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
+          $afterImg.addClass('img-placeholder').text('Error');
+        } else if (data.status === 'processing' || data.status === 'queued') {
+          $statusText.html(`<span class="badge bg-info text-dark status-badge">${data.status === 'processing' ? '⚙️ Processing...' : '⏳ Queued...'}</span> (ETA: ${data.eta}s)`);
+          $progressBar.addClass('progress-bar-striped progress-bar-animated').removeClass('bg-success bg-danger').css('width', '50%'); // Or calculate based on ETA
+          setTimeout(() => pollStatus(jobId, cardElement), 2000); // Poll every 2s
         }
+        updateUploadButtonStatus(); // Update button status after each poll
+      }).fail(function() {
+        $statusText.html('<span class="badge bg-danger status-badge">❌ Error</span>: Failed to get status');
+        $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
+        $refreshButton.prop('disabled', false);
+        updateUploadButtonStatus();
       });
     }
 
-    $('#imageForm').on('submit', function(e) {
+    $('#uploadForm').on('submit', function(e) {
       e.preventDefault();
-      const count = parseInt($('#imageCount').val());
-      $('#results').empty();
+      const files = $('#imageFiles')[0].files;
+      const model = $('#modelSelect').val();
+      const postProcess = $('#postProcessCheck').is(':checked');
 
-      for (let i = 0; i < count; i++) {
-        $.ajax({
-          url: apiUrl,
-          method: 'POST',
-          contentType: 'application/json',
-          data: JSON.stringify({
-            image: testImageUrl,
-            key: 'secretApiKey',
-            model: 'u2net',
-            post_process: true
-          }),
-          success: function(data) {
-            const card = $(
-              `<div class="col-md-3 mb-4">
-                <div class="card">
-                  <img src="" class="card-img-top" alt="Processing...">
-                  <div class="card-body">
-                    <p class="card-text status">Processing...</p>
-                    <p class="small text-muted">Job ID: ${data.id}</p>
-                  </div>
+      if (files.length === 0) {
+        alert('Please select one or more image files.');
+        return;
+      }
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const formData = new FormData();
+        formData.append('image_file', file);
+        formData.append('api_key', apiKey);
+        formData.append('model', model);
+        formData.append('post_process', postProcess);
+
+        const originalFileName = file.name;
+
+        // Create a placeholder card immediately
+        const tempJobId = `temp-${Date.now()}-${i}`; // Temporary ID for UI element
+        const cardHtml = `
+          <div class="col-md-4 image-card" id="card-${tempJobId}" data-original-filename="${originalFileName}">
+            <div class="card">
+              <div class="slider-container">
+                <img src="" class="img-before img-placeholder" alt="Original Image">
+                <img src="" class="img-after img-placeholder" alt="Processed Image">
+              </div>
+              <div class="card-body">
+                <h5 class="card-title small">${originalFileName}</h5>
+                <div class="progress mb-2" style="height: 10px;">
+                  <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: 10%" aria-valuenow="10" aria-valuemin="0" aria-valuemax="100"></div>
                 </div>
-              </div>`
-            );
-            $('#results').append(card);
-            pollStatus(data.id, card);
+                <p class="card-text status-text"><span class="badge bg-secondary status-badge">⏳ Submitting...</span></p>
+                <p class="small text-muted job-id-text">Job ID: Pending...</p>
+                <div class="form-check">
+                  <input class="form-check-input image-select-radio" type="radio" name="image_choice_${tempJobId}" value="original" data-url="">
+                  <label class="form-check-label small" for="image_choice_${tempJobId}_original">Use Original</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input image-select-radio" type="radio" name="image_choice_${tempJobId}" value="processed" data-url="" checked>
+                  <label class="form-check-label small" for="image_choice_${tempJobId}_processed">Use Processed</label>
+                </div>
+              </div>
+              <div class="card-footer text-end">
+                <button class="btn btn-sm btn-outline-primary refresh-btn" data-jobid="${tempJobId}" disabled>Re-process</button>
+              </div>
+            </div>
+          </div>`;
+        const $card = $(cardHtml);
+        $('#results').append($card);
+        
+        // Show original image preview
+        const reader = new FileReader();
+        reader.onload = function(event) {
+            $card.find('.img-before').attr('src', event.target.result).removeClass('img-placeholder');
+        }
+        reader.readAsDataURL(file);
+
+
+        $.ajax({
+          url: submitApiUrl,
+          method: 'POST',
+          data: formData,
+          processData: false,
+          contentType: false,
+          success: function(data) {
+            if (data.job_id) {
+              jobFileMap[data.job_id] = file; // Store file for re-processing
+              
+              // Update card with real job ID and URLs
+              $card.attr('id', `card-${data.job_id}`);
+              $card.data('job-id', data.job_id); // Store job ID in data attribute
+              $card.data('original-url', data.original_image_url);
+              $card.find('.job-id-text').text(`Job ID: ${data.job_id}`);
+              $card.find('.refresh-btn').data('jobid', data.job_id).prop('disabled', true); // Disable initially
+              
+              // Update radio button names and data-url for original
+              $card.find('input[name="image_choice_' + tempJobId + '"]').attr('name', `image_choice_${data.job_id}`);
+              $card.find('input[value="original"]').data('url', data.original_image_url);
+              
+              // Set original image for slider (server-provided URL is more robust)
+              $('<img>').attr('src', data.original_image_url).on('load', function() {
+                  $card.find('.img-before').attr('src', data.original_image_url);
+              }).on('error', function() {
+                  // Keep FileReader version if server one fails, or show placeholder
+                  $card.find('.img-before').addClass('img-placeholder').text('Error loading original');
+              });
+              $card.find('.img-after').addClass('img-placeholder').text('Processing...'); // Placeholder for processed
+
+              pollStatus(data.job_id, $card[0]);
+            } else {
+              $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Submission Error</span>');
+              $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
+            }
+          },
+          error: function(xhr) {
+            let errorMsg = 'Submission failed.';
+            if (xhr.responseJSON && xhr.responseJSON.error) {
+                errorMsg = xhr.responseJSON.error;
+            } else if (xhr.responseJSON && xhr.responseJSON.detail) {
+                 if (Array.isArray(xhr.responseJSON.detail)) {
+                    errorMsg = xhr.responseJSON.detail.map(d => `${d.loc.join('.')} - ${d.msg}`).join('; ');
+                 } else {
+                    errorMsg = xhr.responseJSON.detail;
+                 }
+            }
+            $card.find('.status-text').html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`);
+            $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
           }
         });
       }
+      $('#imageFiles').val(''); // Clear file input
     });
+
+    // Re-process button handler
+    $('#results').on('click', '.refresh-btn', function() {
+      const jobIdToRefresh = $(this).data('jobid');
+      const originalFile = jobFileMap[jobIdToRefresh];
+      const $card = $(`#card-${jobIdToRefresh}`);
+      
+      if (!originalFile) {
+        alert('Original file not found for re-processing. This might happen if the page was reloaded.');
+        // Potentially, you could try to re-fetch from $card.data('original-url') if it's from a URL source.
+        // But here, we assume direct upload and rely on jobFileMap.
+        return;
+      }
+
+      const model = $('#modelSelect').val(); // Use current global settings
+      const postProcess = $('#postProcessCheck').is(':checked');
+
+      const formData = new FormData();
+      formData.append('image_file', originalFile);
+      formData.append('api_key', apiKey);
+      formData.append('model', model);
+      formData.append('post_process', postProcess);
+
+      // Visually reset the card for the new job
+      $card.find('.status-text').html('<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>');
+      $card.find('.progress-bar').removeClass('bg-success bg-danger').addClass('progress-bar-striped progress-bar-animated').css('width', '10%');
+      $card.find('.img-after').attr('src', '').addClass('img-placeholder').text('Re-processing...');
+      $card.find('.refresh-btn').prop('disabled', true);
+      // Clear previous processed URL from data and radio
+      $card.data('processed-url', null);
+      $card.find('input[value="processed"]').data('url', null);
+
+
+      $.ajax({
+        url: submitApiUrl, // Submit to the same endpoint
+        method: 'POST',
+        data: formData,
+        processData: false,
+        contentType: false,
+        success: function(newData) {
+          if (newData.job_id) {
+            // Update jobFileMap to new job ID if needed (or keep original if file content is identical)
+            // For simplicity, assume new job ID means a new entry in processing.
+            // The old job ID is now orphaned for this card.
+            delete jobFileMap[jobIdToRefresh]; // Remove old mapping
+            jobFileMap[newData.job_id] = originalFile; // Add new mapping
+
+            // Update card ID and all references to the new job ID
+            $card.attr('id', `card-${newData.job_id}`);
+            $card.data('job-id', newData.job_id);
+            $card.data('original-url', newData.original_image_url); // Original URL might change if filename convention includes job_id
+            $card.find('.job-id-text').text(`Job ID: ${newData.job_id}`);
+            $card.find('.refresh-btn').data('jobid', newData.job_id);
+
+            // Update radio button names for the new job_id
+            $card.find('input[type="radio"]').attr('name', `image_choice_${newData.job_id}`);
+            $card.find('input[value="original"]').data('url', newData.original_image_url);
+            // Processed URL will be set by pollStatus
+
+            // Update the original image display in slider if its URL changed.
+            $('<img>').attr('src', newData.original_image_url).on('load', function() {
+                $card.find('.img-before').attr('src', newData.original_image_url);
+            });
+
+            pollStatus(newData.job_id, $card[0]);
+          } else {
+            $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>');
+            $card.find('.refresh-btn').prop('disabled', false); // Re-enable on error
+          }
+        },
+        error: function() {
+          $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Failed</span>');
+          $card.find('.refresh-btn').prop('disabled', false); // Re-enable on error
+        }
+      });
+    });
+
+    // "Upload Item" button handler
+    $('#uploadItemButton').on('click', function() {
+      const selectedImageUrls = [];
+      $('#results .image-card').each(function() {
+        const $card = $(this);
+        const jobId = $card.data('job-id');
+        const selectedValue = $card.find(`input[name="image_choice_${jobId}"]:checked`).val();
+        
+        if (selectedValue) {
+          const url = $card.find(`input[value="${selectedValue}"]`).data('url');
+          if (url) {
+            selectedImageUrls.push(encodeURIComponent(url));
+          }
+        }
+      });
+
+      if (selectedImageUrls.length > 0) {
+        const uploadUrl = `/upload-item?images=${selectedImageUrls.join('&images=')}`;
+        window.open(uploadUrl, '_blank'); // Open in a new tab
+      } else {
+        alert('No images selected for upload. Please check your selections.');
+      }
+    });
+    
+    // Delegate change event for radio buttons to update upload button status
+    $('#results').on('change', '.image-select-radio', function() {
+        updateUploadButtonStatus();
+    });
+
   </script>
 </body>
 </html>
