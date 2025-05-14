@@ -1,6 +1,5 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
-from fastapi import Request
 from fastapi.staticfiles import StaticFiles
 from rembg import remove
 from PIL import Image
@@ -17,6 +16,14 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 queue = asyncio.Queue()
 results = {}
 
+def get_proxy_url(request: Request):
+    """
+    Constructs a RunPod proxy-safe public URL using the host header.
+    """
+    host = request.headers.get("host", "localhost")
+    scheme = request.url.scheme
+    return f"{scheme}://{host}"
+
 @app.post("/submit")
 async def submit_image(request: Request, file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
@@ -27,21 +34,20 @@ async def submit_image(request: Request, file: UploadFile = File(...)):
     position = queue.qsize()
     eta_seconds = position * ESTIMATED_TIME_PER_JOB
 
-    base_url = str(request.base_url).rstrip("/")
+    public_base_url = get_proxy_url(request)
 
     return {
         "status": "processing",
-        "image_links": [f"{base_url}/images/{job_id}.png"],
+        "image_links": [f"{public_base_url}/images/{job_id}.png"],
         "eta": eta_seconds,
         "id": job_id
     }
 
-
 @app.get("/status/{job_id}")
 async def check_status(request: Request, job_id: str):
     result = results.get(job_id)
-    base_url = str(request.base_url).rstrip("/")
-    image_url = f"{base_url}/images/{job_id}.png"
+    public_base_url = get_proxy_url(request)
+    image_url = f"{public_base_url}/images/{job_id}.png"
 
     job_keys = list(queue._queue)
     position = next((i for i, (k, _) in enumerate(job_keys) if k == job_id), None)
