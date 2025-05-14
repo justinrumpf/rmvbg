@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from rembg import remove, new_session
+from onnxruntime import get_available_providers
 from PIL import Image, ImageOps, ImageEnhance
 import asyncio, uuid, io, os, requests
 
@@ -95,8 +96,12 @@ async def worker():
             response = requests.get(image_url)
             response.raise_for_status()
 
+            providers = ["CUDAExecutionProvider"]
+            if "TensorrtExecutionProvider" in get_available_providers():
+                providers.insert(0, "TensorrtExecutionProvider")
+    
             input_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            session = new_session(model_name=model_name, providers=["CUDAExecutionProvider"])
+            session = new_session(model_name=model_name, providers=providers)
             removed = remove(input_image, session=session, post_process=post_process)
 
             # Resize to fit within 1024x1024 while preserving aspect ratio
