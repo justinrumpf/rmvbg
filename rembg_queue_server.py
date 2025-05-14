@@ -4,17 +4,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from rembg import remove, new_session
 from PIL import Image, ImageOps, ImageEnhance
-import asyncio, uuid, io, os, requests, aiohttp
+import asyncio, uuid, io, os, requests
 
 app = FastAPI()
 
 MAX_CONCURRENT_TASKS = 1
 ESTIMATED_TIME_PER_JOB = 5
 PROCESSED_DIR = "/workspace/processed"
-LOGO_URL = "https://help.resale1.com/wp-content/uploads/2025/02/CM.png"
-LOGO_PATH = "/workspace/rmvbg/assets/logo.png"
+LOGO_PATH = "/workspace/rmvbg/CM.png"  # Updated to use bundled logo
+
 os.makedirs(PROCESSED_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(LOGO_PATH), exist_ok=True)
 
 queue = asyncio.Queue()
 results = {}
@@ -58,7 +57,7 @@ async def submit_image(request: Request, data: ImageRequest):
 async def check_status(request: Request, job_id: str):
     result = results.get(job_id)
     public_url = get_proxy_url(request)
-    image_url = f"{public_url}/images/{job_id}.webp"
+    image_url = f"/images/{job_id}.webp"
 
     job_keys = list(queue._queue)
     position = next((i for i, (k, *_ ) in enumerate(job_keys) if k == job_id), None)
@@ -86,17 +85,7 @@ async def check_status(request: Request, job_id: str):
             "id": job_id
         }
 
-async def fetch_logo():
-    if not os.path.exists(LOGO_PATH):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(LOGO_URL) as resp:
-                if resp.status == 200:
-                    with open(LOGO_PATH, "wb") as f:
-                        f.write(await resp.read())
-                    print("✅ Logo downloaded successfully.")
-
 async def worker():
-    await fetch_logo()
     logo = Image.open(LOGO_PATH).convert("RGBA") if os.path.exists(LOGO_PATH) else None
 
     while True:
