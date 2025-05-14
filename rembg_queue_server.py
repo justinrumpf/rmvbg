@@ -258,7 +258,6 @@ async def startup_event():
 # Serve static files
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static_assets") # For slider JS/CSS if any
 
 # Serve root index.html
 @app.get("/", response_class=FileResponse)
