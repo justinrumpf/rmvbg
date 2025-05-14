@@ -48,7 +48,7 @@ async def submit_image(request: Request, data: ImageRequest):
 
     return {
         "status": "processing",
-        "image_links": [f"/images/{job_id}.webp"],
+        "image_links": [f"{public_url}/images/{job_id}.webp"],
         "eta": eta_seconds,
         "id": job_id
     }
