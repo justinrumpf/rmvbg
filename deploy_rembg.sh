@@ -16,6 +16,11 @@ fi
 
 cd rmvbg
 
+# Download the logo and store it in assets
+echo "🖼️  Downloading logo for watermarking..."
+mkdir -p assets
+curl -sSL https://help.resale1.com/wp-content/uploads/2025/02/CM.png -o assets/logo.png
+
 # Create virtual environment if missing
 if [ ! -d "venv" ]; then
     echo "🐍 Creating virtual environment..."
@@ -36,4 +41,4 @@ source venv/bin/activate && \
 uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000
 "
 
-echo "✅ Done! Your Rembg server is now running."
+echo "✅ Done! Your Rembg server is now running at port 7000."
