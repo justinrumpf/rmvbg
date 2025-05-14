@@ -17,9 +17,6 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 queue = asyncio.Queue()
 results = {}
 
-# Replace with your actual public URL
-BASE_IMAGE_URL = "https://<your-pod-id>-7000.proxy.runpod.net/images"
-
 @app.post("/submit")
 async def submit_image(request: Request, file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
