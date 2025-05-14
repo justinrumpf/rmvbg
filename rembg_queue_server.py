@@ -12,7 +12,7 @@ app = FastAPI()
 MAX_CONCURRENT_TASKS = 1
 ESTIMATED_TIME_PER_JOB = 5
 PROCESSED_DIR = "/workspace/processed"
-LOGO_PATH = "/workspace/rmvbg/CM.png"  # Updated to use bundled logo
+LOGO_PATH = "/workspace/rmvbg/logo.png"  # Updated to use bundled logo
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
