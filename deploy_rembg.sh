@@ -5,6 +5,9 @@ set -e
 echo "🔧 Updating system packages..."
 apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip
 
+echo "🔧 Installing CUDA runtime dependencies..."
+apt update && apt install -y libcublas-12-0
+
 cd /workspace
 
 # Clone the repo if it doesn't exist
