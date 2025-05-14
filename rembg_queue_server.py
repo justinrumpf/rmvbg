@@ -18,7 +18,7 @@ class ImageRequest(BaseModel):
 
 app = FastAPI()
 
-MAX_CONCURRENT_TASKS = 1
+MAX_CONCURRENT_TASKS = 5
 ESTIMATED_TIME_PER_JOB = 5
 PROCESSED_DIR = "/workspace/processed"
 os.makedirs(PROCESSED_DIR, exist_ok=True)
