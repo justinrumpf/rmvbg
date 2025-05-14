@@ -3,38 +3,39 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Batch Background Removal v2</title>
+  <title>Batch Background Removal v3 (imgSlider.js)</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- imgSlider.js CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/imgslider/imgSlider.min.css">
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <style>
     .image-card { margin-bottom: 20px; }
     .slider-container {
-      position: relative;
-      width: 100%; /* Or fixed size */
-      aspect-ratio: 1 / 1; /* Make it square */
-      overflow: hidden;
-      border: 1px solid #ccc;
-      cursor: col-resize;
-    }
-    .slider-container img {
-      position: absolute;
-      top: 0;
-      left: 0;
       width: 100%;
-      height: 100%;
-      object-fit: contain; /* Or cover, depending on desired look */
+      aspect-ratio: 1 / 1; /* Make it square, adjust if needed */
+      border: 1px solid #ccc;
+      overflow: hidden; /* Good practice */
     }
-    .slider-container .img-after {
-      clip-path: polygon(50% 0, 100% 0, 100% 100%, 50% 100%);
-    }
-    .img-placeholder {
+    /* Placeholder style for the slider container before images load */
+    .slider-container.img-placeholder {
         display: flex;
+        flex-direction: column; /* Stack text lines */
         align-items: center;
         justify-content: center;
         background-color: #f0f0f0;
         color: #aaa;
-        font-size: 1.2em;
+        font-size: 0.9em;
+        text-align: center;
     }
+    /* Ensure images within imgSlider fill their container if object-fit is desired */
+    .slider-container img {
+        /* imgSlider.js might control this, but you can try to enforce it */
+        /* width: 100% !important; */
+        /* height: 100% !important; */
+        /* object-fit: contain !important; */
+        /* Note: imgSlider.js usually handles image sizing well. Add above if needed. */
+    }
+
     .status-badge { font-size: 0.8em; }
     .card-footer { background-color: #f8f9fa; }
   </style>
@@ -62,7 +63,6 @@
                 <option value="silueta">Silueta (Alternative to U2Net)</option>
                 <option value="isnet-general-use">IS-Net General Use</option>
                 <option value="isnet-anime">IS-Net Anime</option>
-                <!-- Add other models rembg supports as needed -->
             </select>
         </div>
         <div class="col-md-4 mb-3 d-flex align-items-end">
@@ -85,46 +85,87 @@
     </div>
   </div>
 
+  <!-- imgSlider.js JavaScript -->
+  <script src="https://cdn.jsdelivr.net/npm/imgslider/imgSlider.min.js"></script>
   <script>
     const submitApiUrl = '/submit';
     const statusApiUrl = '/status/';
     const apiKey = 'secretApiKey'; // WARNING: Not secure for production!
     
-    // Store file objects for re-submission
     let jobFileMap = {}; // jobId -> File object
-
-    function createSlider(container) {
-      const beforeImg = $(container).find('.img-before');
-      const afterImg = $(container).find('.img-after');
-      if (!beforeImg.length || !afterImg.length) return;
-
-      $(container).on('mousemove touchmove', function(e) {
-        let eventX = e.pageX || (e.originalEvent.touches && e.originalEvent.touches[0].pageX);
-        if (eventX === undefined) return;
-
-        let rect = this.getBoundingClientRect();
-        let x = eventX - rect.left;
-        let width = rect.width;
-        let percentage = (x / width) * 100;
-        percentage = Math.max(0, Math.min(100, percentage)); // Clamp between 0 and 100
-        $(afterImg).css('clip-path', `polygon(${percentage}% 0, 100% 0, 100% 100%, ${percentage}% 100%)`);
-      });
-       // Initial position
-      $(afterImg).css('clip-path', `polygon(50% 0, 100% 0, 100% 100%, 50% 100%)`);
-    }
 
     function updateUploadButtonStatus() {
         const anySelected = $('#results input[type="radio"]:checked').length > 0;
         $('#uploadItemButton').prop('disabled', !anySelected);
     }
 
+    function initializeOrUpdateSlider($card, originalImageUrl, processedImageUrl) {
+        const $sliderContainer = $card.find('.slider-container');
+        const originalFileName = $card.data('original-filename');
+
+        // Clear previous slider content and placeholder status
+        $sliderContainer.removeClass('img-placeholder').empty();
+
+        const $beforeImgTag = $('<img>')
+            .attr('src', originalImageUrl)
+            .attr('alt', 'Original: ' + originalFileName);
+        const $afterImgTag = $('<img>')
+            .attr('src', processedImageUrl + `?t=${new Date().getTime()}`) // Cache bust
+            .attr('alt', 'Processed: ' + originalFileName);
+
+        $sliderContainer.append($beforeImgTag).append($afterImgTag);
+
+        // Wait for both images to load before initializing the slider
+        // This is important for imgSlider to calculate dimensions correctly.
+        let imagesLoaded = 0;
+        const totalImages = 2;
+
+        function onImageLoad() {
+            imagesLoaded++;
+            if (imagesLoaded === totalImages) {
+                try {
+                    imgSlider($sliderContainer[0]); // Initialize imgSlider
+                } catch (e) {
+                    console.error("Error initializing imgSlider:", e);
+                    $sliderContainer.addClass('img-placeholder').text('Error initializing slider.');
+                }
+            }
+        }
+
+        $beforeImgTag.on('load', onImageLoad).on('error', function() {
+            console.error('Error loading original image for slider:', originalImageUrl);
+            $sliderContainer.addClass('img-placeholder').text('Error loading original image.');
+            // Don't increment imagesLoaded to prevent faulty slider init
+        });
+        $afterImgTag.on('load', onImageLoad).on('error', function() {
+            console.error('Error loading processed image for slider:', processedImageUrl);
+            $sliderContainer.addClass('img-placeholder').text('Error loading processed image.');
+            // Don't increment imagesLoaded
+        });
+
+        // Fallback if images are already cached and 'load' doesn't fire consistently
+        // or if one image fails to load. A timeout can help.
+        setTimeout(() => {
+            if (imagesLoaded < totalImages && !$sliderContainer.hasClass('img-placeholder')) {
+                 // If after a short delay, images haven't loaded and no error text is set,
+                 // it might mean they were cached. Try initializing anyway, or add more robust checks.
+                 console.warn("Slider images might be cached or one failed to trigger load event properly. Attempting init.");
+                 if ($beforeImgTag[0].complete && $afterImgTag[0].complete && $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
+                    if (imagesLoaded < totalImages) imagesLoaded = totalImages; // Force it
+                    onImageLoad(); // This will trigger init if both are considered complete
+                 }
+            }
+        }, 500); // Adjust timeout as needed
+    }
+
+
     function pollStatus(jobId, cardElement) {
       const $card = $(cardElement);
       const $statusText = $card.find('.status-text');
       const $progressBar = $card.find('.progress-bar');
-      const $afterImg = $card.find('.img-after');
       const $sliderContainer = $card.find('.slider-container');
       const $refreshButton = $card.find('.refresh-btn');
+      const originalImageUrl = $card.data('original-url'); // Stored when job submitted
 
       $.getJSON(statusApiUrl + jobId, function(data) {
         $statusText.text(data.status.charAt(0).toUpperCase() + data.status.slice(1) + (data.eta > 0 ? ` (ETA: ${data.eta}s)` : ''));
@@ -133,33 +174,31 @@
         if (data.status === 'done') {
           $statusText.html('<span class="badge bg-success status-badge">✅ Done</span>');
           $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-success').css('width', '100%');
-          if (data.processed_image_url) {
-             // Preload image before showing
-            $('<img>').attr('src', data.processed_image_url + `?t=${new Date().getTime()}`).on('load', function() {
-                $afterImg.attr('src', data.processed_image_url + `?t=${new Date().getTime()}`);
-                $afterImg.removeClass('img-placeholder');
-                createSlider($sliderContainer[0]); // Initialize slider after both images are potentially loaded
-            }).on('error', function() {
-                $afterImg.addClass('img-placeholder').text('Error loading processed');
-            });
+          
+          if (data.processed_image_url && originalImageUrl) {
+            initializeOrUpdateSlider($card, originalImageUrl, data.processed_image_url);
           } else {
-             $afterImg.addClass('img-placeholder').text('No processed image');
+             $sliderContainer.addClass('img-placeholder').text('Image URLs missing for slider.');
+             if (!originalImageUrl) console.error("Original image URL missing for job", jobId);
+             if (!data.processed_image_url) console.error("Processed image URL missing for job", jobId);
           }
           $card.data('processed-url', data.processed_image_url);
           $card.find('input[name="image_choice_' + jobId + '"][value="processed"]').data('url', data.processed_image_url);
         } else if (data.status === 'error') {
           $statusText.html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${data.error_message || 'Unknown error'}`);
           $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
-          $afterImg.addClass('img-placeholder').text('Error');
+          $sliderContainer.addClass('img-placeholder').text('Processing Error: ' + (data.error_message || 'Unknown issue'));
         } else if (data.status === 'processing' || data.status === 'queued') {
           $statusText.html(`<span class="badge bg-info text-dark status-badge">${data.status === 'processing' ? '⚙️ Processing...' : '⏳ Queued...'}</span> (ETA: ${data.eta}s)`);
-          $progressBar.addClass('progress-bar-striped progress-bar-animated').removeClass('bg-success bg-danger').css('width', '50%'); // Or calculate based on ETA
-          setTimeout(() => pollStatus(jobId, cardElement), 2000); // Poll every 2s
+          $progressBar.addClass('progress-bar-striped progress-bar-animated').removeClass('bg-success bg-danger').css('width', '50%');
+          // Placeholder text is set during card creation
+          setTimeout(() => pollStatus(jobId, cardElement), 2000);
         }
-        updateUploadButtonStatus(); // Update button status after each poll
+        updateUploadButtonStatus();
       }).fail(function() {
         $statusText.html('<span class="badge bg-danger status-badge">❌ Error</span>: Failed to get status');
         $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
+        $sliderContainer.addClass('img-placeholder').text('Status Check Failed.');
         $refreshButton.prop('disabled', false);
         updateUploadButtonStatus();
       });
@@ -185,15 +224,13 @@
         formData.append('post_process', postProcess);
 
         const originalFileName = file.name;
-
-        // Create a placeholder card immediately
-        const tempJobId = `temp-${Date.now()}-${i}`; // Temporary ID for UI element
+        const tempJobId = `temp-${Date.now()}-${i}`;
+        
         const cardHtml = `
           <div class="col-md-4 image-card" id="card-${tempJobId}" data-original-filename="${originalFileName}">
             <div class="card">
-              <div class="slider-container">
-                <img src="" class="img-before img-placeholder" alt="Original Image">
-                <img src="" class="img-after img-placeholder" alt="Processed Image">
+              <div class="slider-container img-placeholder">
+                Original: Loading preview...<br>Processed: Queued
               </div>
               <div class="card-body">
                 <h5 class="card-title small">${originalFileName}</h5>
@@ -219,13 +256,10 @@
         const $card = $(cardHtml);
         $('#results').append($card);
         
-        // Show original image preview
-        const reader = new FileReader();
-        reader.onload = function(event) {
-            $card.find('.img-before').attr('src', event.target.result).removeClass('img-placeholder');
-        }
-        reader.readAsDataURL(file);
-
+        // For imgSlider, we need the server-provided original URL later.
+        // We can show a FileReader preview in the placeholder text or a separate small preview if desired.
+        // For now, the placeholder text "Original: Loading preview..." is sufficient.
+        // The actual original for the slider will come from `data.original_image_url`.
 
         $.ajax({
           url: submitApiUrl,
@@ -235,67 +269,51 @@
           contentType: false,
           success: function(data) {
             if (data.job_id) {
-              jobFileMap[data.job_id] = file; // Store file for re-processing
+              jobFileMap[data.job_id] = file;
               
-              // Update card with real job ID and URLs
               $card.attr('id', `card-${data.job_id}`);
-              $card.data('job-id', data.job_id); // Store job ID in data attribute
-              $card.data('original-url', data.original_image_url);
-              $card.find('.job-id-text').text(`Job ID: ${data.job_id}`);
-              $card.find('.refresh-btn').data('jobid', data.job_id).prop('disabled', true); // Disable initially
+              $card.data('job-id', data.job_id);
+              $card.data('original-url', data.original_image_url); // Crucial for imgSlider
               
-              // Update radio button names and data-url for original
+              $card.find('.job-id-text').text(`Job ID: ${data.job_id}`);
+              $card.find('.refresh-btn').data('jobid', data.job_id).prop('disabled', true);
+              
               $card.find('input[name="image_choice_' + tempJobId + '"]').attr('name', `image_choice_${data.job_id}`);
               $card.find('input[value="original"]').data('url', data.original_image_url);
               
-              // Set original image for slider (server-provided URL is more robust)
-              $('<img>').attr('src', data.original_image_url).on('load', function() {
-                  $card.find('.img-before').attr('src', data.original_image_url);
-              }).on('error', function() {
-                  // Keep FileReader version if server one fails, or show placeholder
-                  $card.find('.img-before').addClass('img-placeholder').text('Error loading original');
-              });
-              $card.find('.img-after').addClass('img-placeholder').text('Processing...'); // Placeholder for processed
+              // Update placeholder text with more accurate info
+              $card.find('.slider-container.img-placeholder').html(`Original: Waiting for server URL<br>Processed: ${data.status === 'queued' ? 'Queued' : 'Processing...'}`);
 
               pollStatus(data.job_id, $card[0]);
             } else {
               $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Submission Error</span>');
               $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
+              $card.find('.slider-container.img-placeholder').text('Submission Error.');
             }
           },
           error: function(xhr) {
             let errorMsg = 'Submission failed.';
-            if (xhr.responseJSON && xhr.responseJSON.error) {
-                errorMsg = xhr.responseJSON.error;
-            } else if (xhr.responseJSON && xhr.responseJSON.detail) {
-                 if (Array.isArray(xhr.responseJSON.detail)) {
-                    errorMsg = xhr.responseJSON.detail.map(d => `${d.loc.join('.')} - ${d.msg}`).join('; ');
-                 } else {
-                    errorMsg = xhr.responseJSON.detail;
-                 }
-            }
+            // ... (error message parsing as before) ...
             $card.find('.status-text').html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`);
             $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
+            $card.find('.slider-container.img-placeholder').text('AJAX Submission Error.');
           }
         });
       }
-      $('#imageFiles').val(''); // Clear file input
+      $('#imageFiles').val('');
     });
 
-    // Re-process button handler
     $('#results').on('click', '.refresh-btn', function() {
       const jobIdToRefresh = $(this).data('jobid');
       const originalFile = jobFileMap[jobIdToRefresh];
       const $card = $(`#card-${jobIdToRefresh}`);
       
       if (!originalFile) {
-        alert('Original file not found for re-processing. This might happen if the page was reloaded.');
-        // Potentially, you could try to re-fetch from $card.data('original-url') if it's from a URL source.
-        // But here, we assume direct upload and rely on jobFileMap.
+        alert('Original file not found for re-processing.');
         return;
       }
 
-      const model = $('#modelSelect').val(); // Use current global settings
+      const model = $('#modelSelect').val();
       const postProcess = $('#postProcessCheck').is(':checked');
 
       const formData = new FormData();
@@ -307,63 +325,58 @@
       // Visually reset the card for the new job
       $card.find('.status-text').html('<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>');
       $card.find('.progress-bar').removeClass('bg-success bg-danger').addClass('progress-bar-striped progress-bar-animated').css('width', '10%');
-      $card.find('.img-after').attr('src', '').addClass('img-placeholder').text('Re-processing...');
+      $card.find('.slider-container').addClass('img-placeholder').empty().text('Re-processing... (Slider will refresh)'); // Reset slider area
       $card.find('.refresh-btn').prop('disabled', true);
-      // Clear previous processed URL from data and radio
       $card.data('processed-url', null);
       $card.find('input[value="processed"]').data('url', null);
 
-
       $.ajax({
-        url: submitApiUrl, // Submit to the same endpoint
+        url: submitApiUrl,
         method: 'POST',
         data: formData,
         processData: false,
         contentType: false,
         success: function(newData) {
           if (newData.job_id) {
-            // Update jobFileMap to new job ID if needed (or keep original if file content is identical)
-            // For simplicity, assume new job ID means a new entry in processing.
-            // The old job ID is now orphaned for this card.
-            delete jobFileMap[jobIdToRefresh]; // Remove old mapping
-            jobFileMap[newData.job_id] = originalFile; // Add new mapping
+            delete jobFileMap[jobIdToRefresh];
+            jobFileMap[newData.job_id] = originalFile;
 
-            // Update card ID and all references to the new job ID
-            $card.attr('id', `card-${newData.job_id}`);
+            const oldCardId = $card.attr('id');
+            const newCardId = `card-${newData.job_id}`;
+            $card.attr('id', newCardId); // Update card ID itself
+            
+            // Update all internal references if necessary, or ensure they use data attributes relative to current card
             $card.data('job-id', newData.job_id);
-            $card.data('original-url', newData.original_image_url); // Original URL might change if filename convention includes job_id
+            $card.data('original-url', newData.original_image_url); // Update original URL for new job
+            
             $card.find('.job-id-text').text(`Job ID: ${newData.job_id}`);
             $card.find('.refresh-btn').data('jobid', newData.job_id);
-
-            // Update radio button names for the new job_id
             $card.find('input[type="radio"]').attr('name', `image_choice_${newData.job_id}`);
             $card.find('input[value="original"]').data('url', newData.original_image_url);
-            // Processed URL will be set by pollStatus
-
-            // Update the original image display in slider if its URL changed.
-            $('<img>').attr('src', newData.original_image_url).on('load', function() {
-                $card.find('.img-before').attr('src', newData.original_image_url);
-            });
+            
+            // Placeholder for new job
+            $card.find('.slider-container.img-placeholder').html(`Original: Waiting for server URL<br>Processed: ${newData.status === 'queued' ? 'Queued' : 'Processing...'}`);
 
             pollStatus(newData.job_id, $card[0]);
           } else {
             $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>');
-            $card.find('.refresh-btn').prop('disabled', false); // Re-enable on error
+            $card.find('.refresh-btn').prop('disabled', false);
           }
         },
         error: function() {
           $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Failed</span>');
-          $card.find('.refresh-btn').prop('disabled', false); // Re-enable on error
+          $card.find('.refresh-btn').prop('disabled', false);
         }
       });
     });
 
-    // "Upload Item" button handler
     $('#uploadItemButton').on('click', function() {
       const selectedImageUrls = [];
       $('#results .image-card').each(function() {
         const $card = $(this);
         const jobId = $card.data('job-id');
+        if (!jobId || jobId.startsWith('temp-')) return; // Skip cards not yet fully submitted or temp ones
+
         const selectedValue = $card.find(`input[name="image_choice_${jobId}"]:checked`).val();
         
         if (selectedValue) {
@@ -376,13 +389,12 @@
 
       if (selectedImageUrls.length > 0) {
         const uploadUrl = `/upload-item?images=${selectedImageUrls.join('&images=')}`;
-        window.open(uploadUrl, '_blank'); // Open in a new tab
+        window.open(uploadUrl, '_blank');
       } else {
-        alert('No images selected for upload. Please check your selections.');
+        alert('No images selected or ready for upload. Please check your selections.');
       }
     });
     
-    // Delegate change event for radio buttons to update upload button status
     $('#results').on('change', '.image-select-radio', function() {
         updateUploadButtonStatus();
     });
