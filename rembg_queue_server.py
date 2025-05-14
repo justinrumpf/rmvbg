@@ -96,7 +96,7 @@ async def worker():
             response.raise_for_status()
 
             input_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            session = new_session(model_name=model_name)
+            session = new_session(model_name=model_name, providers=["CUDAExecutionProvider"])
             removed = remove(input_image, session=session, post_process=post_process)
 
             # Resize to fit within 1024x1024 while preserving aspect ratio
