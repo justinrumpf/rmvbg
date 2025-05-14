@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from rembg import remove
 from PIL import Image
+from rembg import new_session
 import asyncio, uuid, io, os
 import requests
 
@@ -90,7 +91,9 @@ async def worker():
             response.raise_for_status()
 
             input_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            output_image = remove(input_image)
+            
+            session = new_session(model_name="isnet-general-use")  # or "sam", "u2netp", etc.
+            output_image = remove(input_image, session=session, post_process=True)
 
             out_path = os.path.join(PROCESSED_DIR, f"{job_id}.png")
             output_image.save(out_path)
