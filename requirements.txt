@@ -1,0 +1,10 @@
+rembg[gpu]
+watchdog
+asyncer
+aiohttp
+uvicorn
+fastapi
+python-multipart
+filetype
+gradio
+nano
