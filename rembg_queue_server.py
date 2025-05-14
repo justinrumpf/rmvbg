@@ -48,7 +48,7 @@ async def submit_image(request: Request, data: ImageRequest):
 
     return {
         "status": "processing",
-        "image_links": [f"{public_url}/images/{job_id}.webp"],
+        "image_links": [f"/images/{job_id}.webp"],
         "eta": eta_seconds,
         "id": job_id
     }
@@ -57,7 +57,7 @@ async def submit_image(request: Request, data: ImageRequest):
 async def check_status(request: Request, job_id: str):
     result = results.get(job_id)
     public_url = get_proxy_url(request)
-    image_url = f"/images/{job_id}.webp"
+    image_url = f"{public_url}/images/{job_id}.webp"
 
     job_keys = list(queue._queue)
     position = next((i for i, (k, *_ ) in enumerate(job_keys) if k == job_id), None)
