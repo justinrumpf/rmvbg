@@ -53,8 +53,7 @@ async def submit_image(request: Request, data: ImageRequest):
 @app.get("/status/{job_id}")
 async def check_status(request: Request, job_id: str):
     result = results.get(job_id)
-    public_url = get_proxy_url(request)
-    image_url = f"{public_url}/images/{job_id}.png"
+    image_url = f"/images/{job_id}.png"
 
     job_keys = list(queue._queue)
     position = next((i for i, (k, _) in enumerate(job_keys) if k == job_id), None)
