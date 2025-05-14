@@ -16,11 +16,6 @@ fi
 
 cd rmvbg
 
-# Download the logo and store it in assets
-echo "🖼️  Downloading logo for watermarking..."
-mkdir -p assets
-curl -sSL https://help.resale1.com/wp-content/uploads/2025/02/CM.png -o assets/logo.png
-
 # Create virtual environment if missing
 if [ ! -d "venv" ]; then
     echo "🐍 Creating virtual environment..."
@@ -32,6 +27,11 @@ source venv/bin/activate
 echo "📦 Installing Python dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# Download the logo and store it in assets
+echo "🖼️  Downloading logo for watermarking..."
+mkdir -p /workspace/rmvbg/assets
+curl -sSL https://help.resale1.com/wp-content/uploads/2025/02/CM.png -o /workspace/rmvbg/assets/logo.png
 
 echo "🚀 Launching server in tmux..."
 tmux kill-session -t rembg 2>/dev/null || true
