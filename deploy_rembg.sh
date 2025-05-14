@@ -5,7 +5,7 @@ apt update && apt install -y git python3-pip python3-venv ffmpeg tmux
 cd /workspace
 
 # Clone your repo
-git clone https://github.com/justinrumpf/rembg-server.git
+git -c credential.helper= clone https://github.com/justinrumpf/rmvbg.git
 cd rembg-server
 
 # Create and activate virtual environment
