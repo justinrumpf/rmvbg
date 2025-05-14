@@ -9,3 +9,6 @@ python-multipart
 filetype
 gradio
 nano
+aiofiles  
+Pillow    
+requests  
