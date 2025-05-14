@@ -1,9 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from rembg import remove, new_session
-from onnxruntime import get_available_providers
 from PIL import Image, ImageOps, ImageEnhance
 import asyncio, uuid, io, os, requests
 
@@ -12,7 +11,7 @@ app = FastAPI()
 MAX_CONCURRENT_TASKS = 1
 ESTIMATED_TIME_PER_JOB = 5
 PROCESSED_DIR = "/workspace/processed"
-LOGO_PATH = "/workspace/rmvbg/logo.png"  # Updated to use bundled logo
+LOGO_PATH = "/workspace/rmvbg/CM.png"  # Updated to use bundled logo
 
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
@@ -45,7 +44,7 @@ async def submit_image(request: Request, data: ImageRequest):
     results[job_id] = None
 
     eta_seconds = queue.qsize() * ESTIMATED_TIME_PER_JOB
-    public_url = "{public_url}"
+    public_url = get_proxy_url(request)
 
     return {
         "status": "processing",
@@ -57,7 +56,7 @@ async def submit_image(request: Request, data: ImageRequest):
 @app.get("/status/{job_id}")
 async def check_status(request: Request, job_id: str):
     result = results.get(job_id)
-    public_url = "{public_url}"
+    public_url = get_proxy_url(request)
     image_url = f"{public_url}/images/{job_id}.webp"
 
     job_keys = list(queue._queue)
@@ -96,12 +95,8 @@ async def worker():
             response = requests.get(image_url)
             response.raise_for_status()
 
-            providers = ["CUDAExecutionProvider"]
-            if "TensorrtExecutionProvider" in get_available_providers():
-                providers.insert(0, "TensorrtExecutionProvider")
-    
             input_image = Image.open(io.BytesIO(response.content)).convert("RGBA")
-            session = new_session(model_name=model_name, providers=providers)
+            session = new_session(model_name=model_name)
             removed = remove(input_image, session=session, post_process=post_process)
 
             # Resize to fit within 1024x1024 while preserving aspect ratio
@@ -158,4 +153,10 @@ async def start_workers():
     for _ in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(worker())
 
+# Serve processed images
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="images")
+
+# Serve root index.html from repo root
+@app.get("/")
+async def serve_index():
+    return FileResponse("/workspace/rmvbg/index.html")
