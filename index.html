@@ -150,12 +150,8 @@
           if (imagesLoaded === totalImages) {
               try {
                   if (window.juxtapose && window.juxtapose.JXSlider) {
-                      new juxtapose.JXSlider('#' + uniqueSliderId, {
-                          // These are the options that worked in standalone for v1.2.1
-                          startingPosition: "50%",
-                          showLabels: false, // Set to true if you add data-label to imgs
-                          // labelTexts: {left: "Before", right: "After"} // Optional custom labels
-                      });
+                      new juxtapose.JXSlider('#' + uniqueSliderId);
+             
                       console.log("Juxtapose slider initialized for #" + uniqueSliderId);
                   } else {
                        console.warn("JuxtaposeJS v1.2.1 library (juxtapose.JXSlider) not found on window.");
