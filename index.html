@@ -136,7 +136,7 @@
 
 
 
-      function initializeOrUpdateJuxtapose($card, originalImageUrl, processedImageUrl) {
+  function initializeOrUpdateJuxtapose($card, originalImageUrl, processedImageUrl) {
     const $juxtaposeWrapper = $card.find('.juxtapose-wrapper-container');
     const originalFileName = $card.data('original-filename');
     const uniqueSliderId = 'juxtapose-' + $card.data('job-id').replace(/-/g, '');
@@ -167,20 +167,13 @@
                 console.log("Target element:", document.getElementById(uniqueSliderId));
 
                 if (window.juxtapose && window.juxtapose.JXSlider) {
-                    // --- ATTEMPT 1: NO OPTIONS ---
-                    new juxtapose.JXSlider('#' + uniqueSliderId); 
-                    
-                    // --- OR ATTEMPT 2: EMPTY OPTIONS OBJECT (Try one at a time) ---
-                    // new juxtapose.JXSlider('#' + uniqueSliderId, {});
 
-                    // --- IF EITHER OF THE ABOVE WORKS, THEN TRY RE-ADDING OPTIONS ---
-                    /*
                     new juxtapose.JXSlider('#' + uniqueSliderId, {
                         animate: true, // Try commenting this out if it still fails with options
                         startingPosition: "50%",
                         showLabels: false 
                     });
-                    */
+                 
                     console.log("Juxtapose slider should be initialized for #" + uniqueSliderId);
                 } else {
                      console.warn("JuxtaposeJS library (juxtapose.JXSlider) not found on window.");
