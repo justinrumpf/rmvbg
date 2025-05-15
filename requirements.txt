@@ -12,3 +12,5 @@ nano
 aiofiles  
 Pillow    
 requests  
+httpx
+
