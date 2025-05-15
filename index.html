@@ -1182,9 +1182,9 @@
         // formData.append("title", $("#modalTitle").val().trim()); // ... and so on for all fields
 
         if (attachedImages.length > 0) {
-            formData.append("attached_images_json_string", JSON.stringify(attachedImages));
+            formData.append("attached_images_json", JSON.stringify(attachedImages));
         } else {
-            formData.append("attached_images_json_string", "[]"); // Should not happen due to check above
+            formData.append("attached_images_json", "[]"); // Should not happen due to check above
         }
 
         // Log FormData for debugging
