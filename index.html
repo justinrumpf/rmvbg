@@ -1,236 +1,378 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Batch Background Removal</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <!-- imgSlider.js CSS -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/imgslider/imgSlider.min.css">
-  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-  <style>
-    .image-card { margin-bottom: 20px; }
-    .slider-container {
-      width: 100%;
-      aspect-ratio: 1 / 1; /* Make it square, adjust if needed */
-      border: 1px solid #ccc;
-      overflow: hidden; /* Good practice */
-    }
-    /* Placeholder style for the slider container before images load */
-    .slider-container.img-placeholder {
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Batch Background Removal (JuxtaposeJS)</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <!-- JuxtaposeJS CSS -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.knightlab.com/libs/juxtapose/latest/css/juxtapose.css"
+    />
+
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <style>
+      .image-card {
+        margin-bottom: 20px;
+      }
+      /* Container for JuxtaposeJS */
+      .juxtapose-wrapper-container {
+        width: 100%;
+        /* JuxtaposeJS usually dictates its own height based on images,
+         but aspect-ratio on the wrapper can help control the space. */
+        aspect-ratio: 1 / 1;
+        border: 1px solid #ccc;
+        overflow: hidden; /* Good practice */
+        position: relative; /* For absolute positioning of placeholder if needed */
+      }
+      /* Placeholder style */
+      .juxtapose-wrapper-container.img-placeholder {
         display: flex;
-        flex-direction: column; /* Stack text lines */
+        flex-direction: column;
         align-items: center;
         justify-content: center;
         background-color: #f0f0f0;
         color: #aaa;
         font-size: 0.9em;
         text-align: center;
-    }
-    /* Ensure images within imgSlider fill their container if object-fit is desired */
-    .slider-container img {
-        /* imgSlider.js might control this, but you can try to enforce it */
-        /* width: 100% !important; */
-        /* height: 100% !important; */
-        /* object-fit: contain !important; */
-        /* Note: imgSlider.js usually handles image sizing well. Add above if needed. */
-    }
+        /* Ensure placeholder text is visible if wrapper has aspect-ratio */
+        height: 100%;
+      }
+      /* Optional: Adjust Juxtapose's default styling if needed */
+      /* .jx-slider { background-color: rgba(0,0,0,0.1); } */
+      /* .jx-handle { background-color: #007bff; } */
 
-    .status-badge { font-size: 0.8em; }
-    .card-footer { background-color: #f8f9fa; }
-  </style>
-</head>
-<body class="bg-light">
-  <div class="container py-5">
-    <div class="d-flex justify-content-between align-items-center mb-4">
+      .status-badge {
+        font-size: 0.8em;
+      }
+      .card-footer {
+        background-color: #f8f9fa;
+      }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container py-5">
+      <div class="d-flex justify-content-between align-items-center mb-4">
         <h1>Batch Image Background Removal</h1>
-        <button id="uploadItemButton" class="btn btn-success btn-lg" disabled>Upload Selected Item(s)</button>
-    </div>
-
-    <form id="uploadForm" class="mb-4">
-      <div class="mb-3">
-        <label for="imageFiles" class="form-label">Select Images (PNG, JPG, WebP):</label>
-        <input type="file" class="form-control" id="imageFiles" multiple accept="image/png, image/jpeg, image/webp">
+        <button id="uploadItemButton" class="btn btn-success btn-lg" disabled>
+          Upload Selected Item(s)
+        </button>
       </div>
-      <div class="row">
-        <div class="col-md-4 mb-3">
+
+      <form id="uploadForm" class="mb-4">
+        <div class="mb-3">
+          <label for="imageFiles" class="form-label"
+            >Select Images (PNG, JPG, WebP):</label
+          >
+          <input
+            type="file"
+            class="form-control"
+            id="imageFiles"
+            multiple
+            accept="image/png, image/jpeg, image/webp"
+          />
+        </div>
+        <div class="row">
+          <div class="col-md-4 mb-3">
             <label for="modelSelect" class="form-label">Model:</label>
             <select id="modelSelect" class="form-select">
-                <option value="u2net" selected>U2Net (General Purpose)</option>
-                <option value="u2netp">U2Netp (Lightweight)</option>
-                <option value="u2net_human_seg">U2Net Human Segmentation</option>
-                <option value="u2net_cloth_seg">U2Net Cloth Segmentation</option>
-                <option value="silueta">Silueta (Alternative to U2Net)</option>
-                <option value="isnet-general-use">IS-Net General Use</option>
-                <option value="isnet-anime">IS-Net Anime</option>
+              <option value="u2net" selected>U2Net (General Purpose)</option>
+              <option value="u2netp">U2Netp (Lightweight)</option>
+              <option value="u2net_human_seg">U2Net Human Segmentation</option>
+              <option value="u2net_cloth_seg">U2Net Cloth Segmentation</option>
+              <option value="silueta">Silueta (Alternative to U2Net)</option>
+              <option value="isnet-general-use">IS-Net General Use</option>
+              <option value="isnet-anime">IS-Net Anime</option>
             </select>
-        </div>
-        <div class="col-md-4 mb-3 d-flex align-items-end">
-             <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="postProcessCheck">
-                <label class="form-check-label" for="postProcessCheck">
-                    Enable Post-Processing (Alpha Matting)
-                </label>
+          </div>
+          <div class="col-md-4 mb-3 d-flex align-items-end">
+            <div class="form-check">
+              <input
+                class="form-check-input"
+                type="checkbox"
+                id="postProcessCheck"
+              />
+              <label class="form-check-label" for="postProcessCheck">
+                Enable Post-Processing (Alpha Matting)
+              </label>
             </div>
+          </div>
+          <div class="col-md-4 mb-3 d-flex align-items-end">
+            <button type="submit" class="btn btn-primary w-100">
+              Process Selected Images
+            </button>
+          </div>
         </div>
-        <div class="col-md-4 mb-3 d-flex align-items-end">
-            <button type="submit" class="btn btn-primary w-100">Process Selected Images</button>
-        </div>
+      </form>
+
+      <hr />
+      <div id="results" class="row mt-4">
+        <!-- Image cards will be appended here -->
       </div>
-    </form>
-
-    <hr>
-    <div id="results" class="row mt-4">
-      <!-- Image cards will be appended here -->
     </div>
-  </div>
 
-  <!-- imgSlider.js JavaScript -->
-  <script src="https://cdn.jsdelivr.net/npm/imgslider/imgSlider.min.js"></script>
-  <script>
-    const submitApiUrl = '/submit';
-    const statusApiUrl = '/status/';
-    const apiKey = 'secretApiKey'; // WARNING: Not secure for production!
-    
-    let jobFileMap = {}; // jobId -> File object
+    <!-- JuxtaposeJS JavaScript -->
+    <script src="https://cdn.knightlab.com/libs/juxtapose/latest/js/juxtapose.min.js"></script>
 
-    function updateUploadButtonStatus() {
-        const anySelected = $('#results input[type="radio"]:checked').length > 0;
-        $('#uploadItemButton').prop('disabled', !anySelected);
-    }
+    <script>
+      const submitApiUrl = "/submit";
+      const statusApiUrl = "/status/";
+      const apiKey = "secretApiKey"; // WARNING: Not secure for production!
 
-    function initializeOrUpdateSlider($card, originalImageUrl, processedImageUrl) {
-        const $sliderContainer = $card.find('.slider-container');
-        const originalFileName = $card.data('original-filename');
+      let jobFileMap = {}; // jobId -> File object
+
+      function updateUploadButtonStatus() {
+        const anySelected =
+          $('#results input[type="radio"]:checked').length > 0;
+        $("#uploadItemButton").prop("disabled", !anySelected);
+      }
+
+      function initializeOrUpdateJuxtapose(
+        $card,
+        originalImageUrl,
+        processedImageUrl
+      ) {
+        const $juxtaposeWrapper = $card.find(".juxtapose-wrapper-container");
+        const originalFileName = $card.data("original-filename");
+        // Create a unique ID for each Juxtapose instance
+        const uniqueSliderId =
+          "juxtapose-" + $card.data("job-id").replace(/-/g, ""); // Ensure ID is valid
 
         // Clear previous slider content and placeholder status
-        $sliderContainer.removeClass('img-placeholder').empty();
+        $juxtaposeWrapper.removeClass("img-placeholder").empty();
 
-        const $beforeImgTag = $('<img>')
-            .attr('src', originalImageUrl)
-            .attr('alt', 'Original: ' + originalFileName);
-        const $afterImgTag = $('<img>')
-            .attr('src', processedImageUrl + `?t=${new Date().getTime()}`) // Cache bust
-            .attr('alt', 'Processed: ' + originalFileName);
+        // Create the div that JuxtaposeJS will target.
+        // JuxtaposeJS applies its own class `jx-slider` internally.
+        // We give it a unique ID to initialize it specifically.
+        const $juxtaposeDiv = $("<div>").attr("id", uniqueSliderId);
 
-        $sliderContainer.append($beforeImgTag).append($afterImgTag);
+        const $beforeImgTag = $("<img>")
+          .attr("src", originalImageUrl)
+          .attr("alt", "Original: " + originalFileName);
+        // data-label for JuxtaposeJS can be added here if showLabels: true
+        // .attr('data-label', 'Original');
+        const $afterImgTag = $("<img>")
+          .attr("src", processedImageUrl + `?t=${new Date().getTime()}`) // Cache bust
+          .attr("alt", "Processed: " + originalFileName);
+        // .attr('data-label', 'Processed');
 
-        // Wait for both images to load before initializing the slider
-        // This is important for imgSlider to calculate dimensions correctly.
+        $juxtaposeDiv.append($beforeImgTag).append($afterImgTag);
+        $juxtaposeWrapper.append($juxtaposeDiv);
+
+        // Wait for images to load before initializing JuxtaposeJS
+        // This is important for it to calculate dimensions correctly.
         let imagesLoaded = 0;
         const totalImages = 2;
 
         function onImageLoad() {
-            imagesLoaded++;
-            if (imagesLoaded === totalImages) {
-                try {
-                    imgSlider($sliderContainer[0]); // Initialize imgSlider
-                } catch (e) {
-                    console.error("Error initializing imgSlider:", e);
-                    $sliderContainer.addClass('img-placeholder').text('Error initializing slider.');
-                }
+          imagesLoaded++;
+          if (imagesLoaded === totalImages) {
+            try {
+              // Check if the Juxtapose library is loaded
+              if (window.juxtapose && window.juxtapose.JXSlider) {
+                new juxtapose.JXSlider("#" + uniqueSliderId, {
+                  animate: true,
+                  startingPosition: "50%", // Default is "50%"
+                  showLabels: false, // Set to true to use data-label on imgs
+                  // mode: 'horizontal', // Default
+                  // makeResponsive: true // Default
+                });
+                console.log(
+                  "Juxtapose slider initialized for #" + uniqueSliderId
+                );
+              } else {
+                console.warn(
+                  "JuxtaposeJS library (juxtapose.JXSlider) not found on window."
+                );
+                $juxtaposeWrapper
+                  .addClass("img-placeholder")
+                  .text("Slider library error.");
+              }
+            } catch (e) {
+              console.error(
+                "Error initializing JuxtaposeJS slider for #" +
+                  uniqueSliderId +
+                  ":",
+                e
+              );
+              $juxtaposeWrapper
+                .addClass("img-placeholder")
+                .text("Error initializing slider.");
             }
-        }
-
-        $beforeImgTag.on('load', onImageLoad).on('error', function() {
-            console.error('Error loading original image for slider:', originalImageUrl);
-            $sliderContainer.addClass('img-placeholder').text('Error loading original image.');
-            // Don't increment imagesLoaded to prevent faulty slider init
-        });
-        $afterImgTag.on('load', onImageLoad).on('error', function() {
-            console.error('Error loading processed image for slider:', processedImageUrl);
-            $sliderContainer.addClass('img-placeholder').text('Error loading processed image.');
-            // Don't increment imagesLoaded
-        });
-
-        // Fallback if images are already cached and 'load' doesn't fire consistently
-        // or if one image fails to load. A timeout can help.
-        setTimeout(() => {
-            if (imagesLoaded < totalImages && !$sliderContainer.hasClass('img-placeholder')) {
-                 // If after a short delay, images haven't loaded and no error text is set,
-                 // it might mean they were cached. Try initializing anyway, or add more robust checks.
-                 console.warn("Slider images might be cached or one failed to trigger load event properly. Attempting init.");
-                 if ($beforeImgTag[0].complete && $afterImgTag[0].complete && $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
-                    if (imagesLoaded < totalImages) imagesLoaded = totalImages; // Force it
-                    onImageLoad(); // This will trigger init if both are considered complete
-                 }
-            }
-        }, 500); // Adjust timeout as needed
-    }
-
-
-    function pollStatus(jobId, cardElement) {
-      const $card = $(cardElement);
-      const $statusText = $card.find('.status-text');
-      const $progressBar = $card.find('.progress-bar');
-      const $sliderContainer = $card.find('.slider-container');
-      const $refreshButton = $card.find('.refresh-btn');
-      const originalImageUrl = $card.data('original-url'); // Stored when job submitted
-
-      $.getJSON(statusApiUrl + jobId, function(data) {
-        $statusText.text(data.status.charAt(0).toUpperCase() + data.status.slice(1) + (data.eta > 0 ? ` (ETA: ${data.eta}s)` : ''));
-        $refreshButton.prop('disabled', data.status === 'processing' || data.status === 'queued');
-
-        if (data.status === 'done') {
-          $statusText.html('<span class="badge bg-success status-badge">✅ Done</span>');
-          $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-success').css('width', '100%');
-          
-          if (data.processed_image_url && originalImageUrl) {
-            initializeOrUpdateSlider($card, originalImageUrl, data.processed_image_url);
-          } else {
-             $sliderContainer.addClass('img-placeholder').text('Image URLs missing for slider.');
-             if (!originalImageUrl) console.error("Original image URL missing for job", jobId);
-             if (!data.processed_image_url) console.error("Processed image URL missing for job", jobId);
           }
-          $card.data('processed-url', data.processed_image_url);
-          $card.find('input[name="image_choice_' + jobId + '"][value="processed"]').data('url', data.processed_image_url);
-        } else if (data.status === 'error') {
-          $statusText.html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${data.error_message || 'Unknown error'}`);
-          $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
-          $sliderContainer.addClass('img-placeholder').text('Processing Error: ' + (data.error_message || 'Unknown issue'));
-        } else if (data.status === 'processing' || data.status === 'queued') {
-          $statusText.html(`<span class="badge bg-info text-dark status-badge">${data.status === 'processing' ? '⚙️ Processing...' : '⏳ Queued...'}</span> (ETA: ${data.eta}s)`);
-          $progressBar.addClass('progress-bar-striped progress-bar-animated').removeClass('bg-success bg-danger').css('width', '50%');
-          // Placeholder text is set during card creation
-          setTimeout(() => pollStatus(jobId, cardElement), 2000);
         }
-        updateUploadButtonStatus();
-      }).fail(function() {
-        $statusText.html('<span class="badge bg-danger status-badge">❌ Error</span>: Failed to get status');
-        $progressBar.removeClass('progress-bar-striped progress-bar-animated').addClass('bg-danger').css('width', '100%');
-        $sliderContainer.addClass('img-placeholder').text('Status Check Failed.');
-        $refreshButton.prop('disabled', false);
-        updateUploadButtonStatus();
-      });
-    }
 
-    $('#uploadForm').on('submit', function(e) {
-      e.preventDefault();
-      const files = $('#imageFiles')[0].files;
-      const model = $('#modelSelect').val();
-      const postProcess = $('#postProcessCheck').is(':checked');
+        $beforeImgTag.on("load", onImageLoad).on("error", function () {
+          console.error(
+            "Error loading original image for Juxtapose slider:",
+            originalImageUrl
+          );
+          $juxtaposeWrapper
+            .addClass("img-placeholder")
+            .text("Error loading original image.");
+        });
+        $afterImgTag.on("load", onImageLoad).on("error", function () {
+          console.error(
+            "Error loading processed image for Juxtapose slider:",
+            processedImageUrl
+          );
+          $juxtaposeWrapper
+            .addClass("img-placeholder")
+            .text("Error loading processed image.");
+        });
 
-      if (files.length === 0) {
-        alert('Please select one or more image files.');
-        return;
+        // Fallback for cached images
+        setTimeout(() => {
+          if (
+            imagesLoaded < totalImages &&
+            !$juxtaposeWrapper.hasClass("img-placeholder")
+          ) {
+            if (
+              $beforeImgTag[0].complete &&
+              $afterImgTag[0].complete &&
+              $beforeImgTag[0].naturalWidth > 0 &&
+              $afterImgTag[0].naturalWidth > 0
+            ) {
+              if (imagesLoaded < totalImages) imagesLoaded = totalImages; // Mark as loaded
+              onImageLoad(); // Trigger init attempt
+            } else if (imagesLoaded < totalImages) {
+              // If still not loaded and no error set
+              console.warn(
+                "Juxtapose images might be cached or failed to load without error event for #" +
+                  uniqueSliderId
+              );
+              // $juxtaposeWrapper.addClass('img-placeholder').text('Image load timeout.'); // Optional: indicate timeout
+            }
+          }
+        }, 700); // Increased timeout slightly
       }
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const formData = new FormData();
-        formData.append('image_file', file);
-        formData.append('api_key', apiKey);
-        formData.append('model', model);
-        formData.append('post_process', postProcess);
+      function pollStatus(jobId, cardElement) {
+        const $card = $(cardElement);
+        const $statusText = $card.find(".status-text");
+        const $progressBar = $card.find(".progress-bar");
+        const $juxtaposeWrapper = $card.find(".juxtapose-wrapper-container");
+        const $refreshButton = $card.find(".refresh-btn");
+        const originalImageUrl = $card.data("original-url");
 
-        const originalFileName = file.name;
-        const tempJobId = `temp-${Date.now()}-${i}`;
-        
-        const cardHtml = `
+        $.getJSON(statusApiUrl + jobId, function (data) {
+          $statusText.text(
+            data.status.charAt(0).toUpperCase() +
+              data.status.slice(1) +
+              (data.eta > 0 ? ` (ETA: ${data.eta}s)` : "")
+          );
+          $refreshButton.prop(
+            "disabled",
+            data.status === "processing" || data.status === "queued"
+          );
+
+          if (data.status === "done") {
+            $statusText.html(
+              '<span class="badge bg-success status-badge">✅ Done</span>'
+            );
+            $progressBar
+              .removeClass("progress-bar-striped progress-bar-animated")
+              .addClass("bg-success")
+              .css("width", "100%");
+
+            if (data.processed_image_url && originalImageUrl) {
+              initializeOrUpdateJuxtapose(
+                $card,
+                originalImageUrl,
+                data.processed_image_url
+              );
+            } else {
+              $juxtaposeWrapper
+                .addClass("img-placeholder")
+                .text("Image URLs missing for slider.");
+              if (!originalImageUrl)
+                console.error("Original image URL missing for job", jobId);
+              if (!data.processed_image_url)
+                console.error("Processed image URL missing for job", jobId);
+            }
+            $card.data("processed-url", data.processed_image_url);
+            $card
+              .find(
+                'input[name="image_choice_' + jobId + '"][value="processed"]'
+              )
+              .data("url", data.processed_image_url);
+          } else if (data.status === "error") {
+            $statusText.html(
+              `<span class="badge bg-danger status-badge">❌ Error</span>: ${
+                data.error_message || "Unknown error"
+              }`
+            );
+            $progressBar
+              .removeClass("progress-bar-striped progress-bar-animated")
+              .addClass("bg-danger")
+              .css("width", "100%");
+            $juxtaposeWrapper
+              .addClass("img-placeholder")
+              .text(
+                "Processing Error: " + (data.error_message || "Unknown issue")
+              );
+          } else if (data.status === "processing" || data.status === "queued") {
+            $statusText.html(
+              `<span class="badge bg-info text-dark status-badge">${
+                data.status === "processing"
+                  ? "⚙️ Processing..."
+                  : "⏳ Queued..."
+              }</span> (ETA: ${data.eta}s)`
+            );
+            $progressBar
+              .addClass("progress-bar-striped progress-bar-animated")
+              .removeClass("bg-success bg-danger")
+              .css("width", "50%");
+            setTimeout(() => pollStatus(jobId, cardElement), 2000);
+          }
+          updateUploadButtonStatus();
+        }).fail(function () {
+          $statusText.html(
+            '<span class="badge bg-danger status-badge">❌ Error</span>: Failed to get status'
+          );
+          $progressBar
+            .removeClass("progress-bar-striped progress-bar-animated")
+            .addClass("bg-danger")
+            .css("width", "100%");
+          $juxtaposeWrapper
+            .addClass("img-placeholder")
+            .text("Status Check Failed.");
+          $refreshButton.prop("disabled", false);
+          updateUploadButtonStatus();
+        });
+      }
+
+      $("#uploadForm").on("submit", function (e) {
+        e.preventDefault();
+        const files = $("#imageFiles")[0].files;
+        const model = $("#modelSelect").val();
+        const postProcess = $("#postProcessCheck").is(":checked");
+
+        if (files.length === 0) {
+          alert("Please select one or more image files.");
+          return;
+        }
+
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          const formData = new FormData();
+          formData.append("image_file", file);
+          formData.append("api_key", apiKey);
+          formData.append("model", model);
+          formData.append("post_process", postProcess);
+
+          const originalFileName = file.name;
+          const tempJobId = `temp-${Date.now()}-${i}`; // Temporary ID for UI element
+
+          const cardHtml = `
           <div class="col-md-4 image-card" id="card-${tempJobId}" data-original-filename="${originalFileName}">
             <div class="card">
-              <div class="slider-container img-placeholder">
-                Original: Loading preview...<br>Processed: Queued
+              <div class="juxtapose-wrapper-container img-placeholder">
+                Original: Awaiting submission<br>Processed: Queued
               </div>
               <div class="card-body">
                 <h5 class="card-title small">${originalFileName}</h5>
@@ -253,152 +395,219 @@
               </div>
             </div>
           </div>`;
-        const $card = $(cardHtml);
-        $('#results').append($card);
-        
-        // For imgSlider, we need the server-provided original URL later.
-        // We can show a FileReader preview in the placeholder text or a separate small preview if desired.
-        // For now, the placeholder text "Original: Loading preview..." is sufficient.
-        // The actual original for the slider will come from `data.original_image_url`.
+          const $card = $(cardHtml);
+          $("#results").append($card);
+
+          $.ajax({
+            url: submitApiUrl,
+            method: "POST",
+            data: formData,
+            processData: false,
+            contentType: false,
+            success: function (data) {
+              if (data.job_id) {
+                jobFileMap[data.job_id] = file;
+
+                $card.attr("id", `card-${data.job_id}`);
+                $card.data("job-id", data.job_id);
+                $card.data("original-url", data.original_image_url);
+
+                $card.find(".job-id-text").text(`Job ID: ${data.job_id}`);
+                $card
+                  .find(".refresh-btn")
+                  .data("jobid", data.job_id)
+                  .prop("disabled", true);
+
+                $card
+                  .find('input[name="image_choice_' + tempJobId + '"]')
+                  .attr("name", `image_choice_${data.job_id}`);
+                $card
+                  .find('input[value="original"]')
+                  .data("url", data.original_image_url);
+
+                $card
+                  .find(".juxtapose-wrapper-container.img-placeholder")
+                  .html(
+                    `Original: Waiting for server URL<br>Processed: ${
+                      data.status === "queued" ? "Queued" : "Processing..."
+                    }`
+                  );
+
+                pollStatus(data.job_id, $card[0]);
+              } else {
+                $card
+                  .find(".status-text")
+                  .html(
+                    '<span class="badge bg-danger status-badge">❌ Submission Error</span>'
+                  );
+                $card
+                  .find(".progress-bar")
+                  .addClass("bg-danger")
+                  .css("width", "100%");
+                $card
+                  .find(".juxtapose-wrapper-container.img-placeholder")
+                  .text("Submission Error.");
+              }
+            },
+            error: function (xhr) {
+              let errorMsg = "Submission failed.";
+              if (xhr.responseJSON && xhr.responseJSON.error) {
+                errorMsg = xhr.responseJSON.error;
+              } else if (xhr.responseJSON && xhr.responseJSON.detail) {
+                // FastAPI validation errors
+                if (Array.isArray(xhr.responseJSON.detail)) {
+                  errorMsg = xhr.responseJSON.detail
+                    .map((d) => `${d.loc.join(".")} - ${d.msg}`)
+                    .join("; ");
+                } else {
+                  errorMsg = xhr.responseJSON.detail;
+                }
+              }
+              $card
+                .find(".status-text")
+                .html(
+                  `<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`
+                );
+              $card
+                .find(".progress-bar")
+                .addClass("bg-danger")
+                .css("width", "100%");
+              $card
+                .find(".juxtapose-wrapper-container.img-placeholder")
+                .text("AJAX Submission Error.");
+            },
+          });
+        }
+        $("#imageFiles").val("");
+      });
+
+      $("#results").on("click", ".refresh-btn", function () {
+        const jobIdToRefresh = $(this).data("jobid");
+        const originalFile = jobFileMap[jobIdToRefresh];
+        const $card = $(`#card-${jobIdToRefresh}`);
+
+        if (!originalFile) {
+          alert("Original file not found for re-processing.");
+          return;
+        }
+
+        const model = $("#modelSelect").val();
+        const postProcess = $("#postProcessCheck").is(":checked");
+
+        const formData = new FormData();
+        formData.append("image_file", originalFile);
+        formData.append("api_key", apiKey);
+        formData.append("model", model);
+        formData.append("post_process", postProcess);
+
+        $card
+          .find(".status-text")
+          .html(
+            '<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>'
+          );
+        $card
+          .find(".progress-bar")
+          .removeClass("bg-success bg-danger")
+          .addClass("progress-bar-striped progress-bar-animated")
+          .css("width", "10%");
+        $card
+          .find(".juxtapose-wrapper-container")
+          .addClass("img-placeholder")
+          .empty()
+          .text("Re-processing... (Slider will refresh)");
+        $card.find(".refresh-btn").prop("disabled", true);
+        $card.data("processed-url", null);
+        $card.find('input[value="processed"]').data("url", null);
 
         $.ajax({
           url: submitApiUrl,
-          method: 'POST',
+          method: "POST",
           data: formData,
           processData: false,
           contentType: false,
-          success: function(data) {
-            if (data.job_id) {
-              jobFileMap[data.job_id] = file;
-              
-              $card.attr('id', `card-${data.job_id}`);
-              $card.data('job-id', data.job_id);
-              $card.data('original-url', data.original_image_url); // Crucial for imgSlider
-              
-              $card.find('.job-id-text').text(`Job ID: ${data.job_id}`);
-              $card.find('.refresh-btn').data('jobid', data.job_id).prop('disabled', true);
-              
-              $card.find('input[name="image_choice_' + tempJobId + '"]').attr('name', `image_choice_${data.job_id}`);
-              $card.find('input[value="original"]').data('url', data.original_image_url);
-              
-              // Update placeholder text with more accurate info
-              $card.find('.slider-container.img-placeholder').html(`Original: Waiting for server URL<br>Processed: ${data.status === 'queued' ? 'Queued' : 'Processing...'}`);
+          success: function (newData) {
+            if (newData.job_id) {
+              delete jobFileMap[jobIdToRefresh];
+              jobFileMap[newData.job_id] = originalFile;
 
-              pollStatus(data.job_id, $card[0]);
+              $card.attr("id", `card-${newData.job_id}`);
+              $card.data("job-id", newData.job_id);
+              $card.data("original-url", newData.original_image_url);
+
+              $card.find(".job-id-text").text(`Job ID: ${newData.job_id}`);
+              $card.find(".refresh-btn").data("jobid", newData.job_id);
+              $card
+                .find('input[type="radio"]')
+                .attr("name", `image_choice_${newData.job_id}`);
+              $card
+                .find('input[value="original"]')
+                .data("url", newData.original_image_url);
+
+              $card
+                .find(".juxtapose-wrapper-container.img-placeholder")
+                .html(
+                  `Original: Waiting for server URL<br>Processed: ${
+                    newData.status === "queued" ? "Queued" : "Processing..."
+                  }`
+                );
+
+              pollStatus(newData.job_id, $card[0]);
             } else {
-              $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Submission Error</span>');
-              $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
-              $card.find('.slider-container.img-placeholder').text('Submission Error.');
+              $card
+                .find(".status-text")
+                .html(
+                  '<span class="badge bg-danger status-badge">❌ Re-submission Error</span>'
+                );
+              $card.find(".refresh-btn").prop("disabled", false);
             }
           },
-          error: function(xhr) {
-            let errorMsg = 'Submission failed.';
-            // ... (error message parsing as before) ...
-            $card.find('.status-text').html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`);
-            $card.find('.progress-bar').addClass('bg-danger').css('width', '100%');
-            $card.find('.slider-container.img-placeholder').text('AJAX Submission Error.');
+          error: function () {
+            $card
+              .find(".status-text")
+              .html(
+                '<span class="badge bg-danger status-badge">❌ Re-submission Failed</span>'
+              );
+            $card.find(".refresh-btn").prop("disabled", false);
+          },
+        });
+      });
+
+      $("#uploadItemButton").on("click", function () {
+        const selectedImageUrls = [];
+        $("#results .image-card").each(function () {
+          const $card = $(this);
+          const jobId = $card.data("job-id");
+          if (!jobId || jobId.startsWith("temp-")) return;
+
+          const selectedValue = $card
+            .find(`input[name="image_choice_${jobId}"]:checked`)
+            .val();
+
+          if (selectedValue) {
+            const url = $card
+              .find(`input[value="${selectedValue}"]`)
+              .data("url");
+            if (url) {
+              selectedImageUrls.push(encodeURIComponent(url));
+            }
           }
         });
-      }
-      $('#imageFiles').val('');
-    });
 
-    $('#results').on('click', '.refresh-btn', function() {
-      const jobIdToRefresh = $(this).data('jobid');
-      const originalFile = jobFileMap[jobIdToRefresh];
-      const $card = $(`#card-${jobIdToRefresh}`);
-      
-      if (!originalFile) {
-        alert('Original file not found for re-processing.');
-        return;
-      }
-
-      const model = $('#modelSelect').val();
-      const postProcess = $('#postProcessCheck').is(':checked');
-
-      const formData = new FormData();
-      formData.append('image_file', originalFile);
-      formData.append('api_key', apiKey);
-      formData.append('model', model);
-      formData.append('post_process', postProcess);
-
-      // Visually reset the card for the new job
-      $card.find('.status-text').html('<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>');
-      $card.find('.progress-bar').removeClass('bg-success bg-danger').addClass('progress-bar-striped progress-bar-animated').css('width', '10%');
-      $card.find('.slider-container').addClass('img-placeholder').empty().text('Re-processing... (Slider will refresh)'); // Reset slider area
-      $card.find('.refresh-btn').prop('disabled', true);
-      $card.data('processed-url', null);
-      $card.find('input[value="processed"]').data('url', null);
-
-      $.ajax({
-        url: submitApiUrl,
-        method: 'POST',
-        data: formData,
-        processData: false,
-        contentType: false,
-        success: function(newData) {
-          if (newData.job_id) {
-            delete jobFileMap[jobIdToRefresh];
-            jobFileMap[newData.job_id] = originalFile;
-
-            const oldCardId = $card.attr('id');
-            const newCardId = `card-${newData.job_id}`;
-            $card.attr('id', newCardId); // Update card ID itself
-            
-            // Update all internal references if necessary, or ensure they use data attributes relative to current card
-            $card.data('job-id', newData.job_id);
-            $card.data('original-url', newData.original_image_url); // Update original URL for new job
-            
-            $card.find('.job-id-text').text(`Job ID: ${newData.job_id}`);
-            $card.find('.refresh-btn').data('jobid', newData.job_id);
-            $card.find('input[type="radio"]').attr('name', `image_choice_${newData.job_id}`);
-            $card.find('input[value="original"]').data('url', newData.original_image_url);
-            
-            // Placeholder for new job
-            $card.find('.slider-container.img-placeholder').html(`Original: Waiting for server URL<br>Processed: ${newData.status === 'queued' ? 'Queued' : 'Processing...'}`);
-
-            pollStatus(newData.job_id, $card[0]);
-          } else {
-            $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>');
-            $card.find('.refresh-btn').prop('disabled', false);
-          }
-        },
-        error: function() {
-          $card.find('.status-text').html('<span class="badge bg-danger status-badge">❌ Re-submission Failed</span>');
-          $card.find('.refresh-btn').prop('disabled', false);
-        }
-      });
-    });
-
-    $('#uploadItemButton').on('click', function() {
-      const selectedImageUrls = [];
-      $('#results .image-card').each(function() {
-        const $card = $(this);
-        const jobId = $card.data('job-id');
-        if (!jobId || jobId.startsWith('temp-')) return; // Skip cards not yet fully submitted or temp ones
-
-        const selectedValue = $card.find(`input[name="image_choice_${jobId}"]:checked`).val();
-        
-        if (selectedValue) {
-          const url = $card.find(`input[value="${selectedValue}"]`).data('url');
-          if (url) {
-            selectedImageUrls.push(encodeURIComponent(url));
-          }
+        if (selectedImageUrls.length > 0) {
+          const uploadUrl = `/upload-item?images=${selectedImageUrls.join(
+            "&images="
+          )}`;
+          window.open(uploadUrl, "_blank");
+        } else {
+          alert(
+            "No images selected or ready for upload. Please check your selections."
+          );
         }
       });
 
-      if (selectedImageUrls.length > 0) {
-        const uploadUrl = `/upload-item?images=${selectedImageUrls.join('&images=')}`;
-        window.open(uploadUrl, '_blank');
-      } else {
-        alert('No images selected or ready for upload. Please check your selections.');
-      }
-    });
-    
-    $('#results').on('change', '.image-select-radio', function() {
+      $("#results").on("change", ".image-select-radio", function () {
         updateUploadButtonStatus();
-    });
-
-  </script>
-</body>
+      });
+    </script>
+  </body>
 </html>
