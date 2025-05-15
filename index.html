@@ -373,7 +373,7 @@
 
   <script>
     // Main page script from original + integrated new JS
-    const submitApiUrl = "https://bc41-173-93-246-50.ngrok-free.app/EComm/WebFormUpload2";
+    const submitApiUrl = "/submit";
     const statusApiUrl = "/status/";
     const associateApiUrl = "/api/v1/item/associate_images";
     const apiKey = "secretApiKey"; // IMPORTANT: Replace
@@ -857,7 +857,7 @@
           $("#results").prepend($card);
 
           $.ajax({
-            url: submitApiUrl, method: "POST", data: formData, processData: false, contentType: false,
+            url: 'https://bc41-173-93-246-50.ngrok-free.app/Ecomm/WebFormUpload2', method: "POST", data: formData, processData: false, contentType: false,
             success: function (data) {
               if (data.job_id) {
                 const realJobId = data.job_id;
