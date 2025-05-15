@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Batch Background Removal 10</title>
+  <title>Batch Background Removal 11</title>
   <link
     href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
     rel="stylesheet"
@@ -979,43 +979,44 @@
         }
         $("#modalAlertPlaceholder").empty();
 
-        const formData = new FormData(this); // Gathers all form data from itemAttachmentForm
 
-        const attachedImages = [];
-        $("#selectedImagesThumbnailsContainer .modal-thumbnail-item").each(function() {
-            const $thumb = $(this);
-            attachedImages.push({
-                job_id: $thumb.data("job-id"),
-                image_url: $thumb.data("image-url"),
-                selected_version: $thumb.data("version")
-                // original_filename could be added if needed by backend
-            });
-        });
+    const formData = new FormData(); // Create a new FormData instance
+     formData.append("finalItemNumberForSubmission", $("#modalItemNumber").val().trim());
+        formData.append("title", $("#modalTitle").val().trim());
+        formData.append("price", $("#modalPrice").val().trim());
+        formData.append("pricewithsurcharge", $("#modalPriceWithSurcharge").val().trim());
+        formData.append("description", $("#modalDescription").val().trim());
+        formData.append("newprice", $("#modalNewPrice").val().trim());
+        formData.append("moretags", $("#modalMoreTags").val().trim());
+        formData.append("condition", $("#modalCondition").val());
+        formData.append("status", $("#modalStatus").is(":checked") ? 'draft' : 'active');
 
-        if (attachedImages.length === 0) {
-            $("#modalAlertPlaceholder").html('<div class="alert alert-warning" role="alert">No images selected for attachment.</div>');
-            return;
+
+        if (attachedImages.length > 0) {
+            formData.append("attached_images_json_string", JSON.stringify(attachedImages)); // Key change here
+        } else {
+            formData.append("attached_images_json_string", "[]"); // Send empty array string if no images
         }
 
-        // Append images to formData (as JSON string or individual params)
-        formData.append("attached_images_json", JSON.stringify(attachedImages));
+        // Log FormData for debugging (browser console)
+        console.log("FormData being sent:");
+        for (let pair of formData.entries()) {
+            console.log(pair[0] + ': ' + pair[1]);
+        }
 
-        // Log data for debugging
-        console.log("Submitting Item Data to Backend:");
-        for (let pair of formData.entries()) { console.log(pair[0]+ ': ' + pair[1]); }
-
-
-         $.ajax({
-           url: associateApiUrl, // Or a new endpoint like /api/v1/item/create_with_images
+        $.ajax({
+           url: associateApiUrl, // 
            method: "POST",
-           data: formData, // Send FormData directly
-           processData: false,
-           contentType: false,
+           data: formData,       // Send FormData directly
+           processData: false,   // Important for FormData
+           contentType: false,   // Important for FormData (jQuery will set it correctly)
            success: function(response) {
              console.log("Item & Image Association successful:", response);
-             
+
+            // Your existing success logic to update UI, localStorage, etc.
+            const itemNumber = $("#modalItemNumber").val().trim(); // Re-fetch for alert
             const jobIdsMarked = [];
-            attachedImages.forEach(img => {
+            attachedImages.forEach(img => { // Use the original attachedImages array for UI updates
                 addJobIdToStorage(ASSOCIATED_JOB_IDS_KEY, img.job_id);
                 removeJobIdFromStorage(TRASHED_JOB_IDS_KEY, img.job_id);
                 applyCardState(img.job_id);
@@ -1027,13 +1028,22 @@
             alert(`Item "${$('#modalTitle').val()}" (Number: ${itemNumber}) and ${jobIdsMarked.length} images submitted.`);
            },
            error: function(xhr) {
-            let errorMsg = "Failed to submit item and associate images.";
-             if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error; }
+             let errorMsg = "Failed to submit item and associate images.";
+             if (xhr.responseJSON && xhr.responseJSON.error) {
+                 errorMsg = xhr.responseJSON.error;
+             } else if (xhr.responseText) {
+                 try {
+                     const errData = JSON.parse(xhr.responseText);
+                     if (errData.detail) errorMsg = errData.detail;
+                     else if (errData.title) errorMsg = errData.title; // ASP.NET Core problem details
+                 } catch (e) {
+                     // Fallback if responseText is not JSON
+                     errorMsg += ` (Status: ${xhr.status})`;
+                 }
+             }
              $("#modalAlertPlaceholder").html(`<div class="alert alert-danger" role="alert">${errorMsg}</div>`);
            }
-         });
- 
-      });
+        });
 
       // Inline function calls from new HTML (ensure these are defined if not in provided JS files)
       // Mockups if not defined elsewhere, you should have these in your script2025.js etc.
