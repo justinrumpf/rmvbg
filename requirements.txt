@@ -11,6 +11,4 @@ gradio
 nano
 aiofiles  
 Pillow    
-requests  
-httpx
-
+requests
