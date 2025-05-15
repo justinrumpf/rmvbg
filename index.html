@@ -131,125 +131,94 @@
         $("#uploadItemButton").prop("disabled", !anySelected);
       }
 
-      function initializeOrUpdateJuxtapose(
-        $card,
-        originalImageUrl,
-        processedImageUrl
-      ) {
-        const $juxtaposeWrapper = $card.find(".juxtapose-wrapper-container");
-        const originalFileName = $card.data("original-filename");
-        // Create a unique ID for each Juxtapose instance
-        const uniqueSliderId =
-          "juxtapose-" + $card.data("job-id").replace(/-/g, ""); // Ensure ID is valid
 
-        // Clear previous slider content and placeholder status
-        $juxtaposeWrapper.removeClass("img-placeholder").empty();
 
-        // Create the div that JuxtaposeJS will target.
-        // JuxtaposeJS applies its own class `jx-slider` internally.
-        // We give it a unique ID to initialize it specifically.
-        const $juxtaposeDiv = $("<div>").attr("id", uniqueSliderId);
 
-        const $beforeImgTag = $("<img>")
-          .attr("src", originalImageUrl)
-          .attr("alt", "Original: " + originalFileName);
-        // data-label for JuxtaposeJS can be added here if showLabels: true
-        // .attr('data-label', 'Original');
-        const $afterImgTag = $("<img>")
-          .attr("src", processedImageUrl + `?t=${new Date().getTime()}`) // Cache bust
-          .attr("alt", "Processed: " + originalFileName);
-        // .attr('data-label', 'Processed');
 
-        $juxtaposeDiv.append($beforeImgTag).append($afterImgTag);
-        $juxtaposeWrapper.append($juxtaposeDiv);
 
-        // Wait for images to load before initializing JuxtaposeJS
-        // This is important for it to calculate dimensions correctly.
-        let imagesLoaded = 0;
-        const totalImages = 2;
+      function initializeOrUpdateJuxtapose($card, originalImageUrl, processedImageUrl) {
+    const $juxtaposeWrapper = $card.find('.juxtapose-wrapper-container');
+    const originalFileName = $card.data('original-filename');
+    const uniqueSliderId = 'juxtapose-' + $card.data('job-id').replace(/-/g, '');
 
-        function onImageLoad() {
-          imagesLoaded++;
-          if (imagesLoaded === totalImages) {
+    $juxtaposeWrapper.removeClass('img-placeholder').empty();
+
+    const $juxtaposeDiv = $('<div>').attr('id', uniqueSliderId);
+    
+    const $beforeImgTag = $('<img>')
+        .attr('src', originalImageUrl)
+        .attr('alt', 'Original: ' + originalFileName);
+    const $afterImgTag = $('<img>')
+        .attr('src', processedImageUrl + `?t=${new Date().getTime()}`)
+        .attr('alt', 'Processed: ' + originalFileName);
+
+    $juxtaposeDiv.append($beforeImgTag).append($afterImgTag);
+    $juxtaposeWrapper.append($juxtaposeDiv);
+
+    let imagesLoaded = 0;
+    const totalImages = 2;
+
+    function onImageLoad() {
+        imagesLoaded++;
+        if (imagesLoaded === totalImages) {
             try {
-              // Check if the Juxtapose library is loaded
-              if (window.juxtapose && window.juxtapose.JXSlider) {
-                new juxtapose.JXSlider("#" + uniqueSliderId, {
-                  animate: true,
-                  startingPosition: "50%", // Default is "50%"
-                  showLabels: false, // Set to true to use data-label on imgs
-                  // mode: 'horizontal', // Default
-                  // makeResponsive: true // Default
-                });
-                console.log(
-                  "Juxtapose slider initialized for #" + uniqueSliderId
-                );
-              } else {
-                console.warn(
-                  "JuxtaposeJS library (juxtapose.JXSlider) not found on window."
-                );
-                $juxtaposeWrapper
-                  .addClass("img-placeholder")
-                  .text("Slider library error.");
-              }
+                console.log("Attempting to initialize Juxtapose for #" + uniqueSliderId);
+                console.log("Juxtapose object available:", !!(window.juxtapose && window.juxtapose.JXSlider));
+                console.log("Target element:", document.getElementById(uniqueSliderId));
+
+                if (window.juxtapose && window.juxtapose.JXSlider) {
+                    // --- ATTEMPT 1: NO OPTIONS ---
+                    new juxtapose.JXSlider('#' + uniqueSliderId); 
+                    
+                    // --- OR ATTEMPT 2: EMPTY OPTIONS OBJECT (Try one at a time) ---
+                    // new juxtapose.JXSlider('#' + uniqueSliderId, {});
+
+                    // --- IF EITHER OF THE ABOVE WORKS, THEN TRY RE-ADDING OPTIONS ---
+                    /*
+                    new juxtapose.JXSlider('#' + uniqueSliderId, {
+                        animate: true, // Try commenting this out if it still fails with options
+                        startingPosition: "50%",
+                        showLabels: false 
+                    });
+                    */
+                    console.log("Juxtapose slider should be initialized for #" + uniqueSliderId);
+                } else {
+                     console.warn("JuxtaposeJS library (juxtapose.JXSlider) not found on window.");
+                     $juxtaposeWrapper.addClass('img-placeholder').text('Slider library error.');
+                }
             } catch (e) {
-              console.error(
-                "Error initializing JuxtaposeJS slider for #" +
-                  uniqueSliderId +
-                  ":",
-                e
-              );
-              $juxtaposeWrapper
-                .addClass("img-placeholder")
-                .text("Error initializing slider.");
+                console.error("Error initializing JuxtaposeJS slider for #" + uniqueSliderId + ":", e);
+                // Log the arguments that were attempted to be passed
+                console.error("Arguments passed to JXSlider: selector='#" + uniqueSliderId + "', options were (see previous line if trying with options)");
+                $juxtaposeWrapper.addClass('img-placeholder').text('Error initializing slider.');
             }
-          }
         }
+    }
 
-        $beforeImgTag.on("load", onImageLoad).on("error", function () {
-          console.error(
-            "Error loading original image for Juxtapose slider:",
-            originalImageUrl
-          );
-          $juxtaposeWrapper
-            .addClass("img-placeholder")
-            .text("Error loading original image.");
-        });
-        $afterImgTag.on("load", onImageLoad).on("error", function () {
-          console.error(
-            "Error loading processed image for Juxtapose slider:",
-            processedImageUrl
-          );
-          $juxtaposeWrapper
-            .addClass("img-placeholder")
-            .text("Error loading processed image.");
-        });
-
-        // Fallback for cached images
-        setTimeout(() => {
-          if (
-            imagesLoaded < totalImages &&
-            !$juxtaposeWrapper.hasClass("img-placeholder")
-          ) {
-            if (
-              $beforeImgTag[0].complete &&
-              $afterImgTag[0].complete &&
-              $beforeImgTag[0].naturalWidth > 0 &&
-              $afterImgTag[0].naturalWidth > 0
-            ) {
-              if (imagesLoaded < totalImages) imagesLoaded = totalImages; // Mark as loaded
-              onImageLoad(); // Trigger init attempt
-            } else if (imagesLoaded < totalImages) {
-              // If still not loaded and no error set
-              console.warn(
-                "Juxtapose images might be cached or failed to load without error event for #" +
-                  uniqueSliderId
-              );
-              // $juxtaposeWrapper.addClass('img-placeholder').text('Image load timeout.'); // Optional: indicate timeout
-            }
-          }
-        }, 700); // Increased timeout slightly
-      }
+    // ... (rest of image load handling and fallback timeout as before) ...
+    $beforeImgTag.on('load', onImageLoad).on('error', function() {
+        console.error('Error loading original image for Juxtapose slider:', originalImageUrl);
+        $juxtaposeWrapper.addClass('img-placeholder').text('Error loading original image.');
+    });
+    $afterImgTag.on('load', onImageLoad).on('error', function() {
+        console.error('Error loading processed image for Juxtapose slider:', processedImageUrl);
+        $juxtaposeWrapper.addClass('img-placeholder').text('Error loading processed image.');
+    });
+    
+    setTimeout(() => {
+        if (imagesLoaded < totalImages && !$juxtaposeWrapper.hasClass('img-placeholder')) {
+             if ($beforeImgTag[0].complete && $afterImgTag[0].complete && $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
+                if (imagesLoaded < totalImages) { // Avoid double-calling if already loaded
+                  console.log("Triggering onImageLoad from timeout for #" + uniqueSliderId);
+                  imagesLoaded = totalImages; 
+                  onImageLoad(); 
+                }
+             } else if (imagesLoaded < totalImages) {
+                console.warn("Juxtapose images might be cached or failed to load without error event for #" + uniqueSliderId + " after timeout.");
+             }
+        }
+    }, 700); 
+}
 
       function pollStatus(jobId, cardElement) {
         const $card = $(cardElement);
