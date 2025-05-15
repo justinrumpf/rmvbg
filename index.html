@@ -375,7 +375,7 @@
     // Main page script from original + integrated new JS
     const submitApiUrl = "/submit";
     const statusApiUrl = "/status/";
-    const associateApiUrl = "/api/v1/item/associate_images";
+    const associateApiUrl = "https://bc41-173-93-246-50.ngrok-free.app/EComm/WebFormUpload2";
     const apiKey = "secretApiKey"; // IMPORTANT: Replace
 
     const ASSOCIATED_JOB_IDS_KEY = 'batchUploader_associatedJobIds';
@@ -857,7 +857,7 @@
           $("#results").prepend($card);
 
           $.ajax({
-            url: 'https://bc41-173-93-246-50.ngrok-free.app/Ecomm/WebFormUpload2', method: "POST", data: formData, processData: false, contentType: false,
+            url: submitApiUrl, method: "POST", data: formData, processData: false, contentType: false,
             success: function (data) {
               if (data.job_id) {
                 const realJobId = data.job_id;
@@ -1004,17 +1004,16 @@
         console.log("Submitting Item Data to Backend:");
         for (let pair of formData.entries()) { console.log(pair[0]+ ': ' + pair[1]); }
 
-        // --- SIMULATE BACKEND CALL for item creation/update + image association ---
-        // Replace this with your actual $.ajax call to 'associateApiUrl' or a new endpoint
-        // This endpoint would now handle the full item form data + the image list.
-        // $.ajax({
-        //   url: associateApiUrl, // Or a new endpoint like /api/v1/item/create_with_images
-        //   method: "POST",
-        //   data: formData, // Send FormData directly
-        //   processData: false,
-        //   contentType: false,
-        //   success: function(response) {
-        //     console.log("Item & Image Association successful:", response);
+
+         $.ajax({
+           url: associateApiUrl, // Or a new endpoint like /api/v1/item/create_with_images
+           method: "POST",
+           data: formData, // Send FormData directly
+           processData: false,
+           contentType: false,
+           success: function(response) {
+             console.log("Item & Image Association successful:", response);
+             
             const jobIdsMarked = [];
             attachedImages.forEach(img => {
                 addJobIdToStorage(ASSOCIATED_JOB_IDS_KEY, img.job_id);
@@ -1026,14 +1025,14 @@
             itemAttachmentModalInstance.hide();
             sortImageCards();
             alert(`Item "${$('#modalTitle').val()}" (Number: ${itemNumber}) and ${jobIdsMarked.length} images submitted.`);
-        //   },
-        //   error: function(xhr) {
-        //     let errorMsg = "Failed to submit item and associate images.";
-        //     if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error; }
-        //     $("#modalAlertPlaceholder").html(`<div class="alert alert-danger" role="alert">${errorMsg}</div>`);
-        //   }
-        // });
-        // --- END SIMULATION ---
+           },
+           error: function(xhr) {
+            let errorMsg = "Failed to submit item and associate images.";
+             if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error; }
+             $("#modalAlertPlaceholder").html(`<div class="alert alert-danger" role="alert">${errorMsg}</div>`);
+           }
+         });
+ 
       });
 
       // Inline function calls from new HTML (ensure these are defined if not in provided JS files)
