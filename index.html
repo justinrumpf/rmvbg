@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Batch Background Removal 5</title>
+  <title>Batch Background Removal (BeerSlider.js)</title>
   <link
     href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
     rel="stylesheet"
@@ -68,9 +68,6 @@
   <div class="container py-5">
     <div class="d-flex justify-content-between align-items-center mb-4">
       <h1>Batch Image Background Removal</h1>
-      <button id="attachImagesButton" class="btn btn-info btn-lg" disabled>
-        Attach Selected to Item
-      </button>
     </div>
 
     <form id="uploadForm" class="mb-4">
@@ -120,6 +117,13 @@
     </form>
 
     <hr />
+
+    <div id="attachButtonContainer" class="mb-3 text-end" style="display: none;">
+        <button id="attachImagesButton" class="btn btn-info btn-lg" disabled>
+            Attach Selected to Item
+        </button>
+    </div>
+
     <div id="results" class="row mt-4">
       <!-- Image cards will be appended here -->
     </div>
@@ -158,8 +162,8 @@
   <script>
     const submitApiUrl = "/submit";
     const statusApiUrl = "/status/";
-    const associateApiUrl = "/api/v1/item/associate_images";
-    const apiKey = "secretApiKey"; // Replace with secure handling
+    const associateApiUrl = "/api/v1/item/associate_images"; // Backend endpoint for item association
+    const apiKey = "secretApiKey"; // IMPORTANT: Replace with secure handling
 
     const ASSOCIATED_JOB_IDS_KEY = 'batchUploader_associatedJobIds';
     const TRASHED_JOB_IDS_KEY = 'batchUploader_trashedJobIds';
@@ -175,35 +179,47 @@
     }
     function addJobIdToStorage(key, jobId) {
         let currentJobIds = getStoredJobIds(key);
-        if (!currentJobIds.includes(jobId)) {
+        if (jobId && !currentJobIds.includes(jobId)) { // Ensure jobId is valid
             currentJobIds.push(jobId);
             localStorage.setItem(key, JSON.stringify(currentJobIds));
         }
     }
     function removeJobIdFromStorage(key, jobId) {
         let currentJobIds = getStoredJobIds(key);
-        const index = currentJobIds.indexOf(jobId);
-        if (index > -1) {
-            currentJobIds.splice(index, 1);
-            localStorage.setItem(key, JSON.stringify(currentJobIds));
+        if (jobId) { // Ensure jobId is valid
+            const index = currentJobIds.indexOf(jobId);
+            if (index > -1) {
+                currentJobIds.splice(index, 1);
+                localStorage.setItem(key, JSON.stringify(currentJobIds));
+            }
         }
     }
     function isJobAssociated(jobId) {
-        return getStoredJobIds(ASSOCIATED_JOB_IDS_KEY).includes(jobId);
+        return jobId ? getStoredJobIds(ASSOCIATED_JOB_IDS_KEY).includes(jobId) : false;
     }
     function isJobTrashed(jobId) {
-        return getStoredJobIds(TRASHED_JOB_IDS_KEY).includes(jobId);
+        return jobId ? getStoredJobIds(TRASHED_JOB_IDS_KEY).includes(jobId) : false;
     }
 
     // --- UI Update & Sorting Functions ---
     function updateAttachButtonStatus() {
-      const anySelectedForAttachment = $('#results .image-card:not(.trashed-card) .select-for-attachment:checked').length > 0;
-      $("#attachImagesButton").prop("disabled", !anySelectedForAttachment);
+      const anyCardsPresent = $('#results .image-card').length > 0;
+      const $attachButtonContainer = $("#attachButtonContainer");
+      const $attachButton = $("#attachImagesButton");
+
+      if (anyCardsPresent) {
+        $attachButtonContainer.show();
+        const anySelectedForAttachment = $('#results .image-card:not(.trashed-card) .select-for-attachment:checked').length > 0;
+        $attachButton.prop("disabled", !anySelectedForAttachment);
+      } else {
+        $attachButtonContainer.hide();
+        $attachButton.prop("disabled", true);
+      }
     }
 
     function applyCardState(jobId) {
         const $card = $(`#card-${jobId}`);
-        if (!$card.length) return;
+        if (!$card.length || !jobId) return; // Ensure card and jobId exist
 
         const associated = isJobAssociated(jobId);
         const trashed = isJobTrashed(jobId);
@@ -212,7 +228,6 @@
         $card.find('.trashed-marker').toggle(trashed);
         $card.toggleClass('trashed-card', trashed);
 
-        // Disable selection if trashed
         $card.find('.select-for-attachment').prop('disabled', trashed);
         if (trashed) {
             $card.find('.select-for-attachment').prop('checked', false);
@@ -229,8 +244,8 @@
             const aJobId = $a.data('job-id');
             const bJobId = $b.data('job-id');
 
-            // Handle cases where job-id might not be set yet (temp cards)
-            if (!aJobId || aJobId.startsWith('temp-')) return -1; // Keep temp cards at top initially
+            // Temp cards (no final job-id yet) should ideally stay at top or be handled by initial prepend
+            if (!aJobId || aJobId.startsWith('temp-')) return -1;
             if (!bJobId || bJobId.startsWith('temp-')) return 1;
 
             const aTrashed = isJobTrashed(aJobId);
@@ -238,33 +253,37 @@
             const aAssociated = isJobAssociated(aJobId);
             const bAssociated = isJobAssociated(bJobId);
 
-            if (aTrashed && !bTrashed) return 1;  // a to bottom
-            if (!aTrashed && bTrashed) return -1; // b to bottom
-
-            // If both or neither are trashed, sort by association
-            if (!aTrashed && !bTrashed) { // Both not trashed
-                if (aAssociated && !bAssociated) return 1; // a (associated) after b (not associated)
-                if (!aAssociated && bAssociated) return -1; // b (associated) after a (not associated)
+            if (aTrashed && !bTrashed) return 1;  // a (trashed) to bottom
+            if (!aTrashed && bTrashed) return -1; // b (trashed) to bottom
+            if (aTrashed && bTrashed) { // Both trashed, sort by name
+                 return ($a.data('original-filename') || '').localeCompare($b.data('original-filename') || '');
             }
-            // If both trashed, or both associated (and not trashed), or both not associated (and not trashed),
-            // maintain original relative order or sort by filename/ID (optional)
-            // For simplicity, let's try to maintain original order or use job ID for tie-breaking
-            const aOriginalName = $a.data('original-filename') || '';
-            const bOriginalName = $b.data('original-filename') || '';
-            return aOriginalName.localeCompare(bOriginalName); // Default sort by name
+
+            // Neither is trashed, sort by association
+            if (aAssociated && !bAssociated) return 1; // a (associated) after b (not associated)
+            if (!aAssociated && bAssociated) return -1; // b (associated) after a (not associated)
+
+            // If same association & trashed status, sort by original filename
+            return ($a.data('original-filename') || '').localeCompare($b.data('original-filename') || '');
         });
 
         $.each($cards, function(idx, itm) { $resultsContainer.append(itm); });
-        updateAttachButtonStatus(); // After sorting, button state might need update
+        updateAttachButtonStatus();
     }
 
     function initializeOrUpdateBeerSlider($card, originalImageUrl, processedImageUrl) {
-      // ... (BeerSlider logic remains the same)
       const $sliderWrapper = $card.find('.beerslider-wrapper-container');
       const originalFileName = $card.data('original-filename');
-      const sliderContainerId = 'beer-slider-' + $card.data('job-id').replace(/-/g, '');
+      const jobId = $card.data('job-id');
+      if (!jobId) {
+          console.error("Cannot initialize BeerSlider: missing job-id on card.");
+          return;
+      }
+      const sliderContainerId = 'beer-slider-' + jobId.replace(/-/g, '');
 
-      if (sliderInstances[sliderContainerId]) { /* ... */ }
+      if (sliderInstances[sliderContainerId]) {
+          // BeerSlider doesn't have a documented public destroy. Clearing and rebuilding.
+      }
       $sliderWrapper.removeClass('img-placeholder').empty();
 
       const $beerSliderDiv = $('<div>').attr('id', sliderContainerId).addClass('beer-slider');
@@ -285,9 +304,15 @@
               try {
                   if (window.BeerSlider) {
                       const sliderElement = document.getElementById(sliderContainerId);
-                      const instance = new BeerSlider(sliderElement, { start: 50 });
-                      sliderInstances[sliderContainerId] = instance;
+                      if (sliderElement) {
+                          const instance = new BeerSlider(sliderElement, { start: 50 });
+                          sliderInstances[sliderContainerId] = instance;
+                      } else {
+                          console.error("BeerSlider target element not found:", sliderContainerId);
+                          $sliderWrapper.addClass('img-placeholder').text('Slider DOM error.');
+                      }
                   } else {
+                       console.warn("BeerSlider library not found on window.");
                        $sliderWrapper.addClass('img-placeholder').text('Slider library error.');
                   }
               } catch (e) {
@@ -296,12 +321,20 @@
               }
           }
       }
-      $beforeImgTag.on('load', onImageLoad).on('error', () => $sliderWrapper.addClass('img-placeholder').text('Error loading original image.'));
-      $afterImgTag.on('load', onImageLoad).on('error', () => $sliderWrapper.addClass('img-placeholder').text('Error loading processed image.'));
-      
+      $beforeImgTag.on('load', onImageLoad).on('error', () => {
+          console.error('Error loading original image for BeerSlider:', originalImageUrl);
+          $sliderWrapper.addClass('img-placeholder').text('Error loading original image.');
+      });
+      $afterImgTag.on('load', onImageLoad).on('error', () => {
+          console.error('Error loading processed image for BeerSlider:', processedImageUrl);
+          $sliderWrapper.addClass('img-placeholder').text('Error loading processed image.');
+      });
+
+      // Fallback for cached images
       setTimeout(() => {
           if (imagesLoaded < totalImages && !$sliderWrapper.hasClass('img-placeholder')) {
-               if ($beforeImgTag[0].complete && $afterImgTag[0].complete && $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
+               if ($beforeImgTag.length && $beforeImgTag[0].complete && $afterImgTag.length && $afterImgTag[0].complete &&
+                   $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
                   if (imagesLoaded === 0) { onImageLoad(); onImageLoad(); }
                   else if (imagesLoaded === 1) { onImageLoad(); }
                }
@@ -311,8 +344,6 @@
 
     function pollStatus(jobId, cardElement) {
       const $card = $(cardElement);
-      // ... (Rest of pollStatus remains largely the same)
-      // Key addition: call applyCardState and sortImageCards on "done"
       const $statusText = $card.find(".status-text");
       const $progressBar = $card.find(".progress-bar");
       const $sliderWrapper = $card.find(".beerslider-wrapper-container");
@@ -320,7 +351,11 @@
       const originalImageUrl = $card.data("original-url");
 
       $.getJSON(statusApiUrl + jobId, function (data) {
-        $statusText.text(data.status.charAt(0).toUpperCase() + data.status.slice(1) + (data.eta > 0 ? ` (ETA: ${data.eta}s)` : ""));
+        $statusText.text(
+          data.status.charAt(0).toUpperCase() +
+            data.status.slice(1) +
+            (data.eta > 0 ? ` (ETA: ${data.eta}s)` : "")
+        );
         $refreshButton.prop("disabled", data.status === "processing" || data.status === "queued");
 
         if (data.status === "done") {
@@ -332,14 +367,14 @@
             $sliderWrapper.addClass("img-placeholder").text("Image URLs missing for slider.");
           }
           $card.data("processed-url", data.processed_image_url);
-          $card.find('input[name^="image_choice_"][value="processed"]').data("url", data.processed_image_url);
+          $card.find(`input[name="image_choice_${jobId}"][value="processed"]`).data("url", data.processed_image_url);
           applyCardState(jobId);
           sortImageCards();
         } else if (data.status === "error") {
           $statusText.html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${data.error_message || "Unknown error"}`);
           $progressBar.removeClass("progress-bar-striped progress-bar-animated").addClass("bg-danger").css("width", "100%");
           $sliderWrapper.addClass("img-placeholder").text("Processing Error: " + (data.error_message || "Unknown issue"));
-          applyCardState(jobId); // Even on error, apply state (e.g. if it was already trashed)
+          applyCardState(jobId);
           sortImageCards();
         } else if (data.status === "processing" || data.status === "queued") {
           $statusText.html(`<span class="badge bg-info text-dark status-badge">${data.status === "processing" ? "⚙️ Processing..." : "⏳ Queued..."}</span> (ETA: ${data.eta}s)`);
@@ -358,21 +393,19 @@
 
     $(document).ready(function () {
       itemAttachmentModalInstance = new bootstrap.Modal(document.getElementById('itemAttachmentModal'));
-      // Initial load: apply states and sort
-      $('#results .image-card').each(function() { // Should be empty initially, but good for future
-          const jobId = $(this).data('job-id');
-          if (jobId) applyCardState(jobId);
-      });
-      sortImageCards();
-      updateAttachButtonStatus();
+
+      // Load existing states and sort on page load
+      getStoredJobIds(ASSOCIATED_JOB_IDS_KEY).forEach(jobId => applyCardState(jobId)); // Apply for any cards that might be hardcoded or reloaded
+      getStoredJobIds(TRASHED_JOB_IDS_KEY).forEach(jobId => applyCardState(jobId));
+      sortImageCards(); // This also calls updateAttachButtonStatus
 
       $("#uploadForm").on("submit", function (e) {
         e.preventDefault();
         const files = $("#imageFiles")[0].files;
-        // ... (rest of form submission)
-        if (files.length === 0) { alert("Please select one or more image files."); return; }
         const model = $("#modelSelect").val();
         const postProcess = $("#postProcessCheck").is(":checked");
+
+        if (files.length === 0) { alert("Please select one or more image files."); return; }
 
         for (let i = 0; i < files.length; i++) {
           const file = files[i];
@@ -383,8 +416,8 @@
           formData.append("post_process", postProcess);
 
           const originalFileName = file.name;
-          const tempJobId = `temp-${Date.now()}-${i}`;
-          const selectAttachId = `select-attach-${tempJobId}`;
+          const tempJobId = `temp-${Date.now()}-${i}`; // Unique temporary ID
+          const tempSelectAttachId = `select-attach-${tempJobId}`;
 
           const cardHtml = `
           <div class="col-md-4 image-card" id="card-${tempJobId}" data-original-filename="${originalFileName}">
@@ -401,15 +434,15 @@
                 <p class="small text-muted job-id-text">Job ID: Pending...</p>
                 <div class="form-check">
                   <input class="form-check-input image-select-radio" type="radio" name="image_choice_${tempJobId}" value="original" data-url="">
-                  <label class="form-check-label small">Use Original</label>
+                  <label class="form-check-label small" for="image_choice_${tempJobId}_original">Use Original</label>
                 </div>
                 <div class="form-check">
                   <input class="form-check-input image-select-radio" type="radio" name="image_choice_${tempJobId}" value="processed" data-url="" checked>
-                  <label class="form-check-label small">Use Processed</label>
+                  <label class="form-check-label small" for="image_choice_${tempJobId}_processed">Use Processed</label>
                 </div>
                 <div class="form-check mt-2">
-                    <input class="form-check-input select-for-attachment" type="checkbox" value="" id="${selectAttachId}">
-                    <label class="form-check-label small" for="${selectAttachId}">Select for Item Attachment</label>
+                    <input class="form-check-input select-for-attachment" type="checkbox" value="" id="${tempSelectAttachId}">
+                    <label class="form-check-label small" for="${tempSelectAttachId}">Select for Item Attachment</label>
                 </div>
                 <div class="mt-1">
                     <span class="badge bg-info me-1 marker-badge associated-marker" style="display: none;">Associated</span>
@@ -418,40 +451,54 @@
               </div>
               <div class="card-footer">
                 <button class="btn btn-sm btn-outline-primary refresh-btn" data-jobid="${tempJobId}" disabled>Re-process</button>
-                <i class="fas fa-trash-alt trash-btn" title="Move to bottom/ignore"></i>
+                <i class="fas fa-trash-alt trash-btn" data-jobid="${tempJobId}" title="Move to bottom/ignore"></i>
               </div>
             </div>
           </div>`;
           const $card = $(cardHtml);
-          $("#results").prepend($card); // Prepend new cards so they appear at the top initially
+          $("#results").prepend($card);
 
           $.ajax({
             url: submitApiUrl, method: "POST", data: formData, processData: false, contentType: false,
             success: function (data) {
               if (data.job_id) {
-                jobFileMap[data.job_id] = file;
-                const newSelectAttachId = `select-attach-${data.job_id}`;
-                $card.attr("id", `card-${data.job_id}`);
-                $card.data("job-id", data.job_id);
+                const realJobId = data.job_id;
+                jobFileMap[realJobId] = file;
+
+                // Update card with real job ID
+                $card.attr("id", `card-${realJobId}`);
+                $card.data("job-id", realJobId); // Critical for future operations
+                $card.find(".job-id-text").text(`Job ID: ${realJobId}`);
+                $card.find(".refresh-btn").data("jobid", realJobId).prop("disabled", true);
+                $card.find(".trash-btn").data("jobid", realJobId);
+
+                // Update radio button names
+                $card.find(`input[name="image_choice_${tempJobId}"]`).attr("name", `image_choice_${realJobId}`);
+                // Update select-for-attachment id and label's for
+                const $selectAttachInput = $card.find(`#${tempSelectAttachId}`);
+                const newSelectAttachId = `select-attach-${realJobId}`;
+                $selectAttachInput.attr('id', newSelectAttachId);
+                $selectAttachInput.next('label').attr('for', newSelectAttachId);
+                // Update radio button labels' for attributes
+                $card.find(`label[for="image_choice_${tempJobId}_original"]`).attr('for', `image_choice_${realJobId}_original`);
+                $card.find(`label[for="image_choice_${tempJobId}_processed"]`).attr('for', `image_choice_${realJobId}_processed`);
+
+
                 $card.data("original-url", data.original_image_url);
-                $card.find(".job-id-text").text(`Job ID: ${data.job_id}`);
-                $card.find(".refresh-btn").data("jobid", data.job_id).prop("disabled", true);
-                $card.find(".trash-btn").data("jobid", data.job_id); // Set jobid for trash btn
-                $card.find('input[name^="image_choice_"]').attr("name", `image_choice_${data.job_id}`);
-                $card.find('input[id^="select-attach-"]').attr('id', newSelectAttachId).next('label').attr('for', newSelectAttachId);
-                $card.find('input[value="original"]').data("url", data.original_image_url);
+                $card.find(`input[name="image_choice_${realJobId}"][value="original"]`).data("url", data.original_image_url);
+
                 $card.find(".beerslider-wrapper-container.img-placeholder")
                   .html(`Original: Waiting for server URL<br>Processed: ${data.status === "queued" ? "Queued" : "Processing..."}`);
-                pollStatus(data.job_id, $card[0]);
-                applyCardState(data.job_id); // Apply initial state (likely not associated/trashed yet)
-                sortImageCards(); // Sort after getting job_id
-              } else { /* ... error handling ... */ 
-                $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Submission Error</span>');
+
+                pollStatus(realJobId, $card[0]);
+                applyCardState(realJobId);
+                sortImageCards();
+              } else {
+                $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Submission Error</span>: No Job ID returned');
                 $card.find(".progress-bar").addClass("bg-danger").css("width", "100%");
-                $card.find(".beerslider-wrapper-container.img-placeholder").text("Submission Error.");
               }
             },
-            error: function (xhr) { /* ... error handling ... */
+            error: function (xhr) {
                 let errorMsg = "Submission failed.";
                 if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error; }
                 else if (xhr.responseJSON && xhr.responseJSON.detail) {
@@ -460,123 +507,111 @@
                 }
                 $card.find(".status-text").html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`);
                 $card.find(".progress-bar").addClass("bg-danger").css("width", "100%");
-                $card.find(".beerslider-wrapper-container.img-placeholder").text("AJAX Submission Error.");
             },
           });
         }
         $("#imageFiles").val("");
-        // sortImageCards(); // Sort immediately after adding temp cards
-        updateAttachButtonStatus();
+        updateAttachButtonStatus(); // Show button container if new cards were added
       });
 
       $("#results").on("click", ".refresh-btn", function () {
           const jobIdToRefresh = $(this).data("jobid");
+          if (!jobIdToRefresh || jobIdToRefresh.startsWith('temp-')) {
+              alert("Cannot re-process an item that hasn't finished initial submission.");
+              return;
+          }
           const $card = $(`#card-${jobIdToRefresh}`);
-          // ... (re-processing logic)
-          // Important: After re-processing gets a NEW job ID,
-          // the old job ID's "trashed" or "associated" status is effectively orphaned.
-          // The new job ID starts fresh.
           if (!jobFileMap[jobIdToRefresh]) { alert("Original file not found for re-processing."); return; }
+
           const originalFile = jobFileMap[jobIdToRefresh];
           const model = $("#modelSelect").val();
           const postProcess = $("#postProcessCheck").is(":checked");
           const formData = new FormData();
-          // ... append to formData ...
           formData.append("image_file", originalFile);
           formData.append("api_key", apiKey);
           formData.append("model", model);
           formData.append("post_process", postProcess);
 
           $card.find(".status-text").html('<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>');
-          // ... reset card UI for re-processing ...
           $card.find(".progress-bar").removeClass("bg-success bg-danger").addClass("progress-bar-striped progress-bar-animated").css("width", "10%");
           $card.find(".beerslider-wrapper-container").addClass("img-placeholder").empty().text("Re-processing... (Slider will refresh)");
           $card.find(".refresh-btn").prop("disabled", true);
           $card.data("processed-url", null);
-          $card.find('input[value="processed"]').data("url", null);
-          $card.find('.select-for-attachment').prop('checked', false); // Uncheck
-          // Keep existing markers for the old job ID until new job ID is confirmed
-          // $card.find('.associated-marker, .trashed-marker').hide();
-          // $card.removeClass('trashed-card');
+          $card.find(`input[name="image_choice_${jobIdToRefresh}"][value="processed"]`).data("url", null);
+          $card.find('.select-for-attachment').prop('checked', false);
 
           $.ajax({
               url: submitApiUrl, method: "POST", data: formData, processData: false, contentType: false,
               success: function (newData) {
                   if (newData.job_id) {
-                      const oldJobId = $card.data('job-id');
-                      // If job ID changes, the old one's state (trashed/associated) is effectively gone for this card
-                      // We might want to remove from localStorage if job ID truly changes and old one is invalid.
-                      // For now, we assume re-processing might reuse or give new job ID.
-                      if (oldJobId !== newData.job_id) {
-                        delete jobFileMap[oldJobId]; // Remove old mapping if ID changed
-                        // Optional: remove oldJobId from TRASHED_JOB_IDS_KEY and ASSOCIATED_JOB_IDS_KEY if it's truly a replacement
-                        // removeJobIdFromStorage(TRASHED_JOB_IDS_KEY, oldJobId);
-                        // removeJobIdFromStorage(ASSOCIATED_JOB_IDS_KEY, oldJobId);
+                      const newJobId = newData.job_id;
+                      // If job ID changed, update map and card attributes
+                      if (jobIdToRefresh !== newJobId) {
+                          delete jobFileMap[jobIdToRefresh]; // Remove old mapping
+                          jobFileMap[newJobId] = originalFile; // Add new mapping
+
+                          $card.attr("id", `card-${newJobId}`);
+                          $card.data("job-id", newJobId);
+                          $card.find(".job-id-text").text(`Job ID: ${newJobId}`);
+                          $card.find(".refresh-btn").data("jobid", newJobId);
+                          $card.find(".trash-btn").data("jobid", newJobId);
+                          $card.find(`input[name="image_choice_${jobIdToRefresh}"]`).attr("name", `image_choice_${newJobId}`);
+                          const $selectAttachInput = $card.find(`#select-attach-${jobIdToRefresh}`);
+                          const newSelectAttachId = `select-attach-${newJobId}`;
+                          $selectAttachInput.attr('id', newSelectAttachId);
+                          $selectAttachInput.next('label').attr('for', newSelectAttachId);
+                          // Update radio button labels' for attributes
+                          $card.find(`label[for="image_choice_${jobIdToRefresh}_original"]`).attr('for', `image_choice_${newJobId}_original`);
+                          $card.find(`label[for="image_choice_${jobIdToRefresh}_processed"]`).attr('for', `image_choice_${newJobId}_processed`);
                       }
-                      jobFileMap[newData.job_id] = originalFile;
-
-                      const newSelectAttachId = `select-attach-${newData.job_id}`;
-                      $card.attr("id", `card-${newData.job_id}`);
-                      $card.data("job-id", newData.job_id);
                       $card.data("original-url", newData.original_image_url);
-                      $card.find(".job-id-text").text(`Job ID: ${newData.job_id}`);
-                      $card.find(".refresh-btn").data("jobid", newData.job_id);
-                      $card.find(".trash-btn").data("jobid", newData.job_id); // Update trash btn
-                      $card.find('input[name^="image_choice_"]').attr("name", `image_choice_${newData.job_id}`);
-                      $card.find('input[id^="select-attach-temp"]').attr('id', newSelectAttachId).next('label').attr('for', newSelectAttachId);
-
-
-                      $card.find('input[value="original"]').data("url", newData.original_image_url);
+                      $card.find(`input[name="image_choice_${newJobId}"][value="original"]`).data("url", newData.original_image_url);
                       $card.find(".beerslider-wrapper-container.img-placeholder").html(`Original: Waiting for server URL<br>Processed: ${newData.status === "queued" ? "Queued" : "Processing..."}`);
-                      pollStatus(newData.job_id, $card[0]); // This will call applyCardState & sort
-                  } else { /* ... error handling ... */
-                      $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>');
+                      pollStatus(newJobId, $card[0]);
+                  } else {
+                      $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>: No new Job ID.');
                       $card.find(".refresh-btn").prop("disabled", false);
                   }
               },
-              error: function () { /* ... error handling ... */
-                  $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Re-submission Failed</span>');
+              error: function () {
+                  $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Re-submission Failed</span> (AJAX)');
                   $card.find(".refresh-btn").prop("disabled", false);
               }
           });
           updateAttachButtonStatus();
       });
 
-      // When "Select for Item Attachment" checkbox changes
       $("#results").on("change", ".select-for-attachment", function () {
         updateAttachButtonStatus();
       });
+      // Radio button change doesn't directly trigger UI changes other than what modal picks up
+      // $("#results").on("change", ".image-select-radio", function () { });
 
-      // Trash button click
       $("#results").on("click", ".trash-btn", function () {
         const jobId = $(this).data("jobid");
         if (!jobId || jobId.startsWith('temp-')) return;
 
         if (isJobTrashed(jobId)) {
-            removeJobIdFromStorage(TRASHED_JOB_IDS_KEY, jobId); // Untrash
+            removeJobIdFromStorage(TRASHED_JOB_IDS_KEY, jobId);
         } else {
-            addJobIdToStorage(TRASHED_JOB_IDS_KEY, jobId); // Trash
-            // If trashing, also remove from associated list if present
-            // removeJobIdFromStorage(ASSOCIATED_JOB_IDS_KEY, jobId); // Optional: trashing overrides association display
+            addJobIdToStorage(TRASHED_JOB_IDS_KEY, jobId);
+            // Optional: If trashing an associated item, you might want to un-associate it.
+            // removeJobIdFromStorage(ASSOCIATED_JOB_IDS_KEY, jobId);
         }
         applyCardState(jobId);
         sortImageCards();
-        updateAttachButtonStatus();
       });
-
 
       $("#attachImagesButton").on("click", function () {
         const $selectedCheckboxes = $('#results .image-card:not(.trashed-card) .select-for-attachment:checked');
-        // ... (Modal population logic remains the same)
         if ($selectedCheckboxes.length === 0) {
           alert("Please select at least one non-trashed image to attach.");
           return;
         }
-        // ...
+
         const $listElement = $("#selectedImagesListModal").empty();
         $("#modalAlertPlaceholder").empty();
         $("#itemNumberInput").val('');
-        let imagesForModal = [];
 
         $selectedCheckboxes.each(function () {
           const $card = $(this).closest(".image-card");
@@ -584,61 +619,91 @@
           const originalFileName = $card.data("original-filename");
           const selectedVersion = $card.find(`input[name="image_choice_${jobId}"]:checked`).val();
           let imageUrl = $card.find(`input[name="image_choice_${jobId}"][value="${selectedVersion}"]`).data("url");
-          
+
           if (jobId && !jobId.startsWith("temp-") && imageUrl) {
-            imagesForModal.push({ jobId: jobId, url: imageUrl, fileName: originalFileName, version: selectedVersion });
-            $listElement.append( /* ... */ );
+            $listElement.append(
+              `<li class="list-group-item"
+                    data-job-id="${jobId}"
+                    data-image-url="${imageUrl}"
+                    data-original-filename="${originalFileName}"
+                    data-selected-version="${selectedVersion}">
+                 ${originalFileName} (${selectedVersion}) - <a href="${imageUrl}" target="_blank" class="small">View</a>
+               </li>`
+            );
           }
         });
-        
-        if (imagesForModal.length > 0) {
+
+        if ($listElement.children().length > 0) {
             itemAttachmentModalInstance.show();
         } else {
-            alert("Selected images are not ready or have no URL. Please wait for processing to complete.");
+            alert("Selected images are not ready, have no URL, or an error occurred.");
         }
       });
 
       $("#itemAttachmentForm").on("submit", function(e) {
         e.preventDefault();
-        // ... (Modal submission logic remains the same)
         const itemNumber = $("#itemNumberInput").val().trim();
-        if (!itemNumber) { /* ... */ return; }
+        if (!itemNumber) {
+          $("#modalAlertPlaceholder").html('<div class="alert alert-danger" role="alert">Item Number is required.</div>');
+          return;
+        }
         $("#modalAlertPlaceholder").empty();
 
-        const imagesToAssociate = [];
-        const jobIdsToMarkAssociated = [];
+        const imagesToAssociatePayload = [];
+        const jobIdsToMarkAssociatedOnFrontend = [];
 
         $("#selectedImagesListModal .list-group-item").each(function() {
-            const jobId = $(this).data("job-id");
-            // ... (get image details)
-            const $card = $(`#card-${jobId}`);
-            const originalFileName = $card.data("original-filename");
-            const selectedVersion = $card.find(`input[name="image_choice_${jobId}"]:checked`).val();
-            const url = $card.find(`input[name="image_choice_${jobId}"][value="${selectedVersion}"]`).data("url");
+            const $li = $(this);
+            const jobId = $li.data("job-id");
+            const url = $li.data("image-url");
+            const originalFileName = $li.data("original-filename");
+            const selectedVersion = $li.data("selected-version");
 
             if (jobId && url) {
-                imagesToAssociate.push({ job_id: jobId, image_url: url, original_filename: originalFileName, selected_version: selectedVersion });
-                jobIdsToMarkAssociated.push(jobId);
+                imagesToAssociatePayload.push({
+                    job_id: jobId,
+                    image_url: url,
+                    original_filename: originalFileName,
+                    selected_version: selectedVersion
+                });
+                jobIdsToMarkAssociatedOnFrontend.push(jobId);
             }
         });
-        // ...
 
-        // SIMULATE BACKEND CALL
-        console.log("Submitting to backend:", { item_number: itemNumber, images: imagesToAssociate });
-        // $.ajax({ /* ... */
+        if (imagesToAssociatePayload.length === 0) {
+          $("#modalAlertPlaceholder").html('<div class="alert alert-warning" role="alert">No valid images to associate.</div>');
+          return;
+        }
+
+        console.log("Submitting to backend:", { item_number: itemNumber, images: imagesToAssociatePayload });
+
+        // --- SIMULATE BACKEND CALL ---
+        // Replace this with your actual $.ajax call to 'associateApiUrl'
+        // $.ajax({
+        //   url: associateApiUrl,
+        //   method: "POST",
+        //   contentType: "application/json",
+        //   data: JSON.stringify({ item_number: itemNumber, images: imagesToAssociatePayload }),
         //   success: function(response) {
-            jobIdsToMarkAssociated.forEach(jobId => {
+        //     console.log("Association successful:", response);
+            jobIdsToMarkAssociatedOnFrontend.forEach(jobId => {
                 addJobIdToStorage(ASSOCIATED_JOB_IDS_KEY, jobId);
                 removeJobIdFromStorage(TRASHED_JOB_IDS_KEY, jobId); // Associating untrashes
                 applyCardState(jobId);
                 $(`#card-${jobId} .select-for-attachment`).prop('checked', false);
             });
             itemAttachmentModalInstance.hide();
-            sortImageCards(); // Re-sort after association
-            updateAttachButtonStatus();
+            sortImageCards();
             alert(`Images successfully associated with item number: ${itemNumber}`);
-        //   }, /* ... error ... */
+        //   },
+        //   error: function(xhr) {
+        //     let errorMsg = "Failed to associate images with item.";
+        //     if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error; }
+        //     $("#modalAlertPlaceholder").html(`<div class="alert alert-danger" role="alert">${errorMsg}</div>`);
+        //     console.error("Association error:", xhr);
+        //   }
         // });
+        // --- END SIMULATION ---
       });
     }); // End document.ready
   </script>
