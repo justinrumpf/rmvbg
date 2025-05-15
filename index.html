@@ -3,30 +3,30 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Batch Background Removal 3.1</title>
+  <title>Batch Background Removal (BeerSlider.js)</title>
   <link
     href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
     rel="stylesheet"
   />
-  <!-- JuxtaposeJS CSS v1.2.1 -->
-  <link
-    rel="stylesheet"
-    href="https://cdn.knightlab.com/libs/juxtapose/1.2.1/css/juxtapose.css"
+  <!-- BeerSlider.js CSS -->
+  <link 
+    rel="stylesheet" 
+    href="https://cdn.jsdelivr.net/npm/beerslider/dist/BeerSlider.css" 
   />
-
+  
   <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
   <style>
     .image-card {
       margin-bottom: 20px;
     }
-    .juxtapose-wrapper-container {
+    /* Container for BeerSlider */
+    .beerslider-wrapper-container { /* Our custom wrapper */
       width: 100%;
       aspect-ratio: 1 / 1;
       border: 1px solid #ccc;
-      overflow: hidden; 
-      position: relative; 
+      position: relative; /* For placeholder */
     }
-    .juxtapose-wrapper-container.img-placeholder {
+    .beerslider-wrapper-container.img-placeholder {
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -37,6 +37,19 @@
       text-align: center;
       height: 100%;
     }
+
+    /* BeerSlider itself will occupy the wrapper.
+       The library's CSS handles most of its internal styling.
+       You can override .beer-slider, .beer-reveal, .beer-handle if needed. */
+    .beer-slider img {
+        /* Ensure images display correctly within the slider if needed */
+        display: block;
+        max-width: 100%; /* This is usually good */
+        height: auto;    /* Maintain aspect ratio */
+        object-fit: contain; /* Or 'cover' if you prefer cropping */
+    }
+
+
     .status-badge {
       font-size: 0.8em;
     }
@@ -106,8 +119,8 @@
     </div>
   </div>
 
-  <!-- JuxtaposeJS JavaScript v1.2.1 -->
-  <script src="https://cdn.knightlab.com/libs/juxtapose/1.2.1/js/juxtapose.min.js"></script>
+  <!-- BeerSlider.js JavaScript -->
+  <script src="https://cdn.jsdelivr.net/npm/beerslider/dist/BeerSlider.min.js"></script>
 
   <script>
     const submitApiUrl = "/submit";
@@ -115,6 +128,7 @@
     const apiKey = "secretApiKey"; 
 
     let jobFileMap = {}; 
+    let sliderInstances = {}; // To keep track of initialized sliders for potential re-init/destroy
 
     function updateUploadButtonStatus() {
       const anySelected =
@@ -122,67 +136,98 @@
       $("#uploadItemButton").prop("disabled", !anySelected);
     }
 
-    function initializeOrUpdateJuxtapose($card, originalImageUrl, processedImageUrl) {
-      const $juxtaposeWrapper = $card.find('.juxtapose-wrapper-container');
+    function initializeOrUpdateBeerSlider($card, originalImageUrl, processedImageUrl) {
+      const $sliderWrapper = $card.find('.beerslider-wrapper-container');
       const originalFileName = $card.data('original-filename');
-      const uniqueSliderId = 'juxtapose-' + $card.data('job-id').replace(/-/g, '');
+      // BeerSlider needs a container with a specific structure:
+      // <div id="sliderId" class="beer-slider" data-beer-label="Before">
+      //   <img src="before.jpg" alt="">
+      //   <div class="beer-reveal" data-beer-label="After">
+      //     <img src="after.jpg" alt="">
+      //   </div>
+      // </div>
+      const sliderContainerId = 'beer-slider-' + $card.data('job-id').replace(/-/g, '');
 
-      $juxtaposeWrapper.removeClass('img-placeholder').empty();
+      if (sliderInstances[sliderContainerId]) {
+          // BeerSlider doesn't have a documented public destroy method.
+          // Re-initializing on the same ID might work, or we clear and rebuild.
+          // For safety, let's clear and rebuild.
+      }
+      $sliderWrapper.removeClass('img-placeholder').empty();
 
-      // This is the div JuxtaposeJS will target for manual initialization
-      const $juxtaposeDiv = $('<div>').attr('id', uniqueSliderId); 
-      
+      const $beerSliderDiv = $('<div>')
+          .attr('id', sliderContainerId)
+          .addClass('beer-slider'); // BeerSlider looks for this class or an ID
+          // .attr('data-beer-label', 'Original'); // Optional: label for the 'before' image
+
       const $beforeImgTag = $('<img>')
           .attr('src', originalImageUrl)
           .attr('alt', 'Original: ' + originalFileName);
+      
+      const $beerRevealDiv = $('<div>')
+          .addClass('beer-reveal');
+          // .attr('data-beer-label', 'Processed'); // Optional: label for the 'after' image
+      
       const $afterImgTag = $('<img>')
           .attr('src', processedImageUrl + `?t=${new Date().getTime()}`)
           .attr('alt', 'Processed: ' + originalFileName);
 
-      $juxtaposeDiv.append($beforeImgTag).append($afterImgTag);
-      $juxtaposeWrapper.append($juxtaposeDiv);
+      $beerRevealDiv.append($afterImgTag);
+      $beerSliderDiv.append($beforeImgTag).append($beerRevealDiv);
+      $sliderWrapper.append($beerSliderDiv);
 
       let imagesLoaded = 0;
-      const totalImages = 2;
+      const totalImages = 2; // We need both images loaded for BeerSlider to size correctly
 
       function onImageLoad() {
           imagesLoaded++;
           if (imagesLoaded === totalImages) {
               try {
-                  if (window.juxtapose && window.juxtapose.JXSlider) {
-                      new juxtapose.JXSlider('#' + uniqueSliderId);
-             
-                      console.log("Juxtapose slider initialized for #" + uniqueSliderId);
+                  // Check if the BeerSlider class is available
+                  if (window.BeerSlider) {
+                      const sliderElement = document.getElementById(sliderContainerId);
+                      // Initialize BeerSlider on the container div
+                      const instance = new BeerSlider(sliderElement, {
+                          start: 50 // Starting percentage (0-100)
+                          // prefix: 'beer' // Default class prefix
+                      });
+                      sliderInstances[sliderContainerId] = instance;
+                      console.log("BeerSlider initialized for #" + sliderContainerId);
                   } else {
-                       console.warn("JuxtaposeJS v1.2.1 library (juxtapose.JXSlider) not found on window.");
-                       $juxtaposeWrapper.addClass('img-placeholder').text('Slider library error.');
+                       console.warn("BeerSlider library not found on window.");
+                       $sliderWrapper.addClass('img-placeholder').text('Slider library error.');
                   }
               } catch (e) {
-                  console.error("Error initializing JuxtaposeJS v1.2.1 slider for #" + uniqueSliderId + ":", e);
-                  $juxtaposeWrapper.addClass('img-placeholder').text('Error initializing slider.');
+                  console.error("Error initializing BeerSlider for #" + sliderContainerId + ":", e);
+                  $sliderWrapper.addClass('img-placeholder').text('Error initializing slider.');
               }
           }
       }
 
+      // Attach load listeners
       $beforeImgTag.on('load', onImageLoad).on('error', function() {
-          console.error('Error loading original image for Juxtapose slider:', originalImageUrl);
-          $juxtaposeWrapper.addClass('img-placeholder').text('Error loading original image.');
+          console.error('Error loading original image for BeerSlider:', originalImageUrl);
+          $sliderWrapper.addClass('img-placeholder').text('Error loading original image.');
+          // Potentially mark this image as "failed" so onImageLoad doesn't hang indefinitely
       });
       $afterImgTag.on('load', onImageLoad).on('error', function() {
-          console.error('Error loading processed image for Juxtapose slider:', processedImageUrl);
-          $juxtaposeWrapper.addClass('img-placeholder').text('Error loading processed image.');
+          console.error('Error loading processed image for BeerSlider:', processedImageUrl);
+          $sliderWrapper.addClass('img-placeholder').text('Error loading processed image.');
       });
       
+      // Fallback for cached images
       setTimeout(() => {
-          if (imagesLoaded < totalImages && !$juxtaposeWrapper.hasClass('img-placeholder')) {
-               if ($beforeImgTag[0].complete && $afterImgTag[0].complete && $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
+          if (imagesLoaded < totalImages && !$sliderWrapper.hasClass('img-placeholder')) {
+               if ($beforeImgTag[0].complete && $afterImgTag[0].complete && 
+                   $beforeImgTag[0].naturalWidth > 0 && $afterImgTag[0].naturalWidth > 0) {
                   if (imagesLoaded < totalImages) { 
-                    console.log("Triggering onImageLoad from timeout for #" + uniqueSliderId);
-                    imagesLoaded = totalImages; 
-                    onImageLoad(); 
+                    console.log("Triggering onImageLoad from timeout for #" + sliderContainerId + " (BeerSlider)");
+                    // Call onImageLoad enough times to trigger initialization
+                    if (imagesLoaded === 0) { onImageLoad(); onImageLoad(); }
+                    else if (imagesLoaded === 1) { onImageLoad(); }
                   }
                } else if (imagesLoaded < totalImages) {
-                  console.warn("Juxtapose images might be cached or failed to load for #" + uniqueSliderId + " after timeout.");
+                  console.warn("BeerSlider images might be cached or failed to load for #" + sliderContainerId + " after timeout.");
                }
           }
       }, 700); 
@@ -192,7 +237,7 @@
       const $card = $(cardElement);
       const $statusText = $card.find(".status-text");
       const $progressBar = $card.find(".progress-bar");
-      const $juxtaposeWrapper = $card.find(".juxtapose-wrapper-container");
+      const $sliderWrapper = $card.find(".beerslider-wrapper-container"); // Updated class
       const $refreshButton = $card.find(".refresh-btn");
       const originalImageUrl = $card.data("original-url");
 
@@ -217,13 +262,13 @@
             .css("width", "100%");
 
           if (data.processed_image_url && originalImageUrl) {
-            initializeOrUpdateJuxtapose(
+            initializeOrUpdateBeerSlider( // Updated function name
               $card,
               originalImageUrl,
               data.processed_image_url
             );
           } else {
-            $juxtaposeWrapper
+            $sliderWrapper
               .addClass("img-placeholder")
               .text("Image URLs missing for slider.");
           }
@@ -243,7 +288,7 @@
             .removeClass("progress-bar-striped progress-bar-animated")
             .addClass("bg-danger")
             .css("width", "100%");
-          $juxtaposeWrapper
+          $sliderWrapper
             .addClass("img-placeholder")
             .text(
               "Processing Error: " + (data.error_message || "Unknown issue")
@@ -271,7 +316,7 @@
           .removeClass("progress-bar-striped progress-bar-animated")
           .addClass("bg-danger")
           .css("width", "100%");
-        $juxtaposeWrapper
+        $sliderWrapper
           .addClass("img-placeholder")
           .text("Status Check Failed.");
         $refreshButton.prop("disabled", false);
@@ -281,7 +326,6 @@
 
     $("#uploadForm").on("submit", function (e) {
       e.preventDefault();
-      // ... (rest of the form submission logic remains the same as your last full version)
       const files = $("#imageFiles")[0].files;
       const model = $("#modelSelect").val();
       const postProcess = $("#postProcessCheck").is(":checked");
@@ -305,7 +349,7 @@
         const cardHtml = `
         <div class="col-md-4 image-card" id="card-${tempJobId}" data-original-filename="${originalFileName}">
           <div class="card">
-            <div class="juxtapose-wrapper-container img-placeholder">
+            <div class="beerslider-wrapper-container img-placeholder"> <!-- Updated class -->
               Original: Awaiting submission<br>Processed: Queued
             </div>
             <div class="card-body">
@@ -341,42 +385,27 @@
           success: function (data) {
             if (data.job_id) {
               jobFileMap[data.job_id] = file;
-
               $card.attr("id", `card-${data.job_id}`);
               $card.data("job-id", data.job_id);
               $card.data("original-url", data.original_image_url);
-
               $card.find(".job-id-text").text(`Job ID: ${data.job_id}`);
-              $card
-                .find(".refresh-btn")
-                .data("jobid", data.job_id)
-                .prop("disabled", true);
-
-              $card
-                .find('input[name="image_choice_' + tempJobId + '"]')
-                .attr("name", `image_choice_${data.job_id}`);
-              $card
-                .find('input[value="original"]')
-                .data("url", data.original_image_url);
-
-              $card
-                .find(".juxtapose-wrapper-container.img-placeholder")
+              $card.find(".refresh-btn").data("jobid", data.job_id).prop("disabled", true);
+              $card.find('input[name="image_choice_' + tempJobId + '"]').attr("name", `image_choice_${data.job_id}`);
+              $card.find('input[value="original"]').data("url", data.original_image_url);
+              $card.find(".beerslider-wrapper-container.img-placeholder") // Updated class
                 .html(
                   `Original: Waiting for server URL<br>Processed: ${
                     data.status === "queued" ? "Queued" : "Processing..."
                   }`
                 );
-
               pollStatus(data.job_id, $card[0]);
             } else {
-              // ... (error handling for submission)
               $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Submission Error</span>');
               $card.find(".progress-bar").addClass("bg-danger").css("width", "100%");
-              $card.find(".juxtapose-wrapper-container.img-placeholder").text("Submission Error.");
+              $card.find(".beerslider-wrapper-container.img-placeholder").text("Submission Error."); // Updated
             }
           },
           error: function (xhr) {
-            // ... (error handling for AJAX failure)
               let errorMsg = "Submission failed.";
               if (xhr.responseJSON && xhr.responseJSON.error) { errorMsg = xhr.responseJSON.error;
               } else if (xhr.responseJSON && xhr.responseJSON.detail) {
@@ -385,7 +414,7 @@
               }
               $card.find(".status-text").html(`<span class="badge bg-danger status-badge">❌ Error</span>: ${errorMsg}`);
               $card.find(".progress-bar").addClass("bg-danger").css("width", "100%");
-              $card.find(".juxtapose-wrapper-container.img-placeholder").text("AJAX Submission Error.");
+              $card.find(".beerslider-wrapper-container.img-placeholder").text("AJAX Submission Error."); // Updated
           },
         });
       }
@@ -393,13 +422,10 @@
     });
 
     $("#results").on("click", ".refresh-btn", function () {
-        // ... (re-process logic remains the same as your last full version, ensuring the juxtapose-wrapper is reset)
         const jobIdToRefresh = $(this).data("jobid");
         const originalFile = jobFileMap[jobIdToRefresh];
         const $card = $(`#card-${jobIdToRefresh}`);
-
         if (!originalFile) { alert("Original file not found for re-processing."); return; }
-
         const model = $("#modelSelect").val();
         const postProcess = $("#postProcessCheck").is(":checked");
         const formData = new FormData();
@@ -407,14 +433,12 @@
         formData.append("api_key", apiKey);
         formData.append("model", model);
         formData.append("post_process", postProcess);
-
         $card.find(".status-text").html('<span class="badge bg-secondary status-badge">🔄 Re-submitting...</span>');
         $card.find(".progress-bar").removeClass("bg-success bg-danger").addClass("progress-bar-striped progress-bar-animated").css("width", "10%");
-        $card.find(".juxtapose-wrapper-container").addClass("img-placeholder").empty().text("Re-processing... (Slider will refresh)");
+        $card.find(".beerslider-wrapper-container").addClass("img-placeholder").empty().text("Re-processing... (Slider will refresh)"); // Updated
         $card.find(".refresh-btn").prop("disabled", true);
         $card.data("processed-url", null);
         $card.find('input[value="processed"]').data("url", null);
-
         $.ajax({
             url: submitApiUrl, method: "POST", data: formData, processData: false, contentType: false,
             success: function (newData) {
@@ -426,7 +450,7 @@
                     $card.find(".refresh-btn").data("jobid", newData.job_id);
                     $card.find('input[type="radio"]').attr("name", `image_choice_${newData.job_id}`);
                     $card.find('input[value="original"]').data("url", newData.original_image_url);
-                    $card.find(".juxtapose-wrapper-container.img-placeholder").html(`Original: Waiting for server URL<br>Processed: ${newData.status === "queued" ? "Queued" : "Processing..."}`);
+                    $card.find(".beerslider-wrapper-container.img-placeholder").html(`Original: Waiting for server URL<br>Processed: ${newData.status === "queued" ? "Queued" : "Processing..."}`); // Updated
                     pollStatus(newData.job_id, $card[0]);
                 } else {
                     $card.find(".status-text").html('<span class="badge bg-danger status-badge">❌ Re-submission Error</span>');
@@ -441,7 +465,6 @@
     });
 
     $("#uploadItemButton").on("click", function () {
-        // ... (upload item logic remains the same as your last full version)
         const selectedImageUrls = [];
         $("#results .image-card").each(function () {
             const $card = $(this); const jobId = $card.data("job-id");
