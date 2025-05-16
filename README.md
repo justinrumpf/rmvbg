@@ -1,16 +1,15 @@
 ```
- _____                   _         __  
-|  __ \                 | |        \ \ 
-| |__) |___  ___  __ _  | | ___     | |
-|  _  // _ \/ __|/ _` | | |/ _ \    | |
-| | \ \  __/\__ \ (_| | | |  __/    | |
-|_|  \_\___||___/\__,_| |_|\___|    /_/
-
+ _____                   _        _  
+|  __ \                 | |      / | 
+| |__) |___  ___  __ _  | | ___ | | 
+|  _  // _ \/ __|/ _` | | |/ _ \| | 
+| | \ \  __/\__ \ (_| | | |  __/| | 
+|_|  \_\___||___/\__,_| |_|\___|_|_|
 ```
 
-#RemBG implementation that provides an HTTP server with an API endpoint.
+# RemBG implementation that provides an HTTP server with an API endpoint.
 
-This setup includes settings for:
+##This setup includes settings for:
 
 *   Simple Queuing
 *   Concurrent Jobs
