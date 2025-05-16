@@ -18,8 +18,6 @@ import urllib.parse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
@@ -35,6 +33,20 @@ UPLOADS_DIR = "/workspace/uploads"
 PROCESSED_DIR = "/workspace/processed"
 LOGO_FILENAME = "logo.png"
 LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
+
+# --- CREATE DIRECTORIES EARLY ---
+# Ensure these directories exist before app.mount is called or app object is fully formed.
+try:
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    logger.info(f"Ensured uploads directory exists: {UPLOADS_DIR}")
+    logger.info(f"Ensured processed directory exists: {PROCESSED_DIR}")
+except OSError as e:
+    logger.error(f"Error creating directories {UPLOADS_DIR} or {PROCESSED_DIR}: {e}")
+    # Depending on severity, you might want to raise an exception here and halt startup
+    # For now, just logging the error.
+
+app = FastAPI() # FastAPI app instance created AFTER directories are handled
 
 # --- Global State ---
 prepared_logo_image = None
@@ -135,9 +147,6 @@ async def image_processing_worker(worker_id: int):
                 img_response = await client.get(image_url_str)
                 img_response.raise_for_status()
             
-            # #####################################################################
-            # ## THIS IS THE CONTENT-TYPE HANDLING LOGIC WE DISCUSSED EARLIER ##
-            # #####################################################################
             image_content = await img_response.aread()
             original_content_type_header = img_response.headers.get("content-type", "unknown")
             content_type = original_content_type_header.lower()
@@ -165,9 +174,6 @@ async def image_processing_worker(worker_id: int):
                 logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
                 raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
             logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
-            # #####################################################################
-            # ## END OF CONTENT-TYPE HANDLING LOGIC                             ##
-            # #####################################################################
 
             extension = MIME_TO_EXT.get(content_type)
             if not extension:
@@ -233,9 +239,13 @@ async def image_processing_worker(worker_id: int):
 @app.on_event("startup")
 async def startup_event():
     global prepared_logo_image
-    logger.info("Application startup...")
-    os.makedirs(UPLOADS_DIR, exist_ok=True); os.makedirs(PROCESSED_DIR, exist_ok=True)
-    logger.info(f"Uploads directory: {UPLOADS_DIR}, Processed directory: {PROCESSED_DIR}")
+    logger.info("Application startup event running...") # Changed log message
+
+    # Note: Directories UPLOADS_DIR and PROCESSED_DIR are already created at module level.
+    # Re-running os.makedirs here with exist_ok=True is fine and ensures they exist.
+    # os.makedirs(UPLOADS_DIR, exist_ok=True) 
+    # os.makedirs(PROCESSED_DIR, exist_ok=True)
+
     if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
@@ -254,6 +264,7 @@ async def startup_event():
     logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}.")
 
 # --- Static File Serving ---
+# These must come AFTER app = FastAPI() is defined
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
