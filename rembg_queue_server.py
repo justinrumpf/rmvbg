@@ -1,3 +1,39 @@
+import asyncio
+import uuid
+import io
+import os # Make sure os is imported very early
+import aiofiles
+import logging
+import httpx
+import urllib.parse
+
+# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# Define necessary paths first
+UPLOADS_DIR_STATIC = "/workspace/uploads"
+PROCESSED_DIR_STATIC = "/workspace/processed"
+BASE_DIR_STATIC = "/workspace/rmvbg" # If BASE_DIR is needed for LOGO_PATH before FastAPI app
+
+# Configure logging early as well so directory creation attempts are logged
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__) # Get logger after basicConfig
+
+try:
+    os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
+    os.makedirs(PROCESSED_DIR_STATIC, exist_ok=True)
+    # Also create BASE_DIR if it's used for the logo and might not exist
+    os.makedirs(BASE_DIR_STATIC, exist_ok=True)
+    logger.info(f"Ensured uploads directory exists: {UPLOADS_DIR_STATIC}")
+    logger.info(f"Ensured processed directory exists: {PROCESSED_DIR_STATIC}")
+    logger.info(f"Ensured base directory exists: {BASE_DIR_STATIC}")
+except OSError as e:
+    logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
+    # For such a critical step, you might want the application to exit if directories can't be made.
+    # import sys
+    # sys.exit(f"CRITICAL: Could not create essential directories: {e}")
+    # For now, we'll let it continue and see if FastAPI/Starlette complains later.
+
+# Now import FastAPI and other components that might depend on these paths indirectly
+# or for app.mount
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -5,20 +41,9 @@ from pydantic import BaseModel, HttpUrl
 from rembg import remove, new_session
 from PIL import Image
 
-import asyncio
-import uuid
-import io
-import os
-import aiofiles
-import logging
-import httpx
-import urllib.parse
+app = FastAPI() # FastAPI app instance created AFTER directories are handled
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- Configuration Constants ---
+# --- Configuration Constants (can use the _STATIC versions or redefine) ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 13
@@ -27,26 +52,13 @@ LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 HTTP_CLIENT_TIMEOUT = 30.0
 
-# --- Directory and File Paths ---
-BASE_DIR = "/workspace/rmvbg"
-UPLOADS_DIR = "/workspace/uploads"
-PROCESSED_DIR = "/workspace/processed"
+# --- Directory and File Paths (using the _STATIC versions or re-assigning) ---
+BASE_DIR = BASE_DIR_STATIC
+UPLOADS_DIR = UPLOADS_DIR_STATIC
+PROCESSED_DIR = PROCESSED_DIR_STATIC # Crucial: use the one that was created
 LOGO_FILENAME = "logo.png"
 LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
 
-# --- CREATE DIRECTORIES EARLY ---
-# Ensure these directories exist before app.mount is called or app object is fully formed.
-try:
-    os.makedirs(UPLOADS_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
-    logger.info(f"Ensured uploads directory exists: {UPLOADS_DIR}")
-    logger.info(f"Ensured processed directory exists: {PROCESSED_DIR}")
-except OSError as e:
-    logger.error(f"Error creating directories {UPLOADS_DIR} or {PROCESSED_DIR}: {e}")
-    # Depending on severity, you might want to raise an exception here and halt startup
-    # For now, just logging the error.
-
-app = FastAPI() # FastAPI app instance created AFTER directories are handled
 
 # --- Global State ---
 prepared_logo_image = None
@@ -239,12 +251,17 @@ async def image_processing_worker(worker_id: int):
 @app.on_event("startup")
 async def startup_event():
     global prepared_logo_image
-    logger.info("Application startup event running...") # Changed log message
+    logger.info("Application startup event running...")
 
-    # Note: Directories UPLOADS_DIR and PROCESSED_DIR are already created at module level.
-    # Re-running os.makedirs here with exist_ok=True is fine and ensures they exist.
-    # os.makedirs(UPLOADS_DIR, exist_ok=True) 
-    # os.makedirs(PROCESSED_DIR, exist_ok=True)
+    # Directories should have been created at module level.
+    # This is just an additional check or for clarity if someone looks here.
+    if not os.path.isdir(UPLOADS_DIR):
+        logger.warning(f"Uploads directory {UPLOADS_DIR} was not found at startup event, trying to create again.")
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+    if not os.path.isdir(PROCESSED_DIR):
+        logger.warning(f"Processed directory {PROCESSED_DIR} was not found at startup event, trying to create again.")
+        os.makedirs(PROCESSED_DIR, exist_ok=True)
+
 
     if os.path.exists(LOGO_PATH):
         try:
@@ -264,7 +281,7 @@ async def startup_event():
     logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}.")
 
 # --- Static File Serving ---
-# These must come AFTER app = FastAPI() is defined
+# These must come AFTER app = FastAPI() is defined AND directories exist
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
