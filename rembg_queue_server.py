@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-MAX_CONCURRENT_TASKS = 1
+MAX_CONCURRENT_TASKS = 6
 ESTIMATED_TIME_PER_JOB = 13 # May increase slightly due to download in worker
 TARGET_SIZE = 1024
 LOGO_MAX_WIDTH = 150
