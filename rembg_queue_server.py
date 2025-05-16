@@ -53,6 +53,7 @@ MIME_TO_EXT = {
     'image/webp': '.webp',
     'image/bmp': '.bmp',
     'image/tiff': '.tiff',
+    'image/webp': '.webp',
 }
 
 # --- Pydantic Models ---
