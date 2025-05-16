@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse # FileResponse not needed for root anymore
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
-from rembg import remove, new_session
+from rembg import remove, new_session # Make sure you have rembg[gpu] installed for GPU usage
 from PIL import Image
 
 import asyncio
@@ -11,7 +11,6 @@ import io
 import os
 import aiofiles
 import logging
-# from typing import List, Optional # Not strictly needed now
 import httpx
 import urllib.parse
 
@@ -21,28 +20,31 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-MAX_CONCURRENT_TASKS = 6
-ESTIMATED_TIME_PER_JOB = 13 # May increase slightly due to download in worker
-TARGET_SIZE = 1024
-LOGO_MAX_WIDTH = 150
-LOGO_MARGIN = 20
+# --- Configuration Constants ---
+# YOU MUST TUNE MAX_CONCURRENT_TASKS BASED ON YOUR HARDWARE AND TESTING
+MAX_CONCURRENT_TASKS = 8  # Example: Start with number of CPU cores or based on GPU capacity
+MAX_QUEUE_SIZE = 5000     # Max number of jobs to hold in memory if workers are busy
+ESTIMATED_TIME_PER_JOB = 13 # Estimated seconds per job (download, process, save) - re-evaluate with more workers
+TARGET_SIZE = 1024        # Target dimension for squared image
+LOGO_MAX_WIDTH = 150      # Max width for the logo overlay
+LOGO_MARGIN = 20          # Margin for the logo from image edges
+HTTP_CLIENT_TIMEOUT = 30.0 # Timeout for downloading images from URLs
 
-BASE_DIR = "/workspace/rmvbg"
-UPLOADS_DIR = "/workspace/uploads"
-PROCESSED_DIR = "/workspace/processed"
+# --- Directory and File Paths ---
+BASE_DIR = "/workspace/rmvbg"       # For logo primarily
+UPLOADS_DIR = "/workspace/uploads"  # For downloaded original images
+PROCESSED_DIR = "/workspace/processed" # For final processed images
 LOGO_FILENAME = "logo.png"
 LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
 
+# --- Global State ---
 prepared_logo_image = None
+# Initialize queue with maxsize for backpressure
+queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+# Stores job_id -> { "status": ..., "input_image_url": ..., ..., "status_check_url": ... }
+results = {}
 
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-os.makedirs(PROCESSED_DIR, exist_ok=True)
-
-queue = asyncio.Queue()
-results = {} # job_id -> { "status": ..., "input_image_url": ..., "original_local_path": ..., "processed_path": ..., "error_message": ... }
-
-
-EXPECTED_API_KEY = "secretApiKey"
+EXPECTED_API_KEY = "secretApiKey"  # Replace in production
 
 MIME_TO_EXT = {
     'image/jpeg': '.jpg',
@@ -53,21 +55,23 @@ MIME_TO_EXT = {
     'image/tiff': '.tiff',
 }
 
+# --- Pydantic Models ---
 class SubmitRequestBody(BaseModel):
     image: HttpUrl
     key: str
     model: str = "u2net"
     post_process: bool = False
-    steps: int = 20
-    samples: int = 1
-    resolution: str = "1024x1024"
+    steps: int = 20 # Accepted but not used by rembg
+    samples: int = 1 # Accepted but not used by rembg
+    resolution: str = "1024x1024" # Effectively enforced by TARGET_SIZE
 
-
+# --- Helper Functions ---
 def get_proxy_url(request: Request):
     host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost"))
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     return f"{scheme}://{host}"
 
+# --- API Endpoints ---
 @app.post("/submit")
 async def submit_image_for_processing(
     request: Request,
@@ -77,44 +81,46 @@ async def submit_image_for_processing(
     if body.key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 2. Logo Availability Check (Quick local check)
-    # This check ensures that if a logo is configured and expected, it's loaded.
-    # If LOGO_PATH exists but prepared_logo_image is None, it implies a startup loading issue.
+    # 2. Logo Configuration Check (Quick local check)
     if os.path.exists(LOGO_PATH) and not prepared_logo_image:
-        logger.error("Logo file exists but was not loaded. Watermarking may fail or be skipped.")
-        # Depending on policy, you might raise an error or allow proceeding with a warning.
-        # For now, let's allow it to proceed, worker will handle missing logo.
-        # If logo is critical, uncomment:
-        # raise HTTPException(status_code=500, detail="Server configuration error: Logo not available for watermarking.")
+        logger.error("Logo file exists at startup but was not loaded. Watermarking may fail or be skipped. Check startup logs.")
+        # Decide if this is critical enough to stop submission. For now, allows proceeding.
     
     # 3. Job ID Generation (Quick)
     job_id = str(uuid.uuid4())
+    public_url_base = get_proxy_url(request)
     
-    # 4. Add job to queue with URL, not local path (Quick)
-    # The worker will handle downloading and saving.
-    await queue.put((job_id, str(body.image), body.model, body.post_process))
+    # 4. Add job to queue (Quick, with backpressure)
+    try:
+        # The worker will handle downloading and saving.
+        queue.put_nowait((job_id, str(body.image), body.model, body.post_process))
+    except asyncio.QueueFull:
+        logger.warning(f"Queue is full (max size: {MAX_QUEUE_SIZE}). Rejecting request for image {body.image}.")
+        raise HTTPException(status_code=503, detail=f"Server is temporarily overloaded (queue full). Please try again later. Max queue size: {MAX_QUEUE_SIZE}")
     
-    # 5. Initialize job status (Quick)
+    # 5. Initialize job status in results (Quick)
+    status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
         "status": "queued",
-        "input_image_url": str(body.image), # Store the input URL
-        "original_local_path": None,      # Will be filled by worker
+        "input_image_url": str(body.image),
+        "original_local_path": None,
         "processed_path": None,
-        "error_message": None
+        "error_message": None,
+        "status_check_url": status_check_url
     }
 
     # 6. Generate response data (Quick)
-    public_url_base = get_proxy_url(request)
-    # Placeholder for the *processed* image. Output is still expected to be job_id.webp
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
-    
+    # ETA based on current queue size. If queue is often full, this might be optimistic for new requests.
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB 
 
     # 7. Return response (Quick)
     return {
-        "status": "processing", # User sees "processing" even if it's just queued
+        "status": "processing", # User sees "processing"
+        "job_id": job_id,
         "image_links": [processed_image_placeholder_url],
-        "etc": eta_seconds
+        "eta": eta_seconds,
+        "status_check_url": status_check_url
     }
 
 @app.get("/status/{job_id}")
@@ -123,51 +129,56 @@ async def check_status(request: Request, job_id: str):
     if not job_info:
         raise HTTPException(status_code=404, detail="Job not found")
     
+    public_url_base = get_proxy_url(request)
     response_data = {
         "job_id": job_id, 
-        "status": job_info["status"],
-        "input_image_url": job_info.get("input_image_url")
+        "status": job_info.get("status"),
+        "input_image_url": job_info.get("input_image_url"),
+        "status_check_url": job_info.get("status_check_url")
     }
-    public_url_base = get_proxy_url(request)
 
     if job_info.get("original_local_path"):
-         # Provide a link to the downloaded original if it was saved
         original_filename = os.path.basename(job_info["original_local_path"])
         response_data["downloaded_original_image_url"] = f"{public_url_base}/originals/{original_filename}"
 
-    if job_info["status"] == "done" and job_info.get("processed_path"):
+    if job_info.get("status") == "done" and job_info.get("processed_path"):
         processed_filename = os.path.basename(job_info["processed_path"])
         response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
-    elif job_info["status"] == "error":
-        response_data["error_message"] = job_info["error_message"]
+    elif job_info.get("status") == "error":
+        response_data["error_message"] = job_info.get("error_message")
     
     return JSONResponse(content=response_data)
 
-
+# --- Background Worker ---
 async def image_processing_worker(worker_id: int):
-    logger.info(f"Worker {worker_id} started.")
-    global prepared_logo_image
+    logger.info(f"Worker {worker_id} started. Listening for jobs...")
+    global prepared_logo_image # Access pre-loaded logo
 
     while True:
         job_id, image_url_str, model_name, post_process_flag = await queue.get()
         logger.info(f"Worker {worker_id} picked up job {job_id} for URL: {image_url_str}")
         
-        original_file_path = None # Initialize
+        if job_id not in results:
+            logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. This shouldn't happen. Skipping.")
+            queue.task_done()
+            continue
+
+        original_file_path = None # Initialize for cleanup logic
         results[job_id]["status"] = "downloading"
 
         try:
-            # --- 1. Download Image ---
-            async with httpx.AsyncClient(timeout=30.0) as client: # Added timeout
+            # 1. Download Image
+            async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
                 img_response = await client.get(image_url_str)
-                img_response.raise_for_status()
+                img_response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
             
             image_content = await img_response.aread()
             content_type = img_response.headers.get("content-type", "").lower()
 
             if not content_type.startswith("image/"):
-                raise ValueError(f"Invalid content type '{content_type}'. URL does not point to an image.")
+                raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
 
-            # --- 2. Determine Extension & Save Original Image ---
+            # 2. Determine Extension & Save Original Image to UPLOADS_DIR
             extension = MIME_TO_EXT.get(content_type)
             if not extension:
                 parsed_url_path = urllib.parse.urlparse(image_url_str).path
@@ -175,24 +186,26 @@ async def image_processing_worker(worker_id: int):
                 if ext_from_url and ext_from_url.lower() in MIME_TO_EXT.values():
                     extension = ext_from_url.lower()
                 else:
-                    extension = ".png" # Default
-                    logger.warning(f"Job {job_id}: Could not determine extension for {image_url_str} (Content-Type: {content_type}). Defaulting to '.png'.")
+                    extension = ".png" # Default if cannot determine
+                    logger.warning(f"Job {job_id}: Could not determine extension for {image_url_str} (Content-Type: {content_type}). Defaulting to '{extension}'.")
             
             original_filename = f"{job_id}_original{extension}"
             original_file_path = os.path.join(UPLOADS_DIR, original_filename)
-            results[job_id]["original_local_path"] = original_file_path # Update results
+            results[job_id]["original_local_path"] = original_file_path # Update results with local path
 
             async with aiofiles.open(original_file_path, 'wb') as out_file:
                 await out_file.write(image_content)
             logger.info(f"Worker {worker_id} saved original image for job {job_id} to {original_file_path}")
             
-            # --- 3. Process Image (rembg, square, watermark) ---
-            results[job_id]["status"] = "processing" # More specific status
+            # 3. Process Image (rembg, square, watermark)
+            results[job_id]["status"] = "processing"
             
+            # Use a blocking open here as rembg/PIL will be blocking anyway for this part
             with open(original_file_path, 'rb') as i:
                 input_bytes = i.read()
             
-            session = new_session(model_name)
+            # --- rembg: Background Removal ---
+            session = new_session(model_name) # Create session per model or reuse if thread-safe and efficient
             output_bytes = remove(
                 input_bytes,
                 session=session,
@@ -201,61 +214,79 @@ async def image_processing_worker(worker_id: int):
             
             img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
+            # --- Pillow: Squaring ---
             original_width, original_height = img_no_bg.size
-            ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height) if original_width > 0 and original_height > 0 else 1
+            if original_width == 0 or original_height == 0: # Handle invalid image dimensions
+                raise ValueError("Image dimensions are zero after background removal.")
+
+            ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
             new_width = int(original_width * ratio)
             new_height = int(original_height * ratio)
             
             img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
+            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0)) # Transparent canvas
             paste_x = (TARGET_SIZE - new_width) // 2
             paste_y = (TARGET_SIZE - new_height) // 2
-            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
+            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized) # Paste using its own alpha
 
+            # --- Pillow: Watermarking ---
             if prepared_logo_image:
                 logo_w, logo_h = prepared_logo_image.size
                 logo_pos_x = LOGO_MARGIN
                 logo_pos_y = TARGET_SIZE - logo_h - LOGO_MARGIN
                 square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
+            else:
+                logger.info(f"Job {job_id}: Skipping watermark as logo is not available/loaded.")
 
             final_image = square_canvas
-            processed_filename = f"{job_id}.webp" # Output is always webp
+            processed_filename = f"{job_id}.webp" # Save final output as WEBP
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-            final_image.save(processed_file_path, 'WEBP', quality=90)
+            
+            # Save the final image
+            final_image.save(processed_file_path, 'WEBP', quality=90) # Adjust quality if needed
 
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
             logger.info(f"Worker {worker_id} finished job {job_id}. Processed image: {processed_file_path}")
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"Worker {worker_id} HTTP error downloading for job {job_id} from {image_url_str}: {e.response.status_code} - {e.response.text}", exc_info=True)
+            logger.error(f"Worker {worker_id} HTTP error {e.response.status_code} for job {job_id} from {image_url_str}: {e.response.text}", exc_info=True)
             results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code}."
-        except (httpx.RequestError, ValueError, IOError, OSError) as e: # Catch download, save, or image format errors
-            logger.error(f"Worker {worker_id} error during download/save/initial open for job {job_id}: {e}", exc_info=True)
+            results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code} from {image_url_str}."
+        except httpx.RequestError as e: # Covers DNS, connection, timeout errors
+            logger.error(f"Worker {worker_id} Network error downloading for job {job_id} from {image_url_str}: {e}", exc_info=True)
             results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = str(e)
-        except Exception as e: # Catch-all for other processing errors
+            results[job_id]["error_message"] = f"Network error downloading image from {image_url_str}: {type(e).__name__}."
+        except (ValueError, IOError, OSError) as e: # Covers invalid image data, file save errors etc.
+            logger.error(f"Worker {worker_id} data/file error for job {job_id}: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Data or file error: {str(e)}"
+        except Exception as e: # Catch-all for unexpected processing errors
             logger.error(f"Worker {worker_id} critical error processing job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Processing failed: {str(e)}"
+            results[job_id]["error_message"] = f"Unexpected processing error: {str(e)}"
         finally:
-            queue.task_done()
-            # Clean up original downloaded file if it exists and an error occurred *after* saving it
-            # but *before* successful processing.
-            # This is optional and depends on your cleanup strategy.
-            if results[job_id]["status"] == "error" and original_file_path and os.path.exists(original_file_path):
-                try:
-                    # os.remove(original_file_path)
-                    # logger.info(f"Cleaned up original file {original_file_path} for failed job {job_id}")
-                    pass # Decide on cleanup
-                except OSError as e_clean:
-                    logger.error(f"Error cleaning up original file {original_file_path} for job {job_id}: {e_clean}")
+            queue.task_done() # Crucial: signal that this queue item is processed
+            # Optional: Cleanup original downloaded file on error
+            # if results[job_id]["status"] == "error" and original_file_path and os.path.exists(original_file_path):
+            #     try:
+            #         os.remove(original_file_path)
+            #         logger.info(f"Cleaned up original file {original_file_path} for failed job {job_id}")
+            #     except OSError as e_clean:
+            #         logger.error(f"Error cleaning up original file {original_file_path} for job {job_id}: {e_clean}")
 
-
+# --- Application Startup Logic ---
 @app.on_event("startup")
 async def startup_event():
     global prepared_logo_image
+    logger.info("Application startup...")
+
+    # Create directories if they don't exist
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    logger.info(f"Uploads directory: {UPLOADS_DIR}, Processed directory: {PROCESSED_DIR}")
+
+    # Load and prepare the logo
     if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
@@ -267,27 +298,61 @@ async def startup_event():
             prepared_logo_image = logo
             logger.info(f"Logo loaded and prepared from {LOGO_PATH}. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
         except Exception as e:
-            logger.error(f"Failed to load or prepare logo from {LOGO_PATH}: {e}")
-            prepared_logo_image = None
+            logger.error(f"Failed to load or prepare logo from {LOGO_PATH}: {e}", exc_info=True)
+            prepared_logo_image = None # Ensure it's None on failure
     else:
         logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be skipped.")
         prepared_logo_image = None
 
+    # Start worker tasks
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
-    logger.info(f"{MAX_CONCURRENT_TASKS} worker(s) started.")
+    logger.info(f"{MAX_CONCURRENT_TASKS} image processing worker(s) started.")
+    logger.info(f"Job queue max size: {MAX_QUEUE_SIZE}.")
 
+# --- Static File Serving ---
+# Serves processed images (e.g., /images/job_id.webp)
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
+# Serves original downloaded images (e.g., /originals/job_id_original.png)
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
-@app.get("/", response_class=HTMLResponse)
+# --- Root Endpoint ---
+@app.get("/", response_class=HTMLResponse, include_in_schema=False) # Exclude from OpenAPI docs
 async def root():
     return """
-    <html><head><title>Image Processing API</title></head>
-    <body><h1>Image Processing API is running</h1>
-    <p>Use the /submit endpoint to process images.</p></body></html>
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Image Processing API</title>
+        <style>
+            body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+            .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            h1 { color: #0056b3; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Resale1... In The House!</h1>
+            <p>This service provides background removal and image processing capabilities.</p>
+            <p>Current settings:
+                <ul>
+                    <li>Max Concurrent Workers: """ + str(MAX_CONCURRENT_TASKS) + """</li>
+                    <li>Max Queue Size: """ + str(MAX_QUEUE_SIZE) + """</li>
+                </ul>
+            </p>
+        </div>
+    </body>
+    </html>
     """
 
+# --- Main Execution (for local development) ---
 if __name__ == "__main__":
     import uvicorn
+    logger.info("Starting Uvicorn server for local development...")
+    # For production, use a proper ASGI server like Uvicorn with Gunicorn workers:
+    # gunicorn -w (num_workers) -k uvicorn.workers.UvicornWorker main:app
+    # Number of Gunicorn workers is typically (2 * CPU_CORES) + 1.
+    # Each Gunicorn worker will run its own FastAPI app instance with MAX_CONCURRENT_TASKS asyncio workers.
     uvicorn.run(app, host="0.0.0.0", port=8000)
