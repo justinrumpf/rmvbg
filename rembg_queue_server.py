@@ -43,7 +43,7 @@ TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
 # --- Logo Specific Configuration ---
-ENABLE_LOGO_WATERMARK = True  # <<< --- ADD THIS TOGGLE ---
+ENABLE_LOGO_WATERMARK = False  # <<< --- ADD THIS TOGGLE ---
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
