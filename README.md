@@ -69,8 +69,6 @@ The installation script utilizes `tmux` to run the web server in a detached sess
 
  ## Licensing and Requirements
 
-# 📄 Library Licensing Summary
-
 Below is a list of the libraries and their associated open-source licenses, as commonly published on [PyPI](https://pypi.org/) and GitHub. These licenses determine how the libraries may be used, modified, and distributed in both commercial and non-commercial settings.
 This list is as I know them today and there could be errors. Use and investigate licensing at your own risk. Im no attorney. 
 
