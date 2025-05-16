@@ -176,72 +176,21 @@ async def image_processing_worker(worker_id: int):
             image_content = await img_response.aread()
             content_type = img_response.headers.get("content-type", "").lower()
 
-
-        try:
-            # 1. Download Image and Initial Content-Type Check
-            image_content = await img_response.aread()
-            original_content_type_header = img_response.headers.get("content-type", "unknown") # Get original for logging
-            content_type = original_content_type_header.lower() # Work with lowercase
-            
-            logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_url_str}")
-
-            # Attempt to infer from URL if original Content-Type is problematic (octet-stream or not image/*)
-            if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                if content_type == "application/octet-stream":
-                    logger.warning(f"Job {job_id}: Original Content-Type is 'application/octet-stream'. Attempting to infer from URL file extension.")
-                else: # It's not "image/" and also not "application/octet-stream", but some other type
-                    logger.warning(f"Job {job_id}: Original Content-Type is '{content_type}', which is not 'image/*'. Attempting to infer from URL file extension as a fallback.")
-
-                file_extension_from_url = os.path.splitext(urllib.parse.urlparse(image_url_str).path)[1].lower()
-                logger.info(f"Job {job_id}: Parsed file extension from URL: '{file_extension_from_url}'")
-
-                potential_new_content_type = None
-                if file_extension_from_url == ".webp":
-                    potential_new_content_type = "image/webp"
-                elif file_extension_from_url == ".png":
-                    potential_new_content_type = "image/png"
-                elif file_extension_from_url in [".jpg", ".jpeg"]: # Common variations for JPEG
-                    potential_new_content_type = "image/jpeg"
-                elif file_extension_from_url == ".gif":
-                    potential_new_content_type = "image/gif"
-                elif file_extension_from_url == ".bmp":
-                    potential_new_content_type = "image/bmp"
-                elif file_extension_from_url in [".tif", ".tiff"]: # Common variations for TIFF
-                    potential_new_content_type = "image/tiff"
-                # Add other common image extensions if needed
-
-                if potential_new_content_type:
-                    logger.info(f"Job {job_id}: Overriding Content-Type from '{original_content_type_header}' to '{potential_new_content_type}' based on URL extension '{file_extension_from_url}'.")
-                    content_type = potential_new_content_type # Update content_type
-                else:
-                    logger.warning(f"Job {job_id}: URL file extension '{file_extension_from_url}' is not in the recognized list for Content-Type override. Original Content-Type '{original_content_type_header}' will be used for the final check.")
-                    # If no override, content_type remains what it was (e.g., 'application/octet-stream' or other non-image type)
-
-            # Final validation after potential override (this is effectively your line 180)
             if not content_type.startswith("image/"):
-                logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
                 raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
-            
-            logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
 
-            # 2. Determine Extension for saving & Save Original Image to UPLOADS_DIR
-            # This 'extension' is for the *saved file*, derived from the final 'content_type'
-            saved_file_extension = MIME_TO_EXT.get(content_type) 
-            if not saved_file_extension:
-                # If MIME_TO_EXT doesn't have it (e.g. image/svg+xml), try to use the URL's extension if it's a known one
-                # Or fallback to a default like .bin or raise an error if strictness is needed
-                parsed_url_path_for_save_ext = urllib.parse.urlparse(image_url_str).path
-                _, ext_from_url_for_save = os.path.splitext(parsed_url_path_for_save_ext)
-                ext_from_url_for_save = ext_from_url_for_save.lower()
-
-                if ext_from_url_for_save and ext_from_url_for_save in MIME_TO_EXT.values(): # Check if this suffix is something we map
-                    saved_file_extension = ext_from_url_for_save
-                    logger.info(f"Job {job_id}: Using URL extension '{saved_file_extension}' for saving original file as Content-Type '{content_type}' was not in MIME_TO_EXT map.")
+            # 2. Determine Extension & Save Original Image to UPLOADS_DIR
+            extension = MIME_TO_EXT.get(content_type)
+            if not extension:
+                parsed_url_path = urllib.parse.urlparse(image_url_str).path
+                _, ext_from_url = os.path.splitext(parsed_url_path)
+                if ext_from_url and ext_from_url.lower() in MIME_TO_EXT.values():
+                    extension = ext_from_url.lower()
                 else:
-                    saved_file_extension = ".bin" # A generic binary extension if truly unknown
-                    logger.warning(f"Job {job_id}: Could not determine specific file extension for saving original from Content-Type '{content_type}' or URL. Defaulting to '{saved_file_extension}'.")
+                    extension = ".png" # Default if cannot determine
+                    logger.warning(f"Job {job_id}: Could not determine extension for {image_url_str} (Content-Type: {content_type}). Defaulting to '{extension}'.")
             
-            original_filename = f"{job_id}_original{saved_file_extension}"
+            original_filename = f"{job_id}_original{extension}"
             original_file_path = os.path.join(UPLOADS_DIR, original_filename)
             results[job_id]["original_local_path"] = original_file_path # Update results with local path
 
