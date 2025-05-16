@@ -4,7 +4,7 @@
 | |__) |___  ___  __ _  | | ___ | | 
 |  _  // _ \/ __|/ _` | | |/ _ \| | 
 | | \ \  __/\__ \ (_| | | |  __/| | 
-|_|  \_\___||___/\__,_| |_|\___|_|_|
+|_|  \_\___||___/\__,_| |_|\___|_|_|         IS IN DA HOUSE!
 ```
 
 # RemBG implementation that provides an HTTP server with an API endpoint.
