@@ -9,7 +9,7 @@
 
 # RemBG implementation that provides an HTTP server with an API endpoint.
 
-##This setup includes settings for:
+## This setup includes settings for:
 
 *   Simple Queuing
 *   Concurrent Jobs
