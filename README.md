@@ -66,3 +66,38 @@ The installation script utilizes `tmux` to run the web server in a detached sess
     *   `cd /workspace/rmvbg`: Navigates to the `rmvbg` directory (adjust this path if your installation directory is different).
     *   `source venv/bin/activate`: Activates the virtual environment created by the installation script.
     *   `uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000`: Starts the `uvicorn` web server, binding it to all available network interfaces (`0.0.0.0`) on port 7000.
+
+ ## Licensing and Requirements
+
+# 📄 Library Licensing Summary
+
+Below is a list of the libraries and their associated open-source licenses, as commonly published on [PyPI](https://pypi.org/) and GitHub. These licenses determine how the libraries may be used, modified, and distributed in both commercial and non-commercial settings.
+This list is as I know them today and there could be errors. Use and investigate licensing at your own risk. Im no attorney. 
+
+                | Library               | License                  | Notes                                                                 |
+                |-----------------------|---------------------------|-----------------------------------------------------------------------|
+                | `onnxruntime-gpu`     | MIT                       | Permissive license, allows commercial use, modification, distribution. |
+                | `rembg[gpu]`          | Apache 2.0                | Allows commercial use and redistribution with attribution.             |
+                | `watchdog`            | Apache 2.0                | Permissive, commonly used for file system monitoring.                  |
+                | `asyncer`             | MIT                       | Lightweight async utility with a permissive license.                   |
+                | `aiohttp`             | Apache 2.0                | Async HTTP client/server library, widely adopted.                      |
+                | `uvicorn`             | BSD 3-Clause              | Permissive license with minimal conditions.                            |
+                | `fastapi`             | MIT                       | Very permissive, used for async APIs.                                  |
+                | `python-multipart`    | Apache 2.0                | Handles multipart/form-data, permissive use.                           |
+                | `filetype`            | MIT                       | Detect file types by binary signatures.                                |
+                | `gradio`              | Apache 2.0                | For building machine learning web UIs.                                 |
+                | `nano`                | GPL-3.0                   | GNU nano text editor; copyleft license, restricts proprietary reuse.   |
+                | `aiofiles`            | Apache 2.0                | Asynchronous file IO operations.                                       |
+                | `Pillow`              | HPND (PIL Fork License)   | Historical license, permissive; similar to MIT.                        |
+                | `requests`            | Apache 2.0                | Most popular HTTP library in Python.                                   |
+                | `httpx`               | BSD 3-Clause              | Async-compatible HTTP client library.                                  |
+
+---
+
+## ✅ Summary of Common Licenses
+
+- **MIT / BSD / Apache 2.0**: You can use them in commercial software, modify them, redistribute them, and don’t need to open-source your own code, though attribution is often required.
+- **GPL (like in `nano`)**: Requires derivative works to be licensed under the same GPL license if distributed, making it restrictive for proprietary/commercial use unless isolated.
+
+
+       
