@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse # Keep HTMLResponse for the basic root
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 from rembg import remove, new_session
-from PIL import Image # ImageOps might not be strictly needed if not used
+from PIL import Image
 
 import asyncio
 import uuid
@@ -11,7 +11,7 @@ import io
 import os
 import aiofiles
 import logging
-from typing import List, Optional # Optional and List might not be needed if /upload-item is gone
+# from typing import List, Optional # Not strictly needed now
 import httpx
 import urllib.parse
 
@@ -22,13 +22,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 MAX_CONCURRENT_TASKS = 1
-ESTIMATED_TIME_PER_JOB = 12
+ESTIMATED_TIME_PER_JOB = 13 # May increase slightly due to download in worker
 TARGET_SIZE = 1024
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 
-# Define directories
-BASE_DIR = "/workspace/rmvbg" # This directory is now mainly for the logo
+BASE_DIR = "/workspace/rmvbg"
 UPLOADS_DIR = "/workspace/uploads"
 PROCESSED_DIR = "/workspace/processed"
 LOGO_FILENAME = "logo.png"
@@ -40,7 +39,8 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 queue = asyncio.Queue()
-results = {}
+results = {} # job_id -> { "status": ..., "input_image_url": ..., "original_local_path": ..., "processed_path": ..., "error_message": ... }
+
 
 EXPECTED_API_KEY = "secretApiKey"
 
@@ -73,72 +73,46 @@ async def submit_image_for_processing(
     request: Request,
     body: SubmitRequestBody
 ):
+    # 1. API Key Validation (Quick)
     if body.key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not prepared_logo_image and os.path.exists(LOGO_PATH): # Check if logo should exist but isn't loaded
-        logger.error("Logo image not loaded. Processing cannot continue with watermarking.")
-        # If logo is critical, raise error. If optional, just log a warning.
-        raise HTTPException(status_code=500, detail="Server configuration error: Logo not available.")
-    elif not os.path.exists(LOGO_PATH):
-        logger.warning(f"Logo file {LOGO_PATH} not found. Watermarking will be skipped.")
-        # Allow processing without logo if it's not found.
-
+    # 2. Logo Availability Check (Quick local check)
+    # This check ensures that if a logo is configured and expected, it's loaded.
+    # If LOGO_PATH exists but prepared_logo_image is None, it implies a startup loading issue.
+    if os.path.exists(LOGO_PATH) and not prepared_logo_image:
+        logger.error("Logo file exists but was not loaded. Watermarking may fail or be skipped.")
+        # Depending on policy, you might raise an error or allow proceeding with a warning.
+        # For now, let's allow it to proceed, worker will handle missing logo.
+        # If logo is critical, uncomment:
+        # raise HTTPException(status_code=500, detail="Server configuration error: Logo not available for watermarking.")
+    
+    # 3. Job ID Generation (Quick)
     job_id = str(uuid.uuid4())
     
-    try:
-        async with httpx.AsyncClient() as client:
-            img_response = await client.get(str(body.image))
-            img_response.raise_for_status()
-    except httpx.RequestError as e:
-        logger.error(f"Error downloading image from {body.image}: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to download image from URL: {e}")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error downloading image {body.image}: {e.response.status_code} - {e.response.text}")
-        raise HTTPException(status_code=e.response.status_code, detail=f"Error fetching image from URL: {e.response.reason_phrase}")
-
-    image_content = await img_response.aread()
-    content_type = img_response.headers.get("content-type", "").lower()
-
-    if not content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Invalid file type. URL does not point to an image.")
-
-    extension = MIME_TO_EXT.get(content_type)
-    if not extension:
-        parsed_url_path = urllib.parse.urlparse(str(body.image)).path
-        _, ext_from_url = os.path.splitext(parsed_url_path)
-        if ext_from_url and ext_from_url.lower() in MIME_TO_EXT.values():
-            extension = ext_from_url
-        else:
-            extension = ".png"
-            logger.warning(f"Could not determine extension for {body.image}. Defaulting to '.png'.")
+    # 4. Add job to queue with URL, not local path (Quick)
+    # The worker will handle downloading and saving.
+    await queue.put((job_id, str(body.image), body.model, body.post_process))
     
-    original_filename = f"{job_id}_original{extension}"
-    original_file_path = os.path.join(UPLOADS_DIR, original_filename)
-
-    try:
-        async with aiofiles.open(original_file_path, 'wb') as out_file:
-            await out_file.write(image_content)
-        logger.info(f"📝 Original image saved: {original_file_path} from URL {body.image}")
-    except Exception as e:
-        logger.error(f"Error saving downloaded file {original_filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save downloaded file: {e}")
-
-    await queue.put((job_id, original_file_path, body.model, body.post_process))
-    
+    # 5. Initialize job status (Quick)
     results[job_id] = {
         "status": "queued",
-        "original_path": original_file_path,
+        "input_image_url": str(body.image), # Store the input URL
+        "original_local_path": None,      # Will be filled by worker
         "processed_path": None,
-        "error_message": None,
+        "error_message": None
     }
 
+    # 6. Generate response data (Quick)
     public_url_base = get_proxy_url(request)
+    # Placeholder for the *processed* image. Output is still expected to be job_id.webp
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
+    
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB 
 
+    # 7. Return response (Quick)
     return {
-        "status": "processing",
+        "status": "processing", # User sees "processing" even if it's just queued
         "image_links": [processed_image_placeholder_url],
         "etc": eta_seconds
     }
@@ -149,13 +123,24 @@ async def check_status(request: Request, job_id: str):
     if not job_info:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    response_data = {"job_id": job_id, "status": job_info["status"]}
-    if job_info["status"] == "done":
-        public_url_base = get_proxy_url(request)
-        processed_filename = f"{job_id}.webp" 
+    response_data = {
+        "job_id": job_id, 
+        "status": job_info["status"],
+        "input_image_url": job_info.get("input_image_url")
+    }
+    public_url_base = get_proxy_url(request)
+
+    if job_info.get("original_local_path"):
+         # Provide a link to the downloaded original if it was saved
+        original_filename = os.path.basename(job_info["original_local_path"])
+        response_data["downloaded_original_image_url"] = f"{public_url_base}/originals/{original_filename}"
+
+    if job_info["status"] == "done" and job_info.get("processed_path"):
+        processed_filename = os.path.basename(job_info["processed_path"])
         response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
     elif job_info["status"] == "error":
         response_data["error_message"] = job_info["error_message"]
+    
     return JSONResponse(content=response_data)
 
 
@@ -164,69 +149,109 @@ async def image_processing_worker(worker_id: int):
     global prepared_logo_image
 
     while True:
+        job_id, image_url_str, model_name, post_process_flag = await queue.get()
+        logger.info(f"Worker {worker_id} picked up job {job_id} for URL: {image_url_str}")
+        
+        original_file_path = None # Initialize
+        results[job_id]["status"] = "downloading"
+
         try:
-            job_id, original_file_path, model_name, post_process_flag = await queue.get()
-            logger.info(f"Worker {worker_id} picked up job {job_id}")
-            results[job_id]["status"] = "processing"
+            # --- 1. Download Image ---
+            async with httpx.AsyncClient(timeout=30.0) as client: # Added timeout
+                img_response = await client.get(image_url_str)
+                img_response.raise_for_status()
             
-            try:
-                with open(original_file_path, 'rb') as i:
-                    input_bytes = i.read()
-                
-                session = new_session(model_name)
-                output_bytes = remove(
-                    input_bytes,
-                    session=session,
-                    post_process_mask=post_process_flag
-                )
-                
-                img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
+            image_content = await img_response.aread()
+            content_type = img_response.headers.get("content-type", "").lower()
 
-                original_width, original_height = img_no_bg.size
-                ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
-                new_width = int(original_width * ratio)
-                new_height = int(original_height * ratio)
-                
-                img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
-                paste_x = (TARGET_SIZE - new_width) // 2
-                paste_y = (TARGET_SIZE - new_height) // 2
-                square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
+            if not content_type.startswith("image/"):
+                raise ValueError(f"Invalid content type '{content_type}'. URL does not point to an image.")
 
-                if prepared_logo_image: # Only try to paste if logo was loaded
-                    logo_w, logo_h = prepared_logo_image.size
-                    logo_pos_x = LOGO_MARGIN
-                    logo_pos_y = TARGET_SIZE - logo_h - LOGO_MARGIN
-                    square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
-                # else:
-                    # logger.info(f"Job {job_id}: Skipping watermark as logo is not available.")
-
-
-                final_image = square_canvas
-                processed_filename = f"{job_id}.webp"
-                processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-                final_image.save(processed_file_path, 'WEBP', quality=90)
-
-                results[job_id]["status"] = "done"
-                results[job_id]["processed_path"] = processed_file_path
-                logger.info(f"Worker {worker_id} finished job {job_id}. Processed image: {processed_file_path}")
-
-            except Exception as e:
-                logger.error(f"Worker {worker_id} error processing job {job_id}: {e}", exc_info=True)
-                results[job_id]["status"] = "error"
-                results[job_id]["error_message"] = str(e)
+            # --- 2. Determine Extension & Save Original Image ---
+            extension = MIME_TO_EXT.get(content_type)
+            if not extension:
+                parsed_url_path = urllib.parse.urlparse(image_url_str).path
+                _, ext_from_url = os.path.splitext(parsed_url_path)
+                if ext_from_url and ext_from_url.lower() in MIME_TO_EXT.values():
+                    extension = ext_from_url.lower()
+                else:
+                    extension = ".png" # Default
+                    logger.warning(f"Job {job_id}: Could not determine extension for {image_url_str} (Content-Type: {content_type}). Defaulting to '.png'.")
             
+            original_filename = f"{job_id}_original{extension}"
+            original_file_path = os.path.join(UPLOADS_DIR, original_filename)
+            results[job_id]["original_local_path"] = original_file_path # Update results
+
+            async with aiofiles.open(original_file_path, 'wb') as out_file:
+                await out_file.write(image_content)
+            logger.info(f"Worker {worker_id} saved original image for job {job_id} to {original_file_path}")
+            
+            # --- 3. Process Image (rembg, square, watermark) ---
+            results[job_id]["status"] = "processing" # More specific status
+            
+            with open(original_file_path, 'rb') as i:
+                input_bytes = i.read()
+            
+            session = new_session(model_name)
+            output_bytes = remove(
+                input_bytes,
+                session=session,
+                post_process_mask=post_process_flag
+            )
+            
+            img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
+
+            original_width, original_height = img_no_bg.size
+            ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height) if original_width > 0 and original_height > 0 else 1
+            new_width = int(original_width * ratio)
+            new_height = int(original_height * ratio)
+            
+            img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
+            paste_x = (TARGET_SIZE - new_width) // 2
+            paste_y = (TARGET_SIZE - new_height) // 2
+            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
+
+            if prepared_logo_image:
+                logo_w, logo_h = prepared_logo_image.size
+                logo_pos_x = LOGO_MARGIN
+                logo_pos_y = TARGET_SIZE - logo_h - LOGO_MARGIN
+                square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
+
+            final_image = square_canvas
+            processed_filename = f"{job_id}.webp" # Output is always webp
+            processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
+            final_image.save(processed_file_path, 'WEBP', quality=90)
+
+            results[job_id]["status"] = "done"
+            results[job_id]["processed_path"] = processed_file_path
+            logger.info(f"Worker {worker_id} finished job {job_id}. Processed image: {processed_file_path}")
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Worker {worker_id} HTTP error downloading for job {job_id} from {image_url_str}: {e.response.status_code} - {e.response.text}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code}."
+        except (httpx.RequestError, ValueError, IOError, OSError) as e: # Catch download, save, or image format errors
+            logger.error(f"Worker {worker_id} error during download/save/initial open for job {job_id}: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = str(e)
+        except Exception as e: # Catch-all for other processing errors
+            logger.error(f"Worker {worker_id} critical error processing job {job_id}: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Processing failed: {str(e)}"
+        finally:
             queue.task_done()
-        except asyncio.CancelledError:
-            logger.info(f"Worker {worker_id} stopping.")
-            break
-        except Exception as e:
-            logger.error(f"Critical error in worker {worker_id}: {e}", exc_info=True)
-            if 'job_id' in locals() and job_id in results:
-                 results[job_id]["status"] = "error"
-                 results[job_id]["error_message"] = "Worker failed unexpectedly."
-                 queue.task_done() 
-            await asyncio.sleep(1)
+            # Clean up original downloaded file if it exists and an error occurred *after* saving it
+            # but *before* successful processing.
+            # This is optional and depends on your cleanup strategy.
+            if results[job_id]["status"] == "error" and original_file_path and os.path.exists(original_file_path):
+                try:
+                    # os.remove(original_file_path)
+                    # logger.info(f"Cleaned up original file {original_file_path} for failed job {job_id}")
+                    pass # Decide on cleanup
+                except OSError as e_clean:
+                    logger.error(f"Error cleaning up original file {original_file_path} for job {job_id}: {e_clean}")
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -243,7 +268,7 @@ async def startup_event():
             logger.info(f"Logo loaded and prepared from {LOGO_PATH}. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
         except Exception as e:
             logger.error(f"Failed to load or prepare logo from {LOGO_PATH}: {e}")
-            prepared_logo_image = None # Ensure it's None on failure
+            prepared_logo_image = None
     else:
         logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be skipped.")
         prepared_logo_image = None
@@ -252,23 +277,15 @@ async def startup_event():
         asyncio.create_task(image_processing_worker(worker_id=i+1))
     logger.info(f"{MAX_CONCURRENT_TASKS} worker(s) started.")
 
-# Serve static files for processed and original images (needed for API to serve links)
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
-# Basic root endpoint to indicate the server is running
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return """
-    <html>
-        <head>
-            <title>Image Processing</title>
-        </head>
-        <body>
-            <h1>Resale1 is in the House!</h1>
-            <p>Use the /submit endpoint to process images.</p>
-        </body>
-    </html>
+    <html><head><title>Image Processing API</title></head>
+    <body><h1>Image Processing API is running</h1>
+    <p>Use the /submit endpoint to process images.</p></body></html>
     """
 
 if __name__ == "__main__":
