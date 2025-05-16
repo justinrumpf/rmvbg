@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse # Keep HTMLResponse for the basic root
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 from rembg import remove, new_session
-from PIL import Image, ImageOps # Added ImageOps for potential future use, Image is key
+from PIL import Image # ImageOps might not be strictly needed if not used
 
 import asyncio
 import uuid
@@ -11,7 +11,7 @@ import io
 import os
 import aiofiles
 import logging
-from typing import List, Optional
+from typing import List, Optional # Optional and List might not be needed if /upload-item is gone
 import httpx
 import urllib.parse
 
@@ -22,27 +22,23 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 MAX_CONCURRENT_TASKS = 1
-ESTIMATED_TIME_PER_JOB = 12 # Increased ETA slightly due to more processing
+ESTIMATED_TIME_PER_JOB = 12
 TARGET_SIZE = 1024
-LOGO_MAX_WIDTH = 150 # Max width for the logo, adjust as needed
-LOGO_MARGIN = 20     # Margin for the logo from the edges
+LOGO_MAX_WIDTH = 150
+LOGO_MARGIN = 20
 
 # Define directories
-BASE_DIR = "/workspace/rmvbg"
+BASE_DIR = "/workspace/rmvbg" # This directory is now mainly for the logo
 UPLOADS_DIR = "/workspace/uploads"
 PROCESSED_DIR = "/workspace/processed"
-LOGO_FILENAME = "logo.png" # Make sure this file exists in BASE_DIR
+LOGO_FILENAME = "logo.png"
 LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
 
-
-# Global variable to hold the prepared logo
 prepared_logo_image = None
 
-# Create directories if they don't exist
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-# In-memory job tracking
 queue = asyncio.Queue()
 results = {}
 
@@ -64,7 +60,7 @@ class SubmitRequestBody(BaseModel):
     post_process: bool = False
     steps: int = 20
     samples: int = 1
-    resolution: str = "1024x1024" # This will now be effectively enforced
+    resolution: str = "1024x1024"
 
 
 def get_proxy_url(request: Request):
@@ -80,9 +76,13 @@ async def submit_image_for_processing(
     if body.key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not prepared_logo_image: # Check if logo was loaded successfully at startup
+    if not prepared_logo_image and os.path.exists(LOGO_PATH): # Check if logo should exist but isn't loaded
         logger.error("Logo image not loaded. Processing cannot continue with watermarking.")
+        # If logo is critical, raise error. If optional, just log a warning.
         raise HTTPException(status_code=500, detail="Server configuration error: Logo not available.")
+    elif not os.path.exists(LOGO_PATH):
+        logger.warning(f"Logo file {LOGO_PATH} not found. Watermarking will be skipped.")
+        # Allow processing without logo if it's not found.
 
     job_id = str(uuid.uuid4())
     
@@ -161,7 +161,7 @@ async def check_status(request: Request, job_id: str):
 
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started.")
-    global prepared_logo_image # Make sure we can access the global logo
+    global prepared_logo_image
 
     while True:
         try:
@@ -180,45 +180,32 @@ async def image_processing_worker(worker_id: int):
                     post_process_mask=post_process_flag
                 )
                 
-                # --- Image Squaring and Watermarking START ---
                 img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
-                # 1. Square the image to TARGET_SIZE x TARGET_SIZE with padding
                 original_width, original_height = img_no_bg.size
                 ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
                 new_width = int(original_width * ratio)
                 new_height = int(original_height * ratio)
                 
                 img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-                # Create a new square canvas (transparent)
                 square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
-                
-                # Calculate position to paste the resized image (centered)
                 paste_x = (TARGET_SIZE - new_width) // 2
                 paste_y = (TARGET_SIZE - new_height) // 2
-                
-                square_canvas.paste(img_resized, (paste_x, paste_y), img_resized) # Use img_resized as mask for its own alpha
+                square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
 
-                # 2. Add logo to bottom-left corner
-                if prepared_logo_image:
+                if prepared_logo_image: # Only try to paste if logo was loaded
                     logo_w, logo_h = prepared_logo_image.size
-                    # Position: LOGO_MARGIN from left, LOGO_MARGIN from bottom
                     logo_pos_x = LOGO_MARGIN
                     logo_pos_y = TARGET_SIZE - logo_h - LOGO_MARGIN
-                    
-                    # Paste logo (using its alpha channel as a mask)
                     square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
-                else:
-                    logger.warning(f"Job {job_id}: Logo not available, skipping watermark.")
+                # else:
+                    # logger.info(f"Job {job_id}: Skipping watermark as logo is not available.")
+
 
                 final_image = square_canvas
-                # --- Image Squaring and Watermarking END ---
-
                 processed_filename = f"{job_id}.webp"
                 processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-                
-                final_image.save(processed_file_path, 'WEBP', quality=90) # Adjust quality as needed
+                final_image.save(processed_file_path, 'WEBP', quality=90)
 
                 results[job_id]["status"] = "done"
                 results[job_id]["processed_path"] = processed_file_path
@@ -243,54 +230,46 @@ async def image_processing_worker(worker_id: int):
 
 @app.on_event("startup")
 async def startup_event():
-    global prepared_logo_image # To store the loaded and resized logo
-    # Load and prepare the logo
-    if not os.path.exists(LOGO_PATH):
-        logger.error(f"Logo file not found at {LOGO_PATH}. Watermarking will be disabled.")
-        prepared_logo_image = None
-    else:
+    global prepared_logo_image
+    if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
-            
-            # Resize logo if it's wider than LOGO_MAX_WIDTH, maintaining aspect ratio
             if logo.width > LOGO_MAX_WIDTH:
                 l_ratio = LOGO_MAX_WIDTH / logo.width
                 l_new_width = LOGO_MAX_WIDTH
                 l_new_height = int(logo.height * l_ratio)
                 logo = logo.resize((l_new_width, l_new_height), Image.Resampling.LANCZOS)
-            
             prepared_logo_image = logo
-            logger.info(f"Logo loaded and prepared from {LOGO_PATH}. Dimensions: {prepared_logo_image.size}")
+            logger.info(f"Logo loaded and prepared from {LOGO_PATH}. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
         except Exception as e:
             logger.error(f"Failed to load or prepare logo from {LOGO_PATH}: {e}")
-            prepared_logo_image = None
+            prepared_logo_image = None # Ensure it's None on failure
+    else:
+        logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be skipped.")
+        prepared_logo_image = None
 
-    # Start worker tasks
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
     logger.info(f"{MAX_CONCURRENT_TASKS} worker(s) started.")
 
-# Serve static files
+# Serve static files for processed and original images (needed for API to serve links)
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
-@app.get("/", response_class=FileResponse)
-async def serve_index_html():
-    index_path = os.path.join(BASE_DIR, "index.html")
-    if not os.path.exists(index_path):
-        logger.warning(f"index.html not found at {index_path}. Serving basic message.")
-        return HTMLResponse("<html><body><h1>Image Processing Service</h1><p>index.html not found.</p></body></html>")
-    return FileResponse(index_path)
-
-@app.get("/upload-item", response_class=HTMLResponse)
-async def upload_item_page(request: Request, images: Optional[List[str]] = None):
-    if images is None: images = []
-    image_list_html = "<ul>" + "".join(f"<li><a href='{img_url}' target='_blank'>{img_url}</a></li>" for img_url in images) + "</ul>"
-    return f"""
-    <html><head><title>Upload Item</title></head><body><h1>Item Upload Page</h1>
-    <p>This is a placeholder page.</p><h2>Selected Images:</h2>
-    {image_list_html if images else "<p>No images selected.</p>"}
-    <p><a href="/">Back to Image Processing</a></p></body></html>"""
+# Basic root endpoint to indicate the server is running
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return """
+    <html>
+        <head>
+            <title>Image Processing</title>
+        </head>
+        <body>
+            <h1>Resale1 is in the House!</h1>
+            <p>Use the /submit endpoint to process images.</p>
+        </body>
+    </html>
+    """
 
 if __name__ == "__main__":
     import uvicorn
