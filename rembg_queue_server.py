@@ -1,39 +1,31 @@
 import asyncio
 import uuid
 import io
-import os # Make sure os is imported very early
+import os
 import aiofiles
 import logging
 import httpx
 import urllib.parse
 
 # --- CREATE DIRECTORIES AT THE VERY TOP ---
-# Define necessary paths first
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
-BASE_DIR_STATIC = "/workspace/rmvbg" # If BASE_DIR is needed for LOGO_PATH before FastAPI app
+BASE_DIR_STATIC = "/workspace/rmvbg"
 
-# Configure logging early as well so directory creation attempts are logged
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__) # Get logger after basicConfig
+logger = logging.getLogger(__name__)
 
 try:
     os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
     os.makedirs(PROCESSED_DIR_STATIC, exist_ok=True)
-    # Also create BASE_DIR if it's used for the logo and might not exist
     os.makedirs(BASE_DIR_STATIC, exist_ok=True)
     logger.info(f"Ensured uploads directory exists: {UPLOADS_DIR_STATIC}")
     logger.info(f"Ensured processed directory exists: {PROCESSED_DIR_STATIC}")
     logger.info(f"Ensured base directory exists: {BASE_DIR_STATIC}")
 except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
-    # For such a critical step, you might want the application to exit if directories can't be made.
-    # import sys
-    # sys.exit(f"CRITICAL: Could not create essential directories: {e}")
-    # For now, we'll let it continue and see if FastAPI/Starlette complains later.
+    # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-# Now import FastAPI and other components that might depend on these paths indirectly
-# or for app.mount
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,27 +33,29 @@ from pydantic import BaseModel, HttpUrl
 from rembg import remove, new_session
 from PIL import Image
 
-app = FastAPI() # FastAPI app instance created AFTER directories are handled
+app = FastAPI()
 
-# --- Configuration Constants (can use the _STATIC versions or redefine) ---
+# --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 13
 TARGET_SIZE = 1024
-LOGO_MAX_WIDTH = 150
-LOGO_MARGIN = 20
 HTTP_CLIENT_TIMEOUT = 30.0
 
-# --- Directory and File Paths (using the _STATIC versions or re-assigning) ---
+# --- Logo Specific Configuration ---
+ENABLE_LOGO_WATERMARK = True  # <<< --- ADD THIS TOGGLE ---
+LOGO_MAX_WIDTH = 150
+LOGO_MARGIN = 20
+LOGO_FILENAME = "logo.png"
+
+# --- Directory and File Paths ---
 BASE_DIR = BASE_DIR_STATIC
 UPLOADS_DIR = UPLOADS_DIR_STATIC
-PROCESSED_DIR = PROCESSED_DIR_STATIC # Crucial: use the one that was created
-LOGO_FILENAME = "logo.png"
-LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME)
-
+PROCESSED_DIR = PROCESSED_DIR_STATIC
+LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME) if ENABLE_LOGO_WATERMARK else "" # LOGO_PATH only relevant if enabled
 
 # --- Global State ---
-prepared_logo_image = None
+prepared_logo_image = None # Will be None if watermarking is disabled or logo fails to load
 queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results = {}
 EXPECTED_API_KEY = "secretApiKey"
@@ -99,8 +93,11 @@ async def submit_image_for_processing(
 ):
     if body.key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    if os.path.exists(LOGO_PATH) and not prepared_logo_image:
-        logger.error("Logo file exists at startup but was not loaded. Watermarking may fail or be skipped. Check startup logs.")
+    
+    # Check logo status only if watermarking is enabled and logo file is expected
+    if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
+        logger.error("Logo watermarking is enabled and logo file exists, but was not loaded at startup. Watermarking may fail or be skipped. Check startup logs.")
+    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     try:
@@ -143,7 +140,7 @@ async def check_status(request: Request, job_id: str):
 # --- Background Worker ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
-    global prepared_logo_image
+    global prepared_logo_image # Access pre-loaded logo
 
     while True:
         job_id, image_url_str, model_name, post_process_flag = await queue.get()
@@ -219,12 +216,17 @@ async def image_processing_worker(worker_id: int):
             square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
             paste_x, paste_y = (TARGET_SIZE - new_width) // 2, (TARGET_SIZE - new_height) // 2
             square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
-            if prepared_logo_image:
+
+            # --- Apply watermark ONLY if enabled AND logo is loaded ---
+            if ENABLE_LOGO_WATERMARK and prepared_logo_image:
                 logo_w, logo_h = prepared_logo_image.size
                 logo_pos_x, logo_pos_y = LOGO_MARGIN, TARGET_SIZE - logo_h - LOGO_MARGIN
                 square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
-            else:
-                logger.info(f"Job {job_id}: Skipping watermark as logo is not available/loaded.")
+            elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
+                logger.warning(f"Job {job_id}: Logo watermarking enabled, but logo image was not prepared/loaded. Skipping watermark.")
+            else: # Watermarking is disabled
+                logger.info(f"Job {job_id}: Logo watermarking is disabled. Skipping watermark.")
+            
             final_image = square_canvas
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
@@ -253,8 +255,6 @@ async def startup_event():
     global prepared_logo_image
     logger.info("Application startup event running...")
 
-    # Directories should have been created at module level.
-    # This is just an additional check or for clarity if someone looks here.
     if not os.path.isdir(UPLOADS_DIR):
         logger.warning(f"Uploads directory {UPLOADS_DIR} was not found at startup event, trying to create again.")
         os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -262,38 +262,51 @@ async def startup_event():
         logger.warning(f"Processed directory {PROCESSED_DIR} was not found at startup event, trying to create again.")
         os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-
-    if os.path.exists(LOGO_PATH):
-        try:
-            logo = Image.open(LOGO_PATH).convert("RGBA")
-            if logo.width > LOGO_MAX_WIDTH:
-                l_ratio = LOGO_MAX_WIDTH / logo.width
-                l_new_width, l_new_height = LOGO_MAX_WIDTH, int(logo.height * l_ratio)
-                logo = logo.resize((l_new_width, l_new_height), Image.Resampling.LANCZOS)
-            prepared_logo_image = logo
-            logger.info(f"Logo loaded. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
-        except Exception as e:
-            logger.error(f"Failed to load logo from {LOGO_PATH}: {e}", exc_info=True); prepared_logo_image = None
+    if ENABLE_LOGO_WATERMARK: # Only attempt to load logo if enabled
+        logger.info(f"Logo watermarking is ENABLED. Attempting to load logo from: {LOGO_PATH}")
+        if os.path.exists(LOGO_PATH):
+            try:
+                logo = Image.open(LOGO_PATH).convert("RGBA")
+                if logo.width > LOGO_MAX_WIDTH:
+                    l_ratio = LOGO_MAX_WIDTH / logo.width
+                    l_new_width, l_new_height = LOGO_MAX_WIDTH, int(logo.height * l_ratio)
+                    logo = logo.resize((l_new_width, l_new_height), Image.Resampling.LANCZOS)
+                prepared_logo_image = logo
+                logger.info(f"Logo loaded. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
+            except Exception as e:
+                logger.error(f"Failed to load logo from {LOGO_PATH}: {e}", exc_info=True)
+                prepared_logo_image = None # Ensure it's None on failure
+        else:
+            logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be applied if logo appears later, but it's not present at startup.")
+            prepared_logo_image = None
     else:
-        logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be skipped."); prepared_logo_image = None
+        logger.info("Logo watermarking is DISABLED by configuration.")
+        prepared_logo_image = None # Explicitly set to None if disabled
+
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
     logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}.")
 
 # --- Static File Serving ---
-# These must come AFTER app = FastAPI() is defined AND directories exist
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
 # --- Root Endpoint ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
+    logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
+    if ENABLE_LOGO_WATERMARK and prepared_logo_image:
+        logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
+    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
+        logo_status += " (Enabled but not loaded/found)"
+
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Image Processing API</title><style>body {{ font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }}
     .container {{ background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-    h1 {{ color: #0056b3; }}</style></head><body><div class="container"><h1>Resale1... In The House!</h1>
+    h1 {{ color: #0056b3; }} li {{ margin-bottom: 5px; }}</style></head><body><div class="container"><h1>Resale1... In The House!</h1>
     <p>This service provides background removal and image processing capabilities.</p><p>Current settings:<ul>
-    <li>Max Concurrent Workers: {MAX_CONCURRENT_TASKS}</li><li>Max Queue Size: {MAX_QUEUE_SIZE}</li></ul></p></div></body></html>"""
+    <li>Max Concurrent Workers: {MAX_CONCURRENT_TASKS}</li><li>Max Queue Size: {MAX_QUEUE_SIZE}</li>
+    <li>Logo Watermarking: {logo_status}</li></ul></p></div></body></html>"""
 
 # --- Main Execution ---
 if __name__ == "__main__":
