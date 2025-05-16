@@ -52,8 +52,7 @@ MIME_TO_EXT = {
     'image/gif': '.gif',
     'image/webp': '.webp',
     'image/bmp': '.bmp',
-    'image/tiff': '.tiff',
-    'image/webp': '.webp',
+    'image/tiff': '.tiff'
 }
 
 # --- Pydantic Models ---
