@@ -1,4 +1,14 @@
-RemBG implementation that provides an HTTP server with an API endpoint.
+```
+ _____                   _         __  
+|  __ \                 | |        \ \ 
+| |__) |___  ___  __ _  | | ___     | |
+|  _  // _ \/ __|/ _` | | |/ _ \    | |
+| | \ \  __/\__ \ (_| | | |  __/    | |
+|_|  \_\___||___/\__,_| |_|\___|    /_/
+
+```
+
+#RemBG implementation that provides an HTTP server with an API endpoint.
 
 This setup includes settings for:
 
