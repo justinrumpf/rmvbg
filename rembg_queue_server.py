@@ -150,7 +150,7 @@ async def check_status(request: Request, job_id: str):
     
     return JSONResponse(content=response_data)
 
-# --- Background Worker ---
+
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image # Access pre-loaded logo
@@ -173,22 +173,65 @@ async def image_processing_worker(worker_id: int):
                 img_response = await client.get(image_url_str)
                 img_response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
             
+            # --- START OF CONTENT-TYPE HANDLING FIX ---
             image_content = await img_response.aread()
-            content_type = img_response.headers.get("content-type", "").lower()
+            original_content_type_header = img_response.headers.get("content-type", "unknown") # Get original for logging
+            content_type = original_content_type_header.lower() # Work with lowercase
+            
+            logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_url_str}")
 
-            if not content_type.startswith("image/"):
-                raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
+            # Attempt to infer from URL if original Content-Type is problematic (octet-stream or not image/*)
+            if content_type == "application/octet-stream" or not content_type.startswith("image/"):
+                if content_type == "application/octet-stream":
+                    logger.warning(f"Job {job_id}: Original Content-Type is 'application/octet-stream'. Attempting to infer from URL file extension.")
+                else: # It's not "image/" and also not "application/octet-stream", but some other type
+                    logger.warning(f"Job {job_id}: Original Content-Type is '{content_type}', which is not 'image/*'. Attempting to infer from URL file extension as a fallback.")
 
-            # 2. Determine Extension & Save Original Image to UPLOADS_DIR
-            extension = MIME_TO_EXT.get(content_type)
-            if not extension:
-                parsed_url_path = urllib.parse.urlparse(image_url_str).path
-                _, ext_from_url = os.path.splitext(parsed_url_path)
-                if ext_from_url and ext_from_url.lower() in MIME_TO_EXT.values():
-                    extension = ext_from_url.lower()
+                file_extension_from_url = os.path.splitext(urllib.parse.urlparse(image_url_str).path)[1].lower()
+                logger.info(f"Job {job_id}: Parsed file extension from URL: '{file_extension_from_url}'")
+
+                potential_new_content_type = None
+                if file_extension_from_url == ".webp":
+                    potential_new_content_type = "image/webp"
+                elif file_extension_from_url == ".png":
+                    potential_new_content_type = "image/png"
+                elif file_extension_from_url in [".jpg", ".jpeg"]:
+                    potential_new_content_type = "image/jpeg"
+                elif file_extension_from_url == ".gif":
+                    potential_new_content_type = "image/gif"
+                elif file_extension_from_url == ".bmp":
+                    potential_new_content_type = "image/bmp"
+                elif file_extension_from_url in [".tif", ".tiff"]:
+                    potential_new_content_type = "image/tiff"
+                # Add other common image extensions if needed
+
+                if potential_new_content_type:
+                    logger.info(f"Job {job_id}: Overriding Content-Type from '{original_content_type_header}' to '{potential_new_content_type}' based on URL extension '{file_extension_from_url}'.")
+                    content_type = potential_new_content_type # Update content_type
                 else:
-                    extension = ".png" # Default if cannot determine
-                    logger.warning(f"Job {job_id}: Could not determine extension for {image_url_str} (Content-Type: {content_type}). Defaulting to '{extension}'.")
+                    logger.warning(f"Job {job_id}: URL file extension '{file_extension_from_url}' is not in the recognized list for Content-Type override. Original Content-Type '{original_content_type_header}' will be used for the final check.")
+            
+            # Final validation after potential override
+            if not content_type.startswith("image/"): # This was previously your line 180 causing the error
+                logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
+                raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
+            
+            logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
+            # --- END OF CONTENT-TYPE HANDLING FIX ---
+
+            # 2. Determine Extension for saving & Save Original Image to UPLOADS_DIR
+            extension = MIME_TO_EXT.get(content_type) # Use the (potentially updated) content_type
+            if not extension:
+                # Fallback to URL extension if MIME_TO_EXT didn't provide one from the determined content_type
+                parsed_url_path_for_save_ext = urllib.parse.urlparse(image_url_str).path
+                _, ext_from_url_for_save = os.path.splitext(parsed_url_path_for_save_ext)
+                ext_from_url_for_save = ext_from_url_for_save.lower()
+                if ext_from_url_for_save and ext_from_url_for_save in MIME_TO_EXT.values():
+                    extension = ext_from_url_for_save
+                    logger.info(f"Job {job_id}: Using URL extension '{extension}' for saving original file as Content-Type '{content_type}' was not directly in MIME_TO_EXT map.")
+                else:
+                    extension = ".bin" # Default if cannot determine a known image extension
+                    logger.warning(f"Job {job_id}: Could not determine specific file extension for saving original from Content-Type '{content_type}' or URL. Defaulting to '{extension}'.")
             
             original_filename = f"{job_id}_original{extension}"
             original_file_path = os.path.join(UPLOADS_DIR, original_filename)
@@ -201,12 +244,10 @@ async def image_processing_worker(worker_id: int):
             # 3. Process Image (rembg, square, watermark)
             results[job_id]["status"] = "processing"
             
-            # Use a blocking open here as rembg/PIL will be blocking anyway for this part
             with open(original_file_path, 'rb') as i:
                 input_bytes = i.read()
             
-            # --- rembg: Background Removal ---
-            session = new_session(model_name) # Create session per model or reuse if thread-safe and efficient
+            session = new_session(model_name)
             output_bytes = remove(
                 input_bytes,
                 session=session,
@@ -215,9 +256,8 @@ async def image_processing_worker(worker_id: int):
             
             img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
-            # --- Pillow: Squaring ---
             original_width, original_height = img_no_bg.size
-            if original_width == 0 or original_height == 0: # Handle invalid image dimensions
+            if original_width == 0 or original_height == 0:
                 raise ValueError("Image dimensions are zero after background removal.")
 
             ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
@@ -225,12 +265,11 @@ async def image_processing_worker(worker_id: int):
             new_height = int(original_height * ratio)
             
             img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0)) # Transparent canvas
+            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
             paste_x = (TARGET_SIZE - new_width) // 2
             paste_y = (TARGET_SIZE - new_height) // 2
-            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized) # Paste using its own alpha
+            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
 
-            # --- Pillow: Watermarking ---
             if prepared_logo_image:
                 logo_w, logo_h = prepared_logo_image.size
                 logo_pos_x = LOGO_MARGIN
@@ -240,11 +279,10 @@ async def image_processing_worker(worker_id: int):
                 logger.info(f"Job {job_id}: Skipping watermark as logo is not available/loaded.")
 
             final_image = square_canvas
-            processed_filename = f"{job_id}.webp" # Save final output as WEBP
+            processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
             
-            # Save the final image
-            final_image.save(processed_file_path, 'WEBP', quality=90) # Adjust quality if needed
+            final_image.save(processed_file_path, 'WEBP', quality=90)
 
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
@@ -254,27 +292,21 @@ async def image_processing_worker(worker_id: int):
             logger.error(f"Worker {worker_id} HTTP error {e.response.status_code} for job {job_id} from {image_url_str}: {e.response.text}", exc_info=True)
             results[job_id]["status"] = "error"
             results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code} from {image_url_str}."
-        except httpx.RequestError as e: # Covers DNS, connection, timeout errors
+        except httpx.RequestError as e:
             logger.error(f"Worker {worker_id} Network error downloading for job {job_id} from {image_url_str}: {e}", exc_info=True)
             results[job_id]["status"] = "error"
             results[job_id]["error_message"] = f"Network error downloading image from {image_url_str}: {type(e).__name__}."
-        except (ValueError, IOError, OSError) as e: # Covers invalid image data, file save errors etc.
+        except (ValueError, IOError, OSError) as e:
             logger.error(f"Worker {worker_id} data/file error for job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"
             results[job_id]["error_message"] = f"Data or file error: {str(e)}"
-        except Exception as e: # Catch-all for unexpected processing errors
+        except Exception as e:
             logger.error(f"Worker {worker_id} critical error processing job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"
             results[job_id]["error_message"] = f"Unexpected processing error: {str(e)}"
         finally:
-            queue.task_done() # Crucial: signal that this queue item is processed
-            # Optional: Cleanup original downloaded file on error
-            # if results[job_id]["status"] == "error" and original_file_path and os.path.exists(original_file_path):
-            #     try:
-            #         os.remove(original_file_path)
-            #         logger.info(f"Cleaned up original file {original_file_path} for failed job {job_id}")
-            #     except OSError as e_clean:
-            #         logger.error(f"Error cleaning up original file {original_file_path} for job {job_id}: {e_clean}")
+            queue.task_done()
+
 
 # --- Application Startup Logic ---
 @app.on_event("startup")
