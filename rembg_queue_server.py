@@ -35,6 +35,20 @@ from PIL import Image
 
 app = FastAPI()
 
+origins = [
+    "null",  # Allow requests from file:/// origins (when you open HTML locally)
+    "http://localhost", # If you ever serve your HTML from a local dev server
+    "http://127.0.0.1"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # List of origins that are allowed to make cross-origin requests
+    allow_credentials=True, # Allow cookies to be included in requests (not strictly needed for this app)
+    allow_methods=["*"],    # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],    # Allow all headers
+)
+
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
