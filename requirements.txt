@@ -13,3 +13,4 @@ aiofiles
 Pillow    
 requests
 httpx
+python-multipart
