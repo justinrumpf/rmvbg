@@ -26,7 +26,7 @@ except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
     # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
@@ -101,7 +101,7 @@ async def submit_image_for_processing(
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     try:
-        queue.put_nowait((job_id, str(body.image), body.model, body.post_process))
+        queue.put_nowait((job_id, str(body.image), body.model, body.post_process, "url"))
     except asyncio.QueueFull:
         logger.warning(f"Queue is full (max size: {MAX_QUEUE_SIZE}). Rejecting request for image {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server is temporarily overloaded (queue full). Please try again later. Max queue size: {MAX_QUEUE_SIZE}")
@@ -115,6 +115,51 @@ async def submit_image_for_processing(
     return {
         "status": "processing", "job_id": job_id, "image_links": [processed_image_placeholder_url],
         "eta": eta_seconds, "status_check_url": status_check_url
+    }
+
+@app.post("/bulk")
+async def submit_bulk_image_for_processing(
+    request: Request,
+    image: UploadFile = File(...),
+    key: str = Form(...),
+    model: str = Form("u2net"),
+    post_process: bool = Form(False)
+):
+    if key != EXPECTED_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
+        logger.error("Logo watermarking is enabled and logo file exists, but was not loaded at startup. Watermarking may fail or be skipped. Check startup logs.")
+
+    job_id = str(uuid.uuid4())
+    public_url_base = get_proxy_url(request)
+
+    try:
+        await queue.put((job_id, image, model, post_process, "file"))  # Store the UploadFile object
+
+    except asyncio.QueueFull:
+        logger.warning(f"Queue is full (max size: {MAX_QUEUE_SIZE}). Rejecting request for image {image.filename}.")
+        raise HTTPException(status_code=503, detail=f"Server is temporarily overloaded (queue full). Please try again later. Max queue size: {MAX_QUEUE_SIZE}")
+
+    status_check_url = f"{public_url_base}/status/{job_id}"
+    results[job_id] = {
+        "status": "queued",
+        "input_image_url": image.filename,  # Store the filename, not a URL
+        "original_local_path": None,
+        "processed_path": None,
+        "error_message": None,
+        "status_check_url": status_check_url
+    }
+
+    processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
+    eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
+
+    return {
+        "status": "processing",
+        "job_id": job_id,
+        "image_links": [processed_image_placeholder_url],
+        "eta": eta_seconds,
+        "status_check_url": status_check_url
     }
 
 @app.get("/status/{job_id}")
@@ -140,68 +185,121 @@ async def check_status(request: Request, job_id: str):
 # --- Background Worker ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
-    global prepared_logo_image # Access pre-loaded logo
+    global prepared_logo_image  # Access pre-loaded logo
 
     while True:
-        job_id, image_url_str, model_name, post_process_flag = await queue.get()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for URL: {image_url_str}")
+        job_id, image_data, model_name, post_process_flag, source_type = await queue.get()
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {source_type}")
         if job_id not in results:
             logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
             queue.task_done()
             continue
+
         original_file_path = None
         results[job_id]["status"] = "downloading"
-        try:
-            async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
-                img_response = await client.get(image_url_str)
-                img_response.raise_for_status()
-            
-            image_content = await img_response.aread()
-            original_content_type_header = img_response.headers.get("content-type", "unknown")
-            content_type = original_content_type_header.lower()
-            logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_url_str}")
-            if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                if content_type == "application/octet-stream":
-                    logger.warning(f"Job {job_id}: Original Content-Type is 'application/octet-stream'. Attempting to infer from URL file extension.")
-                else:
-                    logger.warning(f"Job {job_id}: Original Content-Type is '{content_type}', which is not 'image/*'. Attempting to infer from URL file extension as a fallback.")
-                file_extension_from_url = os.path.splitext(urllib.parse.urlparse(image_url_str).path)[1].lower()
-                logger.info(f"Job {job_id}: Parsed file extension from URL: '{file_extension_from_url}'")
-                potential_new_content_type = None
-                if file_extension_from_url == ".webp": potential_new_content_type = "image/webp"
-                elif file_extension_from_url == ".png": potential_new_content_type = "image/png"
-                elif file_extension_from_url in [".jpg", ".jpeg"]: potential_new_content_type = "image/jpeg"
-                elif file_extension_from_url == ".gif": potential_new_content_type = "image/gif"
-                elif file_extension_from_url == ".bmp": potential_new_content_type = "image/bmp"
-                elif file_extension_from_url in [".tif", ".tiff"]: potential_new_content_type = "image/tiff"
-                if potential_new_content_type:
-                    logger.info(f"Job {job_id}: Overriding Content-Type from '{original_content_type_header}' to '{potential_new_content_type}' based on URL extension '{file_extension_from_url}'.")
-                    content_type = potential_new_content_type
-                else:
-                    logger.warning(f"Job {job_id}: URL file extension '{file_extension_from_url}' is not in the recognized list for Content-Type override. Original Content-Type '{original_content_type_header}' will be used for the final check.")
-            if not content_type.startswith("image/"):
-                logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
-                raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
-            logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
 
-            extension = MIME_TO_EXT.get(content_type)
-            if not extension:
-                parsed_url_path_for_save_ext = urllib.parse.urlparse(image_url_str).path
-                _, ext_from_url_for_save = os.path.splitext(parsed_url_path_for_save_ext)
-                ext_from_url_for_save = ext_from_url_for_save.lower()
-                if ext_from_url_for_save and ext_from_url_for_save in MIME_TO_EXT.values():
-                    extension = ext_from_url_for_save
-                    logger.info(f"Job {job_id}: Using URL extension '{extension}' for saving original file as Content-Type '{content_type}' was not directly in MIME_TO_EXT map.")
-                else:
-                    extension = ".bin"
-                    logger.warning(f"Job {job_id}: Could not determine specific file extension for saving original from Content-Type '{content_type}' or URL. Defaulting to '{extension}'.")
+        try:
+            # Handle URL source
+            if source_type == "url":
+                image_url_str = str(image_data)
+                try:
+                    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+                        img_response = await client.get(image_url_str)
+                        img_response.raise_for_status()
+
+                    image_content = await img_response.aread()
+                    original_content_type_header = img_response.headers.get("content-type", "unknown")
+                    content_type = original_content_type_header.lower()
+                    logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_url_str}")
+                    if content_type == "application/octet-stream" or not content_type.startswith("image/"):
+                        if content_type == "application/octet-stream":
+                            logger.warning(f"Job {job_id}: Original Content-Type is 'application/octet-stream'. Attempting to infer from URL file extension.")
+                        else:
+                            logger.warning(f"Job {job_id}: Original Content-Type is '{content_type}', which is not 'image/*'. Attempting to infer from URL file extension as a fallback.")
+                        file_extension_from_url = os.path.splitext(urllib.parse.urlparse(image_url_str).path)[1].lower()
+                        logger.info(f"Job {job_id}: Parsed file extension from URL: '{file_extension_from_url}'")
+                        potential_new_content_type = None
+                        if file_extension_from_url == ".webp": potential_new_content_type = "image/webp"
+                        elif file_extension_from_url == ".png": potential_new_content_type = "image/png"
+                        elif file_extension_from_url in [".jpg", ".jpeg"]: potential_new_content_type = "image/jpeg"
+                        elif file_extension_from_url == ".gif": potential_new_content_type = "image/gif"
+                        elif file_extension_from_url == ".bmp": potential_new_content_type = "image/bmp"
+                        elif file_extension_from_url in [".tif", ".tiff"]: potential_new_content_type = "image/tiff"
+                        if potential_new_content_type:
+                            logger.info(f"Job {job_id}: Overriding Content-Type from '{original_content_type_header}' to '{potential_new_content_type}' based on URL extension '{file_extension_from_url}'.")
+                            content_type = potential_new_content_type
+                        else:
+                            logger.warning(f"Job {job_id}: URL file extension '{file_extension_from_url}' is not in the recognized list for Content-Type override. Original Content-Type '{original_content_type_header}' will be used for the final check.")
+                    if not content_type.startswith("image/"):
+                        logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
+                        raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
+                    logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
+
+                    extension = MIME_TO_EXT.get(content_type)
+                    if not extension:
+                        parsed_url_path_for_save_ext = urllib.parse.urlparse(image_url_str).path
+                        _, ext_from_url_for_save = os.path.splitext(parsed_url_path_for_save_ext)
+                        ext_from_url_for_save = ext_from_url_for_save.lower()
+                        if ext_from_url_for_save and ext_from_url_for_save in MIME_TO_EXT.values():
+                            extension = ext_from_url_for_save
+                            logger.info(f"Job {job_id}: Using URL extension '{extension}' for saving original file as Content-Type '{content_type}' was not directly in MIME_TO_EXT map.")
+                        else:
+                            extension = ".bin"
+                            logger.warning(f"Job {job_id}: Could not determine specific file extension for saving original from Content-Type '{content_type}' or URL. Defaulting to '{extension}'.")
+                    original_filename = f"{job_id}_original{extension}"
+                    
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"Worker {worker_id} HTTP error {e.response.status_code} for job {job_id} from {image_url_str}: {e.response.text}", exc_info=True)
+                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code} from {image_url_str}."
+                    queue.task_done()
+                    continue
+                except httpx.RequestError as e:
+                    logger.error(f"Worker {worker_id} Network error downloading for job {job_id} from {image_url_str}: {e}", exc_info=True)
+                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading image from {image_url_str}: {type(e).__name__}."
+                    queue.task_done()
+                    continue
+            
+            # Handle file upload source
+            elif source_type == "file":
+                image = image_data  # This is now the UploadFile object
+                try:
+                    image_content = await image.read()
+                    content_type = image.content_type
+                    original_filename = image.filename  # Use the original filename
+
+                    if not content_type.startswith("image/"):
+                        logger.error(f"Job {job_id}: Invalid content type '{content_type}' from uploaded file '{original_filename}'. Not an image.")
+                        raise ValueError(f"Invalid content type '{content_type}' from uploaded file. Not an image.")
+
+                    extension = MIME_TO_EXT.get(content_type)
+                    if not extension:
+                        extension = os.path.splitext(original_filename)[1].lower() #Try and get from the original file name
+                        if not extension or extension not in MIME_TO_EXT.values():
+                            extension = ".bin"  # Last resort
+                            logger.warning(f"Job {job_id}: Could not determine specific file extension for uploaded file from Content-Type '{content_type}' or filename. Defaulting to '{extension}'.")
+
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} Error reading uploaded file for job {job_id}: {e}", exc_info=True)
+                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Error reading uploaded file: {str(e)}"
+                    queue.task_done()
+                    continue  # Skip to next job
+            
+            else:
+                logger.error(f"Worker {worker_id}: Invalid source type '{source_type}' for job {job_id}. This is an internal error.")
+                results[job_id]["status"] = "error"; results[job_id]["error_message"] = "Internal error: invalid source type."
+                queue.task_done()
+                continue # Skip to next job
+
+            # Save original image to disk
             original_filename = f"{job_id}_original{extension}"
             original_file_path = os.path.join(UPLOADS_DIR, original_filename)
             results[job_id]["original_local_path"] = original_file_path
             async with aiofiles.open(original_file_path, 'wb') as out_file:
-                await out_file.write(image_content)
+                await out_file.write(image_content) # image_content is defined from both URL or local file load
             logger.info(f"Worker {worker_id} saved original image for job {job_id} to {original_file_path}")
             results[job_id]["status"] = "processing"
+
+            #Remove Background
             with open(original_file_path, 'rb') as i:
                 input_bytes = i.read()
             session = new_session(model_name)
@@ -226,7 +324,7 @@ async def image_processing_worker(worker_id: int):
                 logger.warning(f"Job {job_id}: Logo watermarking enabled, but logo image was not prepared/loaded. Skipping watermark.")
             else: # Watermarking is disabled
                 logger.info(f"Job {job_id}: Logo watermarking is disabled. Skipping watermark.")
-            
+
             final_image = square_canvas
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
@@ -234,12 +332,7 @@ async def image_processing_worker(worker_id: int):
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
             logger.info(f"Worker {worker_id} finished job {job_id}. Processed image: {processed_file_path}")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Worker {worker_id} HTTP error {e.response.status_code} for job {job_id} from {image_url_str}: {e.response.text}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code} from {image_url_str}."
-        except httpx.RequestError as e:
-            logger.error(f"Worker {worker_id} Network error downloading for job {job_id} from {image_url_str}: {e}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading image from {image_url_str}: {type(e).__name__}."
+
         except (ValueError, IOError, OSError) as e:
             logger.error(f"Worker {worker_id} data/file error for job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Data or file error: {str(e)}"
