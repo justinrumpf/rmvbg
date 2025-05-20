@@ -59,7 +59,7 @@ ESTIMATED_TIME_PER_JOB = 13 # This might increase slightly with the extra PIL st
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
-ENABLE_LOGO_WATERMARK = True # Or False to disable
+ENABLE_LOGO_WATERMARK = False # Or False to disable
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
