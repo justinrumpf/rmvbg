@@ -26,7 +26,7 @@ except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
     # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File # Added Form, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
@@ -42,8 +42,7 @@ ESTIMATED_TIME_PER_JOB = 13
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
-# --- Logo Specific Configuration ---
-ENABLE_LOGO_WATERMARK = False  # <<< --- ADD THIS TOGGLE ---
+ENABLE_LOGO_WATERMARK = True
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
@@ -52,10 +51,10 @@ LOGO_FILENAME = "logo.png"
 BASE_DIR = BASE_DIR_STATIC
 UPLOADS_DIR = UPLOADS_DIR_STATIC
 PROCESSED_DIR = PROCESSED_DIR_STATIC
-LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME) if ENABLE_LOGO_WATERMARK else "" # LOGO_PATH only relevant if enabled
+LOGO_PATH = os.path.join(BASE_DIR, LOGO_FILENAME) if ENABLE_LOGO_WATERMARK else ""
 
 # --- Global State ---
-prepared_logo_image = None # Will be None if watermarking is disabled or logo fails to load
+prepared_logo_image = None
 queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results = {}
 EXPECTED_API_KEY = "secretApiKey"
@@ -70,7 +69,7 @@ MIME_TO_EXT = {
 }
 
 # --- Pydantic Models ---
-class SubmitRequestBody(BaseModel):
+class SubmitJsonBody(BaseModel): # Renamed for clarity
     image: HttpUrl
     key: str
     model: str = "u2net"
@@ -86,25 +85,28 @@ def get_proxy_url(request: Request):
     return f"{scheme}://{host}"
 
 # --- API Endpoints ---
+
+# Endpoint 1: Submit with JSON body (image URL)
 @app.post("/submit")
-async def submit_image_for_processing(
+async def submit_json_image_for_processing( # Renamed for clarity
     request: Request,
-    body: SubmitRequestBody
+    body: SubmitJsonBody
 ):
     if body.key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    # Check logo status only if watermarking is enabled and logo file is expected
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
-        logger.error("Logo watermarking is enabled and logo file exists, but was not loaded at startup. Watermarking may fail or be skipped. Check startup logs.")
+        logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
+    
     try:
-        queue.put_nowait((job_id, str(body.image), body.model, body.post_process, "url"))
+        # For JSON/URL submissions, queue the URL directly
+        queue.put_nowait((job_id, str(body.image), body.model, body.post_process))
     except asyncio.QueueFull:
-        logger.warning(f"Queue is full (max size: {MAX_QUEUE_SIZE}). Rejecting request for image {body.image}.")
-        raise HTTPException(status_code=503, detail=f"Server is temporarily overloaded (queue full). Please try again later. Max queue size: {MAX_QUEUE_SIZE}")
+        logger.warning(f"Queue is full. Rejecting JSON request for image {body.image}.")
+        raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
+    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
         "status": "queued", "input_image_url": str(body.image), "original_local_path": None,
@@ -117,50 +119,75 @@ async def submit_image_for_processing(
         "eta": eta_seconds, "status_check_url": status_check_url
     }
 
-@app.post("/bulk")
-async def submit_bulk_image_for_processing(
+# Endpoint 2: Submit with Form Data (file upload)
+@app.post("/submit_form") # Kept distinct path
+async def submit_form_image_for_processing( # Renamed for clarity
     request: Request,
-    image: UploadFile = File(...),
+    image_file: UploadFile = File(...),
     key: str = Form(...),
     model: str = Form("u2net"),
     post_process: bool = Form(False)
 ):
     if key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
-        logger.error("Logo watermarking is enabled and logo file exists, but was not loaded at startup. Watermarking may fail or be skipped. Check startup logs.")
+        logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
+    if not image_file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
 
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
+    
+    original_filename_from_upload = image_file.filename
+    content_type_from_upload = image_file.content_type.lower()
+    
+    extension = MIME_TO_EXT.get(content_type_from_upload)
+    if not extension:
+        _, ext_from_filename = os.path.splitext(original_filename_from_upload)
+        ext_from_filename_lower = ext_from_filename.lower()
+        if ext_from_filename_lower in MIME_TO_EXT.values():
+            extension = ext_from_filename_lower
+        else:
+            extension = ".png"
+            logger.warning(f"Job {job_id} (form): Could not determine ext for {original_filename_from_upload} (Content-Type: {content_type_from_upload}). Defaulting to '{extension}'.")
+
+    saved_original_filename = f"{job_id}_original{extension}"
+    original_file_path = os.path.join(UPLOADS_DIR, saved_original_filename)
 
     try:
-        await queue.put((job_id, image, model, post_process, "file"))  # Store the UploadFile object
+        async with aiofiles.open(original_file_path, 'wb') as out_file:
+            file_content = await image_file.read()
+            await out_file.write(file_content)
+        logger.info(f"📝 (Form Upload) Original image saved: {original_file_path} for job {job_id}")
+    except Exception as e:
+        logger.error(f"Error saving uploaded file {saved_original_filename} for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+    finally:
+        await image_file.close()
 
+    file_uri_for_queue = f"file://{original_file_path}"
+    try:
+        queue.put_nowait((job_id, file_uri_for_queue, model, post_process))
     except asyncio.QueueFull:
-        logger.warning(f"Queue is full (max size: {MAX_QUEUE_SIZE}). Rejecting request for image {image.filename}.")
-        raise HTTPException(status_code=503, detail=f"Server is temporarily overloaded (queue full). Please try again later. Max queue size: {MAX_QUEUE_SIZE}")
-
+        logger.warning(f"Queue is full. Rejecting form request for image {original_filename_from_upload} (job {job_id}).")
+        if os.path.exists(original_file_path):
+            try: os.remove(original_file_path)
+            except OSError as e_clean: logger.error(f"Error cleaning {original_file_path} (queue full): {e_clean}")
+        raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
+    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
-        "status": "queued",
-        "input_image_url": image.filename,  # Store the filename, not a URL
-        "original_local_path": None,
-        "processed_path": None,
-        "error_message": None,
-        "status_check_url": status_check_url
+        "status": "queued", "input_image_url": f"(form_upload: {original_filename_from_upload})",
+        "original_local_path": original_file_path, "processed_path": None,
+        "error_message": None, "status_check_url": status_check_url
     }
-
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-
     return {
-        "status": "processing",
-        "job_id": job_id,
-        "image_links": [processed_image_placeholder_url],
-        "eta": eta_seconds,
-        "status_check_url": status_check_url
+        "status": "processing", "job_id": job_id, "image_links": [processed_image_placeholder_url],
+        "eta": eta_seconds, "status_check_url": status_check_url
     }
+
 
 @app.get("/status/{job_id}")
 async def check_status(request: Request, job_id: str):
@@ -185,129 +212,89 @@ async def check_status(request: Request, job_id: str):
 # --- Background Worker ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
-    global prepared_logo_image  # Access pre-loaded logo
+    global prepared_logo_image
 
     while True:
-        job_id, image_data, model_name, post_process_flag, source_type = await queue.get()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {source_type}")
+        job_id, image_source_str, model_name, post_process_flag = await queue.get()
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}")
         if job_id not in results:
             logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
             queue.task_done()
             continue
-
-        original_file_path = None
-        results[job_id]["status"] = "downloading"
+        
+        # This will hold the bytes of the image to be processed by rembg
+        input_bytes_for_rembg: bytes = None
+        # This will hold the path to the original file that rembg will process from (for logging/reference)
+        # For http, it's a temporary download. For file://, it's the path from the form upload.
+        path_of_source_for_rembg: str = None
 
         try:
-            # Handle URL source
-            if source_type == "url":
-                image_url_str = str(image_data)
-                try:
-                    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
-                        img_response = await client.get(image_url_str)
-                        img_response.raise_for_status()
+            if image_source_str.startswith("file://"):
+                results[job_id]["status"] = "processing_local_file"
+                local_path_from_uri = image_source_str[len("file://"):]
+                if not os.path.exists(local_path_from_uri):
+                    raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path_from_uri}")
+                
+                path_of_source_for_rembg = local_path_from_uri # This is already in UPLOADS_DIR
+                async with aiofiles.open(path_of_source_for_rembg, 'rb') as f:
+                    input_bytes_for_rembg = await f.read()
+                logger.info(f"Worker {worker_id}: Reading local file {path_of_source_for_rembg} for job {job_id}")
 
-                    image_content = await img_response.aread()
-                    original_content_type_header = img_response.headers.get("content-type", "unknown")
-                    content_type = original_content_type_header.lower()
-                    logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_url_str}")
-                    if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                        if content_type == "application/octet-stream":
-                            logger.warning(f"Job {job_id}: Original Content-Type is 'application/octet-stream'. Attempting to infer from URL file extension.")
-                        else:
-                            logger.warning(f"Job {job_id}: Original Content-Type is '{content_type}', which is not 'image/*'. Attempting to infer from URL file extension as a fallback.")
-                        file_extension_from_url = os.path.splitext(urllib.parse.urlparse(image_url_str).path)[1].lower()
-                        logger.info(f"Job {job_id}: Parsed file extension from URL: '{file_extension_from_url}'")
-                        potential_new_content_type = None
-                        if file_extension_from_url == ".webp": potential_new_content_type = "image/webp"
-                        elif file_extension_from_url == ".png": potential_new_content_type = "image/png"
-                        elif file_extension_from_url in [".jpg", ".jpeg"]: potential_new_content_type = "image/jpeg"
-                        elif file_extension_from_url == ".gif": potential_new_content_type = "image/gif"
-                        elif file_extension_from_url == ".bmp": potential_new_content_type = "image/bmp"
-                        elif file_extension_from_url in [".tif", ".tiff"]: potential_new_content_type = "image/tiff"
-                        if potential_new_content_type:
-                            logger.info(f"Job {job_id}: Overriding Content-Type from '{original_content_type_header}' to '{potential_new_content_type}' based on URL extension '{file_extension_from_url}'.")
-                            content_type = potential_new_content_type
-                        else:
-                            logger.warning(f"Job {job_id}: URL file extension '{file_extension_from_url}' is not in the recognized list for Content-Type override. Original Content-Type '{original_content_type_header}' will be used for the final check.")
-                    if not content_type.startswith("image/"):
-                        logger.error(f"Job {job_id}: FINAL Content-Type check FAILED. Content-Type is '{content_type}'. URL: {image_url_str}")
-                        raise ValueError(f"Invalid content type '{content_type}' from URL. Not an image.")
-                    logger.info(f"Job {job_id}: Proceeding with Content-Type '{content_type}'.")
+            elif image_source_str.startswith(("http://", "https://")):
+                results[job_id]["status"] = "downloading"
+                async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+                    img_response = await client.get(image_source_str)
+                    img_response.raise_for_status()
+                
+                input_bytes_for_rembg = await img_response.aread()
+                original_content_type_header = img_response.headers.get("content-type", "unknown")
+                content_type = original_content_type_header.lower()
+                logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_source_str}")
 
-                    extension = MIME_TO_EXT.get(content_type)
-                    if not extension:
-                        parsed_url_path_for_save_ext = urllib.parse.urlparse(image_url_str).path
-                        _, ext_from_url_for_save = os.path.splitext(parsed_url_path_for_save_ext)
-                        ext_from_url_for_save = ext_from_url_for_save.lower()
-                        if ext_from_url_for_save and ext_from_url_for_save in MIME_TO_EXT.values():
-                            extension = ext_from_url_for_save
-                            logger.info(f"Job {job_id}: Using URL extension '{extension}' for saving original file as Content-Type '{content_type}' was not directly in MIME_TO_EXT map.")
-                        else:
-                            extension = ".bin"
-                            logger.warning(f"Job {job_id}: Could not determine specific file extension for saving original from Content-Type '{content_type}' or URL. Defaulting to '{extension}'.")
-                    original_filename = f"{job_id}_original{extension}"
-                    
-                except httpx.HTTPStatusError as e:
-                    logger.error(f"Worker {worker_id} HTTP error {e.response.status_code} for job {job_id} from {image_url_str}: {e.response.text}", exc_info=True)
-                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Failed to download image: HTTP {e.response.status_code} from {image_url_str}."
-                    queue.task_done()
-                    continue
-                except httpx.RequestError as e:
-                    logger.error(f"Worker {worker_id} Network error downloading for job {job_id} from {image_url_str}: {e}", exc_info=True)
-                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading image from {image_url_str}: {type(e).__name__}."
-                    queue.task_done()
-                    continue
-            
-            # Handle file upload source
-            elif source_type == "file":
-                image = image_data  # This is now the UploadFile object
-                try:
-                    image_content = await image.read()
-                    content_type = image.content_type
-                    original_filename = image.filename  # Use the original filename
+                if content_type == "application/octet-stream" or not content_type.startswith("image/"):
+                    # ... (Content-Type inference logic) ...
+                    file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
+                    potential_ct = None
+                    if file_ext_from_url == ".webp": potential_ct = "image/webp"
+                    elif file_ext_from_url == ".png": potential_ct = "image/png"
+                    elif file_ext_from_url in [".jpg", ".jpeg"]: potential_ct = "image/jpeg"
+                    elif file_ext_from_url == ".gif": potential_ct = "image/gif"
+                    elif file_ext_from_url == ".bmp": potential_ct = "image/bmp"
+                    elif file_ext_from_url in [".tif", ".tiff"]: potential_ct = "image/tiff"
+                    if potential_ct: content_type = potential_ct
+                
+                if not content_type.startswith("image/"):
+                    raise ValueError(f"Invalid final content type '{content_type}' from URL. Not an image.")
+                
+                extension = MIME_TO_EXT.get(content_type, ".bin") # Default to .bin if unknown
+                # ... (logic to refine extension if content_type is generic) ...
 
-                    if not content_type.startswith("image/"):
-                        logger.error(f"Job {job_id}: Invalid content type '{content_type}' from uploaded file '{original_filename}'. Not an image.")
-                        raise ValueError(f"Invalid content type '{content_type}' from uploaded file. Not an image.")
+                # Save the downloaded HTTP image to UPLOADS_DIR, this becomes the source for rembg
+                temp_original_filename = f"{job_id}_original_downloaded{extension}"
+                path_of_source_for_rembg = os.path.join(UPLOADS_DIR, temp_original_filename)
+                results[job_id]["original_local_path"] = path_of_source_for_rembg
 
-                    extension = MIME_TO_EXT.get(content_type)
-                    if not extension:
-                        extension = os.path.splitext(original_filename)[1].lower() #Try and get from the original file name
-                        if not extension or extension not in MIME_TO_EXT.values():
-                            extension = ".bin"  # Last resort
-                            logger.warning(f"Job {job_id}: Could not determine specific file extension for uploaded file from Content-Type '{content_type}' or filename. Defaulting to '{extension}'.")
-
-                except Exception as e:
-                    logger.error(f"Worker {worker_id} Error reading uploaded file for job {job_id}: {e}", exc_info=True)
-                    results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Error reading uploaded file: {str(e)}"
-                    queue.task_done()
-                    continue  # Skip to next job
-            
+                async with aiofiles.open(path_of_source_for_rembg, 'wb') as out_file:
+                    await out_file.write(input_bytes_for_rembg)
+                logger.info(f"Worker {worker_id} saved downloaded original for job {job_id} to {path_of_source_for_rembg}")
             else:
-                logger.error(f"Worker {worker_id}: Invalid source type '{source_type}' for job {job_id}. This is an internal error.")
-                results[job_id]["status"] = "error"; results[job_id]["error_message"] = "Internal error: invalid source type."
-                queue.task_done()
-                continue # Skip to next job
+                raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
 
-            # Save original image to disk
-            original_filename = f"{job_id}_original{extension}"
-            original_file_path = os.path.join(UPLOADS_DIR, original_filename)
-            results[job_id]["original_local_path"] = original_file_path
-            async with aiofiles.open(original_file_path, 'wb') as out_file:
-                await out_file.write(image_content) # image_content is defined from both URL or local file load
-            logger.info(f"Worker {worker_id} saved original image for job {job_id} to {original_file_path}")
-            results[job_id]["status"] = "processing"
+            # --- Common Processing Logic ---
+            if input_bytes_for_rembg is None:
+                raise ValueError(f"Image content for rembg is None for job {job_id}. This should not happen.")
 
-            #Remove Background
-            with open(original_file_path, 'rb') as i:
-                input_bytes = i.read()
+            results[job_id]["status"] = "processing_rembg" # More specific status
+            
             session = new_session(model_name)
-            output_bytes = remove(input_bytes, session=session, post_process_mask=post_process_flag)
+            output_bytes = remove(input_bytes_for_rembg, session=session, post_process_mask=post_process_flag)
+            
+            results[job_id]["status"] = "processing_pil"
             img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
+            
             original_width, original_height = img_no_bg.size
             if original_width == 0 or original_height == 0:
-                raise ValueError("Image dimensions are zero after background removal.")
+                raise ValueError(f"Image dimensions zero after rembg for job {job_id}.")
             ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
             new_width, new_height = int(original_width * ratio), int(original_height * ratio)
             img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
@@ -315,29 +302,34 @@ async def image_processing_worker(worker_id: int):
             paste_x, paste_y = (TARGET_SIZE - new_width) // 2, (TARGET_SIZE - new_height) // 2
             square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
 
-            # --- Apply watermark ONLY if enabled AND logo is loaded ---
             if ENABLE_LOGO_WATERMARK and prepared_logo_image:
                 logo_w, logo_h = prepared_logo_image.size
                 logo_pos_x, logo_pos_y = LOGO_MARGIN, TARGET_SIZE - logo_h - LOGO_MARGIN
                 square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
-            elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
-                logger.warning(f"Job {job_id}: Logo watermarking enabled, but logo image was not prepared/loaded. Skipping watermark.")
-            else: # Watermarking is disabled
-                logger.info(f"Job {job_id}: Logo watermarking is disabled. Skipping watermark.")
-
+            
             final_image = square_canvas
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
             final_image.save(processed_file_path, 'WEBP', quality=90)
+
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
-            logger.info(f"Worker {worker_id} finished job {job_id}. Processed image: {processed_file_path}")
+            logger.info(f"Worker {worker_id} finished job {job_id}. Processed: {processed_file_path}")
 
+        except FileNotFoundError as e:
+            logger.error(f"Worker {worker_id} FileNotFoundError for job {job_id}: {e}", exc_info=False) # Less verbose for FileNotFoundError
+            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {str(e)}"
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Worker {worker_id} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}", exc_info=True)
+            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} from {image_source_str}."
+        except httpx.RequestError as e:
+            logger.error(f"Worker {worker_id} Network error for job {job_id}: {e}", exc_info=True)
+            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading from {image_source_str}: {type(e).__name__}."
         except (ValueError, IOError, OSError) as e:
             logger.error(f"Worker {worker_id} data/file error for job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Data or file error: {str(e)}"
         except Exception as e:
-            logger.error(f"Worker {worker_id} critical error processing job {job_id}: {e}", exc_info=True)
+            logger.error(f"Worker {worker_id} critical error for job {job_id}: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Unexpected processing error: {str(e)}"
         finally:
             queue.task_done()
@@ -347,16 +339,11 @@ async def image_processing_worker(worker_id: int):
 async def startup_event():
     global prepared_logo_image
     logger.info("Application startup event running...")
+    if not os.path.isdir(UPLOADS_DIR): os.makedirs(UPLOADS_DIR, exist_ok=True)
+    if not os.path.isdir(PROCESSED_DIR): os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-    if not os.path.isdir(UPLOADS_DIR):
-        logger.warning(f"Uploads directory {UPLOADS_DIR} was not found at startup event, trying to create again.")
-        os.makedirs(UPLOADS_DIR, exist_ok=True)
-    if not os.path.isdir(PROCESSED_DIR):
-        logger.warning(f"Processed directory {PROCESSED_DIR} was not found at startup event, trying to create again.")
-        os.makedirs(PROCESSED_DIR, exist_ok=True)
-
-    if ENABLE_LOGO_WATERMARK: # Only attempt to load logo if enabled
-        logger.info(f"Logo watermarking is ENABLED. Attempting to load logo from: {LOGO_PATH}")
+    if ENABLE_LOGO_WATERMARK:
+        logger.info(f"Logo watermarking ENABLED. Attempting load from: {LOGO_PATH}")
         if os.path.exists(LOGO_PATH):
             try:
                 logo = Image.open(LOGO_PATH).convert("RGBA")
@@ -367,15 +354,12 @@ async def startup_event():
                 prepared_logo_image = logo
                 logger.info(f"Logo loaded. Dimensions: {prepared_logo_image.size if prepared_logo_image else 'None'}")
             except Exception as e:
-                logger.error(f"Failed to load logo from {LOGO_PATH}: {e}", exc_info=True)
-                prepared_logo_image = None # Ensure it's None on failure
+                logger.error(f"Failed to load logo: {e}", exc_info=True); prepared_logo_image = None
         else:
-            logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be applied if logo appears later, but it's not present at startup.")
-            prepared_logo_image = None
+            logger.warning(f"Logo file not found at {LOGO_PATH}."); prepared_logo_image = None
     else:
-        logger.info("Logo watermarking is DISABLED by configuration.")
-        prepared_logo_image = None # Explicitly set to None if disabled
-
+        logger.info("Logo watermarking DISABLED."); prepared_logo_image = None
+    
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
     logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}.")
@@ -388,21 +372,13 @@ app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_image
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
-    if ENABLE_LOGO_WATERMARK and prepared_logo_image:
-        logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
-    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
-        logo_status += " (Enabled but not loaded/found)"
-
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Image Processing API</title><style>body {{ font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }}
-    .container {{ background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-    h1 {{ color: #0056b3; }} li {{ margin-bottom: 5px; }}</style></head><body><div class="container"><h1>Resale1... In The House!</h1>
-    <p>This service provides background removal and image processing capabilities.</p><p>Current settings:<ul>
-    <li>Max Concurrent Workers: {MAX_CONCURRENT_TASKS}</li><li>Max Queue Size: {MAX_QUEUE_SIZE}</li>
-    <li>Logo Watermarking: {logo_status}</li></ul></p></div></body></html>"""
+    if ENABLE_LOGO_WATERMARK and prepared_logo_image: logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
+    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image: logo_status += " (Enabled but not loaded/found)"
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API</title><style>body{{font-family:sans-serif;margin:20px}}</style></head>
+    <body><h1>Image Processing API Running</h1><p>Settings:<ul><li>Workers: {MAX_CONCURRENT_TASKS}</li><li>Queue: {MAX_QUEUE_SIZE}</li><li>Logo: {logo_status}</li></ul></p></body></html>"""
 
 # --- Main Execution ---
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server for local development...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=7000) # Changed port to 7000 as per your uvicorn command
