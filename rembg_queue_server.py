@@ -7,8 +7,7 @@ import logging
 import httpx
 import urllib.parse
 
-
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 2 ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -25,10 +24,9 @@ try:
     logger.info(f"Ensured base directory exists: {BASE_DIR_STATIC}")
 except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
-    # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File # Added Form, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware # Ensure this is imported
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
@@ -37,28 +35,31 @@ from PIL import Image
 
 app = FastAPI()
 
+# --- ADD CORS MIDDLEWARE ---
 origins = [
-    "null",  # Allow requests from file:/// origins (when you open HTML locally)
-    "http://localhost", # If you ever serve your HTML from a local dev server
-    "http://127.0.0.1"
+    "null",
+    "http://localhost",
+    "http://127.0.0.1",
+    # Add your RunPod proxy URL's base if needed, though 'null' should cover local file access
+    # e.g., "https://g15qpczfm67ivl-7000.proxy.runpod.net" - usually not needed for client-side JS requests as origin is 'null' or client's actual domain
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # List of origins that are allowed to make cross-origin requests
-    allow_credentials=True, # Allow cookies to be included in requests (not strictly needed for this app)
-    allow_methods=["*"],    # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"],    # Allow all headers
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 13
+ESTIMATED_TIME_PER_JOB = 13 # This might increase slightly with the extra PIL step
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
-ENABLE_LOGO_WATERMARK = True
+ENABLE_LOGO_WATERMARK = True # Or False to disable
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
@@ -85,7 +86,7 @@ MIME_TO_EXT = {
 }
 
 # --- Pydantic Models ---
-class SubmitJsonBody(BaseModel): # Renamed for clarity
+class SubmitJsonBody(BaseModel):
     image: HttpUrl
     key: str
     model: str = "u2net"
@@ -101,10 +102,8 @@ def get_proxy_url(request: Request):
     return f"{scheme}://{host}"
 
 # --- API Endpoints ---
-
-# Endpoint 1: Submit with JSON body (image URL)
 @app.post("/submit")
-async def submit_json_image_for_processing( # Renamed for clarity
+async def submit_json_image_for_processing(
     request: Request,
     body: SubmitJsonBody
 ):
@@ -112,17 +111,13 @@ async def submit_json_image_for_processing( # Renamed for clarity
         raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
-    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
-    
     try:
-        # For JSON/URL submissions, queue the URL directly
         queue.put_nowait((job_id, str(body.image), body.model, body.post_process))
     except asyncio.QueueFull:
         logger.warning(f"Queue is full. Rejecting JSON request for image {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
-    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
         "status": "queued", "input_image_url": str(body.image), "original_local_path": None,
@@ -135,9 +130,8 @@ async def submit_json_image_for_processing( # Renamed for clarity
         "eta": eta_seconds, "status_check_url": status_check_url
     }
 
-# Endpoint 2: Submit with Form Data (file upload)
-@app.post("/submit_form") # Kept distinct path
-async def submit_form_image_for_processing( # Renamed for clarity
+@app.post("/submit_form")
+async def submit_form_image_for_processing(
     request: Request,
     image_file: UploadFile = File(...),
     key: str = Form(...),
@@ -153,10 +147,8 @@ async def submit_form_image_for_processing( # Renamed for clarity
 
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
-    
     original_filename_from_upload = image_file.filename
     content_type_from_upload = image_file.content_type.lower()
-    
     extension = MIME_TO_EXT.get(content_type_from_upload)
     if not extension:
         _, ext_from_filename = os.path.splitext(original_filename_from_upload)
@@ -165,11 +157,9 @@ async def submit_form_image_for_processing( # Renamed for clarity
             extension = ext_from_filename_lower
         else:
             extension = ".png"
-            logger.warning(f"Job {job_id} (form): Could not determine ext for {original_filename_from_upload} (Content-Type: {content_type_from_upload}). Defaulting to '{extension}'.")
-
+            logger.warning(f"Job {job_id} (form): Could not determine ext for {original_filename_from_upload}. Defaulting to '{extension}'.")
     saved_original_filename = f"{job_id}_original{extension}"
     original_file_path = os.path.join(UPLOADS_DIR, saved_original_filename)
-
     try:
         async with aiofiles.open(original_file_path, 'wb') as out_file:
             file_content = await image_file.read()
@@ -180,7 +170,6 @@ async def submit_form_image_for_processing( # Renamed for clarity
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
     finally:
         await image_file.close()
-
     file_uri_for_queue = f"file://{original_file_path}"
     try:
         queue.put_nowait((job_id, file_uri_for_queue, model, post_process))
@@ -190,7 +179,6 @@ async def submit_form_image_for_processing( # Renamed for clarity
             try: os.remove(original_file_path)
             except OSError as e_clean: logger.error(f"Error cleaning {original_file_path} (queue full): {e_clean}")
         raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
-    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
         "status": "queued", "input_image_url": f"(form_upload: {original_filename_from_upload})",
@@ -203,7 +191,6 @@ async def submit_form_image_for_processing( # Renamed for clarity
         "status": "processing", "job_id": job_id, "image_links": [processed_image_placeholder_url],
         "eta": eta_seconds, "status_check_url": status_check_url
     }
-
 
 @app.get("/status/{job_id}")
 async def check_status(request: Request, job_id: str):
@@ -225,7 +212,7 @@ async def check_status(request: Request, job_id: str):
         response_data["error_message"] = job_info.get("error_message")
     return JSONResponse(content=response_data)
 
-# --- Background Worker ---
+# --- Background Worker (with white background fix) ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
@@ -238,11 +225,8 @@ async def image_processing_worker(worker_id: int):
             queue.task_done()
             continue
         
-        # This will hold the bytes of the image to be processed by rembg
         input_bytes_for_rembg: bytes = None
-        # This will hold the path to the original file that rembg will process from (for logging/reference)
-        # For http, it's a temporary download. For file://, it's the path from the form upload.
-        path_of_source_for_rembg: str = None
+        path_of_source_for_rembg: str = None # Not strictly needed if we always use input_bytes_for_rembg
 
         try:
             if image_source_str.startswith("file://"):
@@ -251,10 +235,9 @@ async def image_processing_worker(worker_id: int):
                 if not os.path.exists(local_path_from_uri):
                     raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path_from_uri}")
                 
-                path_of_source_for_rembg = local_path_from_uri # This is already in UPLOADS_DIR
-                async with aiofiles.open(path_of_source_for_rembg, 'rb') as f:
+                async with aiofiles.open(local_path_from_uri, 'rb') as f:
                     input_bytes_for_rembg = await f.read()
-                logger.info(f"Worker {worker_id}: Reading local file {path_of_source_for_rembg} for job {job_id}")
+                logger.info(f"Worker {worker_id}: Reading local file {local_path_from_uri} for job {job_id}")
 
             elif image_source_str.startswith(("http://", "https://")):
                 results[job_id]["status"] = "downloading"
@@ -268,7 +251,6 @@ async def image_processing_worker(worker_id: int):
                 logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_source_str}")
 
                 if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                    # ... (Content-Type inference logic) ...
                     file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
                     potential_ct = None
                     if file_ext_from_url == ".webp": potential_ct = "image/webp"
@@ -282,58 +264,81 @@ async def image_processing_worker(worker_id: int):
                 if not content_type.startswith("image/"):
                     raise ValueError(f"Invalid final content type '{content_type}' from URL. Not an image.")
                 
-                extension = MIME_TO_EXT.get(content_type, ".bin") # Default to .bin if unknown
-                # ... (logic to refine extension if content_type is generic) ...
-
-                # Save the downloaded HTTP image to UPLOADS_DIR, this becomes the source for rembg
+                # Saving downloaded original is optional if not needed for later, but good for records
+                extension = MIME_TO_EXT.get(content_type, ".bin")
                 temp_original_filename = f"{job_id}_original_downloaded{extension}"
-                path_of_source_for_rembg = os.path.join(UPLOADS_DIR, temp_original_filename)
-                results[job_id]["original_local_path"] = path_of_source_for_rembg
-
-                async with aiofiles.open(path_of_source_for_rembg, 'wb') as out_file:
+                downloaded_original_path = os.path.join(UPLOADS_DIR, temp_original_filename)
+                results[job_id]["original_local_path"] = downloaded_original_path 
+                async with aiofiles.open(downloaded_original_path, 'wb') as out_file:
                     await out_file.write(input_bytes_for_rembg)
-                logger.info(f"Worker {worker_id} saved downloaded original for job {job_id} to {path_of_source_for_rembg}")
+                logger.info(f"Worker {worker_id} saved downloaded original for job {job_id} to {downloaded_original_path}")
             else:
                 raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
 
-            # --- Common Processing Logic ---
             if input_bytes_for_rembg is None:
-                raise ValueError(f"Image content for rembg is None for job {job_id}. This should not happen.")
+                raise ValueError(f"Image content for rembg is None for job {job_id}.")
 
-            results[job_id]["status"] = "processing_rembg" # More specific status
-            
+            results[job_id]["status"] = "processing_rembg"
             session = new_session(model_name)
-            output_bytes = remove(input_bytes_for_rembg, session=session, post_process_mask=post_process_flag)
+            output_bytes_with_alpha = remove(input_bytes_for_rembg, session=session, post_process_mask=post_process_flag)
             
             results[job_id]["status"] = "processing_pil"
-            img_no_bg = Image.open(io.BytesIO(output_bytes)).convert("RGBA")
+            img_rgba = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
             
-            original_width, original_height = img_no_bg.size
+            # --- Add white background ---
+            white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255))
+            white_bg_canvas.paste(img_rgba, (0, 0), img_rgba)
+            # img_on_white_bg is now an RGB image
+            img_on_white_bg = white_bg_canvas 
+            # --- End white background ---
+
+            # Squaring logic operates on the image that now has a white background
+            original_width, original_height = img_on_white_bg.size
             if original_width == 0 or original_height == 0:
-                raise ValueError(f"Image dimensions zero after rembg for job {job_id}.")
+                raise ValueError(f"Image dimensions zero after BG processing for job {job_id}.")
+            
             ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
             new_width, new_height = int(original_width * ratio), int(original_height * ratio)
-            img_resized = img_no_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            square_canvas = Image.new("RGBA", (TARGET_SIZE, TARGET_SIZE), (0, 0, 0, 0))
+            
+            # Resize the image (which is currently RGB with white BG)
+            img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # Create the final square canvas, fill with white.
+            # Since img_resized_on_white is RGB, we can make square_canvas RGB too.
+            square_canvas = Image.new("RGB", (TARGET_SIZE, TARGET_SIZE), (255, 255, 255))
             paste_x, paste_y = (TARGET_SIZE - new_width) // 2, (TARGET_SIZE - new_height) // 2
-            square_canvas.paste(img_resized, (paste_x, paste_y), img_resized)
+            square_canvas.paste(img_resized_on_white, (paste_x, paste_y)) # No mask needed as source is RGB
 
+            # If watermarking, convert square_canvas to RGBA before pasting logo (if logo has alpha)
             if ENABLE_LOGO_WATERMARK and prepared_logo_image:
+                if square_canvas.mode != 'RGBA':
+                    square_canvas = square_canvas.convert('RGBA') # Ensure it can handle alpha paste
                 logo_w, logo_h = prepared_logo_image.size
                 logo_pos_x, logo_pos_y = LOGO_MARGIN, TARGET_SIZE - logo_h - LOGO_MARGIN
-                square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
+                square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image) # Use logo alpha
             
-            final_image = square_canvas
+            # Final image to save. If logo was added, square_canvas is RGBA.
+            # If no logo, it's RGB. For WEBP, this is fine.
+            # If you want to *force* no alpha in WEBP, convert to RGB before saving.
+            final_image_to_save = square_canvas
+            if final_image_to_save.mode == 'RGBA': # If it has an alpha channel (e.g. from logo)
+                 # Create a white background and composite the RGBA image onto it
+                 final_opaque_canvas = Image.new("RGB", final_image_to_save.size, (255,255,255))
+                 final_opaque_canvas.paste(final_image_to_save, mask=final_image_to_save.split()[3]) # Use alpha from image
+                 final_image_to_save = final_opaque_canvas
+
+
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-            final_image.save(processed_file_path, 'WEBP', quality=90)
+            
+            final_image_to_save.save(processed_file_path, 'WEBP', quality=90, background=(255,255,255)) # Save with white background hint for WEBP
 
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
             logger.info(f"Worker {worker_id} finished job {job_id}. Processed: {processed_file_path}")
 
         except FileNotFoundError as e:
-            logger.error(f"Worker {worker_id} FileNotFoundError for job {job_id}: {e}", exc_info=False) # Less verbose for FileNotFoundError
+            logger.error(f"Worker {worker_id} FileNotFoundError for job {job_id}: {e}", exc_info=False)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {str(e)}"
         except httpx.HTTPStatusError as e:
             logger.error(f"Worker {worker_id} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}", exc_info=True)
@@ -397,4 +402,4 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server for local development...")
-    uvicorn.run(app, host="0.0.0.0", port=7000) # Changed port to 7000 as per your uvicorn command
+    uvicorn.run(app, host="0.0.0.0", port=7000)
