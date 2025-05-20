@@ -7,7 +7,7 @@ import logging
 import httpx
 import urllib.parse
 
-# --- CREATE DIRECTORIES AT THE VERY TOP 2 ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 3 ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
