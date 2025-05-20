@@ -27,7 +27,8 @@ except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
     # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File, CORSMiddleware # Added Form, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File # Added Form, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
