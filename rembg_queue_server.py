@@ -158,8 +158,10 @@ async def submit_form_image_for_processing(
         else:
             extension = ".png"
             logger.warning(f"Job {job_id} (form): Could not determine ext for {original_filename_from_upload}. Defaulting to '{extension}'.")
-    saved_original_filename = f"{job_id}_original{extension}"
+    
+    saved_original_filename = f"{job_id}_original{extension}" # Filename for the saved original
     original_file_path = os.path.join(UPLOADS_DIR, saved_original_filename)
+    
     try:
         async with aiofiles.open(original_file_path, 'wb') as out_file:
             file_content = await image_file.read()
@@ -170,6 +172,7 @@ async def submit_form_image_for_processing(
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
     finally:
         await image_file.close()
+        
     file_uri_for_queue = f"file://{original_file_path}"
     try:
         queue.put_nowait((job_id, file_uri_for_queue, model, post_process))
@@ -179,17 +182,26 @@ async def submit_form_image_for_processing(
             try: os.remove(original_file_path)
             except OSError as e_clean: logger.error(f"Error cleaning {original_file_path} (queue full): {e_clean}")
         raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
+        
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {
         "status": "queued", "input_image_url": f"(form_upload: {original_filename_from_upload})",
         "original_local_path": original_file_path, "processed_path": None,
         "error_message": None, "status_check_url": status_check_url
     }
+    
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
+    # Construct the public URL for the saved original image
+    original_image_served_url = f"{public_url_base}/originals/{saved_original_filename}" # <-- ADDED LINE
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
+    
     return {
-        "status": "processing", "job_id": job_id, "image_links": [processed_image_placeholder_url],
-        "eta": eta_seconds, "status_check_url": status_check_url
+        "status": "processing",
+        "job_id": job_id,
+        "original_image_url": original_image_served_url,  # <-- ADDED LINE
+        "image_links": [processed_image_placeholder_url],
+        "eta": eta_seconds,
+        "status_check_url": status_check_url
     }
 
 @app.get("/status/{job_id}")
