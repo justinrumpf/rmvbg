@@ -7,6 +7,7 @@ import logging
 import httpx
 import urllib.parse
 
+
 # --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
@@ -26,7 +27,7 @@ except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
     # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}")
 
-from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File # Added Form, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File, CORSMiddleware # Added Form, UploadFile, File
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
