@@ -6,14 +6,15 @@ import aiofiles
 import logging
 import httpx
 import urllib.parse
+import time # <--- ADDED IMPORT
 
 # --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s') # Added format
+logger = logging.getLogger(__name__) # This will use the module name, e.g., '__main__' or your script's filename
 
 try:
     os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
@@ -53,8 +54,7 @@ app.add_middleware(
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
-# Increased estimate due to always-on alpha matting and post-processing
-ESTIMATED_TIME_PER_JOB = 35
+ESTIMATED_TIME_PER_JOB = 35 # Keep this, but actual times will be logged
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
@@ -89,9 +89,6 @@ class SubmitJsonBody(BaseModel):
     image: HttpUrl
     key: str
     model: str = "u2net"
-    # post_process field removed as it's now always True server-side
-    # The following fields are not used by the current rembg logic,
-    # but kept as per original structure.
     steps: int = 20
     samples: int = 1
     resolution: str = "1024x1024"
@@ -101,6 +98,15 @@ def get_proxy_url(request: Request):
     host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost"))
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     return f"{scheme}://{host}"
+
+def format_size(num_bytes: int) -> str:
+    """Formats a byte size into a human-readable string (KB, MB)."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    elif num_bytes < 1024**2:
+        return f"{num_bytes/1024:.2f} KB"
+    else:
+        return f"{num_bytes/1024**2:.2f} MB"
 
 # --- API Endpoints ---
 @app.post("/submit")
@@ -116,10 +122,7 @@ async def submit_json_image_for_processing(
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     try:
-        # The 4th element (post_process_flag) is now hardcoded to True,
-        # but will be effectively overridden in the worker.
-        # We keep the tuple structure for now.
-        queue.put_nowait((job_id, str(body.image), body.model, True))
+        queue.put_nowait((job_id, str(body.image), body.model, True)) # True for ignored post_process flag
     except asyncio.QueueFull:
         logger.warning(f"Queue is full. Rejecting JSON request for image {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
@@ -131,6 +134,7 @@ async def submit_json_image_for_processing(
     }
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
+    logger.info(f"Job {job_id} (JSON URL: {body.image}) enqueued. Queue size: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {
         "status": "processing", "job_id": job_id, "image_links": [processed_image_placeholder_url],
         "eta": eta_seconds, "status_check_url": status_check_url
@@ -142,7 +146,6 @@ async def submit_form_image_for_processing(
     image_file: UploadFile = File(...),
     key: str = Form(...),
     model: str = Form("u2net")
-    # post_process form field removed
 ):
     if key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -162,7 +165,7 @@ async def submit_form_image_for_processing(
         if ext_from_filename_lower in MIME_TO_EXT.values():
             extension = ext_from_filename_lower
         else:
-            extension = ".png" # Default fallback
+            extension = ".png"
             logger.warning(f"Job {job_id} (form): Could not determine ext for '{original_filename_from_upload}' from type '{content_type_from_upload}'. Defaulting to '{extension}'.")
 
     saved_original_filename = f"{job_id}_original{extension}"
@@ -172,7 +175,7 @@ async def submit_form_image_for_processing(
         async with aiofiles.open(original_file_path, 'wb') as out_file:
             file_content = await image_file.read()
             await out_file.write(file_content)
-        logger.info(f"📝 (Form Upload) Original image saved: {original_file_path} for job {job_id}")
+        logger.info(f"📝 Job {job_id} (Form Upload: {original_filename_from_upload}) Original image saved: {original_file_path} ({format_size(len(file_content))})")
     except Exception as e:
         logger.error(f"Error saving uploaded file {saved_original_filename} for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
@@ -181,8 +184,7 @@ async def submit_form_image_for_processing(
 
     file_uri_for_queue = f"file://{original_file_path}"
     try:
-        # The 4th element (post_process_flag) is now hardcoded to True.
-        queue.put_nowait((job_id, file_uri_for_queue, model, True))
+        queue.put_nowait((job_id, file_uri_for_queue, model, True)) # True for ignored post_process flag
     except asyncio.QueueFull:
         logger.warning(f"Queue is full. Rejecting form request for image {original_filename_from_upload} (job {job_id}).")
         if os.path.exists(original_file_path):
@@ -200,7 +202,7 @@ async def submit_form_image_for_processing(
     processed_image_placeholder_url = f"{public_url_base}/images/{job_id}.webp"
     original_image_served_url = f"{public_url_base}/originals/{saved_original_filename}"
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-
+    logger.info(f"Job {job_id} (Form Upload: {original_filename_from_upload}) enqueued. Queue size: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {
         "status": "processing",
         "job_id": job_id,
@@ -236,9 +238,10 @@ async def image_processing_worker(worker_id: int):
     global prepared_logo_image
 
     while True:
-        # The 4th item from queue is now named to indicate it's ignored for post_process_mask
-        job_id, image_source_str, model_name, _ignored_post_process_flag_from_queue = await queue.get()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}. Processing with Alpha Matting and Post-Processing.")
+        job_id, image_source_str, model_name, _ = await queue.get() # 4th item (post_process_flag) is ignored
+
+        t_job_start = time.perf_counter()
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}. Applying Alpha Matting & Post-Processing.")
 
         if job_id not in results:
             logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
@@ -246,8 +249,15 @@ async def image_processing_worker(worker_id: int):
             continue
 
         input_bytes_for_rembg: bytes | None = None
+        input_fetch_time: float = 0.0
+        rembg_time: float = 0.0
+        pil_time: float = 0.0
+        save_time: float = 0.0
+        input_size_bytes: int = 0
+        output_size_bytes: int = 0
 
         try:
+            t_input_fetch_start = time.perf_counter()
             if image_source_str.startswith("file://"):
                 results[job_id]["status"] = "processing_local_file"
                 local_path_from_uri = image_source_str[len("file://"):]
@@ -256,18 +266,26 @@ async def image_processing_worker(worker_id: int):
 
                 async with aiofiles.open(local_path_from_uri, 'rb') as f:
                     input_bytes_for_rembg = await f.read()
-                logger.info(f"Worker {worker_id}: Reading local file {local_path_from_uri} for job {job_id}")
+                input_size_bytes = len(input_bytes_for_rembg)
+                t_input_fetch_end = time.perf_counter()
+                input_fetch_time = t_input_fetch_end - t_input_fetch_start
+                logger.info(f"Job {job_id} (Worker {worker_id}): Read local file {local_path_from_uri} ({format_size(input_size_bytes)}) in {input_fetch_time:.4f}s.")
 
             elif image_source_str.startswith(("http://", "https://")):
                 results[job_id]["status"] = "downloading"
+                logger.info(f"Job {job_id} (Worker {worker_id}): Downloading from {image_source_str}...")
                 async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
                     img_response = await client.get(image_source_str)
                     img_response.raise_for_status()
 
                 input_bytes_for_rembg = await img_response.aread()
+                input_size_bytes = len(input_bytes_for_rembg)
+                t_input_fetch_end = time.perf_counter()
+                input_fetch_time = t_input_fetch_end - t_input_fetch_start
+                logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)} from {image_source_str} in {input_fetch_time:.4f}s.")
+
                 original_content_type_header = img_response.headers.get("content-type", "unknown")
                 content_type = original_content_type_header.lower()
-                logger.info(f"Job {job_id}: Received initial Content-Type='{original_content_type_header}' for URL {image_source_str}")
 
                 if content_type == "application/octet-stream" or not content_type.startswith("image/"):
                     file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
@@ -275,19 +293,18 @@ async def image_processing_worker(worker_id: int):
                     if file_ext_from_url == ".webp": potential_ct = "image/webp"
                     elif file_ext_from_url == ".png": potential_ct = "image/png"
                     elif file_ext_from_url in [".jpg", ".jpeg"]: potential_ct = "image/jpeg"
-                    # ... (other MIME types)
                     if potential_ct: content_type = potential_ct
 
                 if not content_type.startswith("image/"):
                     raise ValueError(f"Invalid final content type '{content_type}' from URL. Not an image.")
 
-                extension = MIME_TO_EXT.get(content_type, ".bin") # Default to .bin if unknown
+                extension = MIME_TO_EXT.get(content_type, ".bin")
                 temp_original_filename = f"{job_id}_original_downloaded{extension}"
                 downloaded_original_path = os.path.join(UPLOADS_DIR, temp_original_filename)
                 results[job_id]["original_local_path"] = downloaded_original_path
-                async with aiofiles.open(downloaded_original_path, 'wb') as out_file:
+                async with aiofiles.open(downloaded_original_path, 'wb') as out_file: # Save downloaded original
                     await out_file.write(input_bytes_for_rembg)
-                logger.info(f"Worker {worker_id} saved downloaded original for job {job_id} to {downloaded_original_path}")
+                logger.info(f"Job {job_id} (Worker {worker_id}): Saved downloaded original to {downloaded_original_path}")
             else:
                 raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
 
@@ -295,23 +312,22 @@ async def image_processing_worker(worker_id: int):
                 raise ValueError(f"Image content for rembg is None for job {job_id}.")
 
             results[job_id]["status"] = "processing_rembg"
-            session = new_session(model_name) # Consider caching sessions per model_name if performance is critical
-
-            # --- ALWAYS ENABLE ALPHA MATTING AND POST-PROCESSING ---
+            logger.info(f"Job {job_id} (Worker {worker_id}): Starting rembg processing (model: {model_name})...")
+            t_rembg_start = time.perf_counter()
+            session = new_session(model_name)
             output_bytes_with_alpha = remove(
                 input_bytes_for_rembg,
                 session=session,
-                post_process_mask=True,  # Hardcoded to True
-                alpha_matting=True       # Hardcoded to True
-                # Default rembg values for alpha_matting thresholds and erode_size will be used.
-                # You can specify them explicitly if needed:
-                # alpha_matting_foreground_threshold=240,
-                # alpha_matting_background_threshold=10,
-                # alpha_matting_erode_size=10,
+                post_process_mask=True,
+                alpha_matting=True
             )
-            # --- END OF REMBG CALL MODIFICATION ---
+            t_rembg_end = time.perf_counter()
+            rembg_time = t_rembg_end - t_rembg_start
+            logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s.")
 
             results[job_id]["status"] = "processing_pil"
+            logger.info(f"Job {job_id} (Worker {worker_id}): Starting PIL processing (resize, white BG, watermark)...")
+            t_pil_start = time.perf_counter()
             img_rgba = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
 
             white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255))
@@ -324,7 +340,6 @@ async def image_processing_worker(worker_id: int):
 
             ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
             new_width, new_height = int(original_width * ratio), int(original_height * ratio)
-
             img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             square_canvas = Image.new("RGB", (TARGET_SIZE, TARGET_SIZE), (255, 255, 255))
@@ -343,32 +358,53 @@ async def image_processing_worker(worker_id: int):
                  final_opaque_canvas = Image.new("RGB", final_image_to_save.size, (255,255,255))
                  final_opaque_canvas.paste(final_image_to_save, mask=final_image_to_save.split()[3])
                  final_image_to_save = final_opaque_canvas
+            t_pil_end = time.perf_counter()
+            pil_time = t_pil_end - t_pil_start
+            logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s.")
 
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
 
+            logger.info(f"Job {job_id} (Worker {worker_id}): Saving processed image to {processed_file_path}...")
+            t_save_start = time.perf_counter()
             final_image_to_save.save(processed_file_path, 'WEBP', quality=90, background=(255,255,255))
+            t_save_end = time.perf_counter()
+            save_time = t_save_end - t_save_start
+            output_size_bytes = os.path.getsize(processed_file_path)
+            logger.info(f"Job {job_id} (Worker {worker_id}): Saved processed image ({format_size(output_size_bytes)}) in {save_time:.4f}s.")
 
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
-            logger.info(f"Worker {worker_id} finished job {job_id}. Processed: {processed_file_path}")
+
+            t_job_end = time.perf_counter()
+            total_job_time = t_job_end - t_job_start
+            logger.info(
+                f"Job {job_id} (Worker {worker_id}) COMPLETED successfully. Processed: {processed_file_path}\n"
+                f"    Input Size: {format_size(input_size_bytes)}, Output Size: {format_size(output_size_bytes)}\n"
+                f"    Timings: InputFetch={input_fetch_time:.4f}s, Rembg={rembg_time:.4f}s, PIL={pil_time:.4f}s, Save={save_time:.4f}s\n"
+                f"    Total Job Time: {total_job_time:.4f}s"
+            )
 
         except FileNotFoundError as e:
-            logger.error(f"Worker {worker_id} FileNotFoundError for job {job_id}: {e}", exc_info=False) # Less noisy log
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {str(e)}"
         except httpx.HTTPStatusError as e:
-            logger.error(f"Worker {worker_id} HTTP error for job {job_id} URL {image_source_str}: {e.response.status_code}", exc_info=True)
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: HTTPStatusError downloading {image_source_str}: {e.response.status_code}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} from {image_source_str}."
-        except httpx.RequestError as e: # Handles timeouts, connection errors etc.
-            logger.error(f"Worker {worker_id} Network error for job {job_id} URL {image_source_str}: {e}", exc_info=True)
+        except httpx.RequestError as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: RequestError downloading {image_source_str}: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading from {image_source_str}: {type(e).__name__}."
-        except (ValueError, IOError, OSError) as e: # Includes PIL errors, file system errors
-            logger.error(f"Worker {worker_id} data/file error for job {job_id}: {e}", exc_info=True)
+        except (ValueError, IOError, OSError) as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: Data/file processing error: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Data or file error: {str(e)}"
         except Exception as e:
-            logger.error(f"Worker {worker_id} critical unexpected error for job {job_id}: {e}", exc_info=True)
+            logger.critical(f"Job {job_id} (Worker {worker_id}) CRITICAL Error: Unexpected processing error: {e}", exc_info=True)
             results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Unexpected processing error: {str(e)}"
         finally:
+            if results.get(job_id, {}).get("status") == "error":
+                t_job_end_error = time.perf_counter()
+                total_job_time_error = t_job_end_error - t_job_start
+                logger.info(f"Job {job_id} (Worker {worker_id}) FAILED. Total time before failure: {total_job_time_error:.4f}s")
             queue.task_done()
 
 # --- Application Startup Logic ---
@@ -376,7 +412,6 @@ async def image_processing_worker(worker_id: int):
 async def startup_event():
     global prepared_logo_image
     logger.info("Application startup event running...")
-    # Directories are already created at the top of the script now
 
     if ENABLE_LOGO_WATERMARK:
         logger.info(f"Logo watermarking ENABLED. Attempting load from: {LOGO_PATH}")
@@ -401,7 +436,7 @@ async def startup_event():
 
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
-    logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}. ETA per job (rough): {ESTIMATED_TIME_PER_JOB}s.")
+    logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}. ETA per job (rough estimate): {ESTIMATED_TIME_PER_JOB}s.")
 
 # --- Static File Serving ---
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
@@ -422,7 +457,7 @@ async def root():
     <p>Settings:<ul>
     <li>Workers: {MAX_CONCURRENT_TASKS}</li>
     <li>Queue Capacity: {MAX_QUEUE_SIZE}</li>
-    <li>Est. Time per Job: {ESTIMATED_TIME_PER_JOB} seconds</li>
+    <li>Est. Time per Job: {ESTIMATED_TIME_PER_JOB} seconds (actual times logged per job)</li>
     <li>Logo Watermarking: {logo_status}</li>
     </ul></p></body></html>"""
 
