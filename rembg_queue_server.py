@@ -320,7 +320,8 @@ async def image_processing_worker(worker_id: int):
                 session=session,
                 post_process_mask=True,
                 alpha_matting=True,
-                alpha_matting_background_threshold=50
+                alpha_matting_background_threshold=70,
+                alpha_matting_foreground_threshold=200
             )
             t_rembg_end = time.perf_counter()
             rembg_time = t_rembg_end - t_rembg_start
