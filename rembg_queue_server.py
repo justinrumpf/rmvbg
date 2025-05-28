@@ -343,6 +343,7 @@ async def image_processing_worker(worker_id: int):
 
             # -- 3. Post and processing
             img_rgba = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
+            t_pil_start = time.perf_counter()
             alpha = img_rgba.split()[-1]
 
             dilated_mask = apply_mask_operations(alpha, DILATION_ITERATIONS, EROSION_ITERATIONS)
