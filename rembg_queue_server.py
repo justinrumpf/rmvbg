@@ -6,7 +6,7 @@ import aiofiles
 import logging
 import httpx
 import urllib.parse
-import time # <--- ADDED IMPORT
+import time # <--- ADD ED IMPORT
 
 # --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
@@ -20,7 +20,7 @@ try:
     os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
     os.makedirs(PROCESSED_DIR_STATIC, exist_ok=True)
     os.makedirs(BASE_DIR_STATIC, exist_ok=True)
-    logger.info(f"Ensured uploads directory exists: {UPLOADS_DIR_STATIC}")
+    logger.info(f"Ensured  uploads directory exists: {UPLOADS_DIR_STATIC}")
     logger.info(f"Ensured processed directory exists: {PROCESSED_DIR_STATIC}")
     logger.info(f"Ensured base directory exists: {BASE_DIR_STATIC}")
 except OSError as e:
