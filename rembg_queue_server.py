@@ -312,7 +312,7 @@ async def image_processing_worker(worker_id: int):
                 raise ValueError(f"Image content for rembg is None for job {job_id}.")
 
             results[job_id]["status"] = "processing_rembg"
-            logger.info(f"Job {job_id} (Worker {worker_id}): Starting rembg processing (model: {model_name})...")
+            logger.info(f"Job {job_id} (Worker {worker_id}): ...Starting rembg processing (model: {model_name})...")
             t_rembg_start = time.perf_counter()
             session = new_session(model_name)
             output_bytes_with_alpha = remove(
