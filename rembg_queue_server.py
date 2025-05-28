@@ -9,7 +9,7 @@ import urllib.parse
 import time  # ADDED IMPORT
 from typing import Tuple, Optional, Any
 
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 1---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -27,7 +27,6 @@ try:
     logger.info(f"Ensured base directory exists: {BASE_DIR_STATIC}")
 except OSError as e:
     logger.error(f"CRITICAL: Error creating essential directories: {e}", exc_info=True)
-    # import sys; sys.exit(f"CRITICAL: Could not create essential directories: {e}") #Removed
 
 from fastapi import FastAPI, Request, HTTPException, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -116,26 +115,20 @@ def format_size(num_bytes: int) -> str:
         return f"{num_bytes / 1024:.2f} KB"
     else:
         return f"{num_bytes / 1024 ** 2:.2f} MB"
+		
+import numpy as np #Moved import statement
+from PIL import Image, ImageFilter
 
 def apply_mask_operations(mask: Image.Image, dilate_iterations: int, erode_iterations: int) -> Image.Image:
-    """Dilates and erodes the mask.
-    Args:
-        mask: A PIL Image in L or 1 mode.
-        dilate_iterations: Number of dilation iterations.
-        erode_iterations: Number of erosion iterations.
-    Returns:
-        Image.Image: The modified mask.
-    """
 
-    mask_np = np.array(mask).astype(np.uint8)  # Ensure mask is a uint8 array
-    if dilate_iterations > 0:
-        dilated_mask = binary_dilation(mask_np, iterations=dilate_iterations).astype(np.uint8)
-        mask_np = dilated_mask 
-    if erode_iterations > 0:
-        mask_np = binary_erosion(mask_np, iterations=erode_iterations).astype(np.uint8)
-        mask_np = dilated_mask 
+    mask_np = np.array(mask) #Now its a np stack!
 
-    return Image.fromarray(mask_np)
+    for d in range(dilate_iterations): #Run how many you need
+        mask_np = binary_dilation(mask_np).astype(np.uint8) #Get new layer
+    for e in range(erode_iterations): #Run how many for erosion
+        mask_np = binary_erosion(mask_np).astype(np.uint8) #Make erode action
+
+    return Image.fromarray(mask_np)  #Return image now.
 
 # --- API Endpoints ---
 @app.post("/submit")
@@ -241,39 +234,6 @@ async def submit_form_image_for_processing(
         "status_check_url": status_check_url
     }
 
-@app.get("/status/{job_id}")
-async def check_status(request: Request, job_id: str):
-    job_info = results.get(job_id)
-    if not job_info:
-        raise HTTPException(status_code=404, detail="Job not found")
-    public_url_base = get_proxy_url(request)
-    response_data = {
-        "job_id": job_id, "status": job_info.get("status"),
-        "input_image_url": job_info.get("input_image_url"), "status_check_url": job_info.get("status_check_url")
-    }
-    if job_info.get("original_local_path"):
-        original_filename = os.path.basename(job_info["original_local_path"])
-        response_data["downloaded_original_image_url"] = f"{public_url_base}/originals/{original_filename}"
-    if job_info.get("status") == "done" and job_info.get("processed_path"):
-        processed_filename = os.path.basename(job_info["processed_path"])
-        response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
-    elif job_info.get("status") == "error":
-        response_data["error_message"] = job_info.get("error_message")
-    return JSONResponse(content=response_data)
-
-def apply_mask_operations(mask: Image.Image, dilate_iterations: int, erode_iterations: int) -> Image.Image:
-   
-    mask_np = np.array(mask).astype(np.uint8)
-    if dilate_iterations > 0:
-        dilated_mask = binary_dilation(mask_np, iterations=dilate_iterations).astype(np.uint8)
-        mask_np = dilated_mask
-    if erode_iterations > 0:
-        eroded_mask = binary_erosion(mask_np, iterations=erode_iterations).astype(np.uint8)
-        mask_np = eroded_mask
-
-    return Image.fromarray(mask_np)
-
-# --- Background Worker ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
@@ -314,6 +274,7 @@ async def image_processing_worker(worker_id: int):
                 logger.info(f"Job {job_id} (Worker {worker_id}): Read local file {local_path_from_uri} ({format_size(input_size_bytes)}) in {input_fetch_time:.4f}s.")
 
             elif image_source_str.startswith(("http://", "https://")):
+                results[job_id]["status"] = "downloading"
                 logger.info(f"Job {job_id} (Worker {worker_id}): Downloading from {image_source_str}...")
                 async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
                     img_response = await client.get(image_source_str)
@@ -325,6 +286,7 @@ async def image_processing_worker(worker_id: int):
                 input_fetch_time = t_input_fetch_end - t_input_fetch_start
                 logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)} from {image_source_str} in {input_fetch_time:.4f}s.")
 
+            #RemBGT code
             results[job_id]["status"] = "processing_rembg"
             logger.info(f"Job {job_id} (Worker {worker_id}): ...Starting rembg processing (model: {model_name})...")
             t_rembg_start = time.perf_counter()
@@ -334,43 +296,39 @@ async def image_processing_worker(worker_id: int):
                 session=session,
                 post_process_mask=True,
                 alpha_matting=True,
-                alpha_matting_background_threshold=70,
-                alpha_matting_foreground_threshold=200
+                alpha_matting_background_threshold=ALPHA_MATTING_BACKGROUND_THRESHOLD,
+                alpha_matting_foreground_threshold=ALPHA_MATTING_FOREGROUND_THRESHOLD
             )
             t_rembg_end = time.perf_counter()
             rembg_time = t_rembg_end - t_rembg_start
             logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s.")
 
-            # -- 3. Post and processing
             img_rgba = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
             alpha = img_rgba.split()[-1]
 
             dilated_mask = apply_mask_operations(alpha, DILATION_ITERATIONS, EROSION_ITERATIONS)
             img_rgba = Image.new("RGBA", img_rgba.size, (255, 255, 255, 0))
-            img_rgba.paste(img_rgba, (0, 0), dilated_mask) #Correct the layering as part of the new function call
-          
+            img_rgba.paste(img_rgba, (0, 0), dilated_mask) #Adds the erosion/dialation to mask
 
-            white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255)) #Load with the white canvas background
-            #Check for transparency, fix to the correct method
-            if img_rgba.mode in ('RGBA', 'LA'):
-                  white_bg_canvas.paste(img_rgba, (0, 0), img_rgba) #Adds in the new color with new alpha
+            white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255)) 
+            if img_rgba.mode in ('RGBA', 'LA'): 
+                  white_bg_canvas.paste(img_rgba, (0, 0), img_rgba) 
             else:
-                 white_bg_canvas.paste(img_rgba, (0, 0)) #Adds in transparent images.
+                 white_bg_canvas.paste(img_rgba, (0, 0)) #Does not have alpha so add
 
-            img_on_white_bg = white_bg_canvas
+            img_on_white_bg = white_bg_canvas #Now use for output.
 
             original_width, original_height = img_on_white_bg.size
-            #Check for Zeros
+
             if original_width == 0 or original_height == 0:
                 raise ValueError(f"Image dimensions zero after BG processing for job {job_id}.")
-          
-            #Scale down and then back up, to remove image artifacts and make images load
+
             ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
             new_width, new_height = int(original_width * ratio), int(original_height * ratio)
-            img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS) # Higher resampling filter
-            square_canvas = Image.new("RGB", (TARGET_SIZE, TARGET_SIZE), (255, 255, 255))  
+            img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS) # High quality.
+            square_canvas = Image.new("RGB", (TARGET_SIZE, TARGET_SIZE), (255, 255, 255))  #Create blank
             paste_x, paste_y = (TARGET_SIZE - new_width) // 2, (TARGET_SIZE - new_height) // 2
-            square_canvas.paste(img_resized_on_white, (paste_x, paste_y)) #Apply scale
+            square_canvas.paste(img_resized_on_white, (paste_x, paste_y))
 
             if ENABLE_LOGO_WATERMARK and prepared_logo_image:
                 if square_canvas.mode != 'RGBA': 
@@ -379,21 +337,19 @@ async def image_processing_worker(worker_id: int):
                 logo_pos_x, logo_pos_y = LOGO_MARGIN, TARGET_SIZE - logo_h - LOGO_MARGIN
                 square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
 
-            #Output to final files.
             final_image_to_save = square_canvas
-            
+
             t_pil_end = time.perf_counter()
             pil_time = t_pil_end - t_pil_start
             logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s.")
 
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-            
-            results[job_id]["status"] = "saving" 
+            results[job_id]["status"] = "saving"
             logger.info(f"Job {job_id} (Worker {worker_id}): Saving processed image to {processed_file_path}...")
             t_save_start = time.perf_counter()
             final_image_to_save.save(processed_file_path, 'WEBP', quality=90, lossless=False)
-            
+
             output_size_bytes = os.path.getsize(processed_file_path)
             t_save_end = time.perf_counter()
             save_time = t_save_end - t_save_start
@@ -438,12 +394,17 @@ async def image_processing_worker(worker_id: int):
                 logger.info(f"Job {job_id} (Worker {worker_id}) FAILED. Total time before failure: {total_job_time_error:.4f}s")
             queue.task_done()
 
- #Set a better set of image load conditions.
 def _load_bytes_from(byte_obj:bytes)->bytes:
-    #If any of the images are not able to be loaded, a bin file is loaded instead.
-    if img_rgba.mode in ('RGBA', 'LA'):
-        _ = image 
-    return  square_canvas.mode == 'RGBA'
+ #If any of the images are not able to be loaded, a bin file is loaded instead.
+ #This will likely throw a different error.
+    try:
+        image = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
+        return "0000000000000000000" #Did not fail, and continue on
+    except:
+       image_not_valid = "Unable to parse output. Load the original URL or ensure settings are correct, or use a different photo setting. Ensure that the server is on."
+       return bytes (image_not_valid,encoding= 'utf-8') #Return the error message
+  
+
 # --- Application Startup Logic ---
 @app.on_event("startup")
 async def startup_event():
@@ -494,20 +455,12 @@ async def root():
         logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
     elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
         logo_status += " (Enabled but not loaded/found)"
-		
-		
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API</title>
-    <style>body{{font-family:sans-serif;margin:20px}} li{{margin-bottom: 5px;}}</style></head>
-    <body><h1>Image Processing API Running</h1><p>Background removal now <b>always uses alpha matting and post-processing</b> for highest quality.</p>
-    <p>Settings:<ul>
-    <li>Workers: {MAX_CONCURRENT_TASKS}</li>
-    <li>Queue Capacity: {MAX_QUEUE_SIZE}</li>
-    <li>Est. Time per Job: {ESTIMATED_TIME_PER_JOB} seconds (actual times logged per job)</li>
-    <li>Logo Watermarking: {logo_status}</li>
-    </ul></p></body></html>"""
+
+    return f"""
 
 # --- Main Execution ---
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting Uvicorn server for local development...")
-    uvicorn.run(app, host="0.0.0.0", port=7000)
+    uvicorn.run(app, host="0.0.0.0", port=7000)	
+		
