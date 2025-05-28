@@ -145,7 +145,7 @@ async def submit_form_image_for_processing(
     request: Request,
     image_file: UploadFile = File(...),
     key: str = Form(...),
-    model: str = Form("u2net")
+    model: str = Form(default="u2net")
 ):
     if key != EXPECTED_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
