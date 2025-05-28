@@ -9,7 +9,7 @@ import urllib.parse
 import time  # ADDED IMPORT
 from typing import Tuple, Optional, Any
 
-# --- CREATE DIRECTORIES AT THE VERY TOP 3---
+# --- CREATE DIRECTORIES AT THE VERY TOP 4---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
