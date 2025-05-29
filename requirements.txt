@@ -14,3 +14,6 @@ Pillow
 requests
 httpx
 python-multipart
+numpy
+scipy
+opencv-python
