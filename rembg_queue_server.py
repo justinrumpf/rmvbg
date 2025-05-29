@@ -360,6 +360,139 @@ def apply_morphological_cleanup(mask: np.ndarray, kernel_size: int) -> np.ndarra
     opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel//2)
     
     return opened
+
+def apply_edge_processing(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """
+    Apply various edge processing techniques to the image.
+    
+    Available techniques:
+    - none: No edge processing
+    - sharpness: Simple sharpness enhancement
+    - edge_detect_sobel: Sobel edge detection
+    - edge_detect_canny: Canny edge detection
+    - edge_enhance: PIL's edge enhancement filter
+    - unsharp_mask: Professional unsharp masking
+    """
+    if options.edge_processing == "none":
+        return image
+    
+    # Convert RGBA to RGB for processing if needed
+    processing_image = image
+    if image.mode == "RGBA":
+        rgb_image = Image.new("RGB", image.size, (255, 255, 255))
+        rgb_image.paste(image, mask=image.split()[3])
+        processing_image = rgb_image
+    
+    if options.edge_processing == "sharpness":
+        enhancer = ImageEnhance.Sharpness(processing_image)
+        result = enhancer.enhance(options.sharpness_factor)
+        
+    elif options.edge_processing == "edge_detect_sobel":
+        result = apply_sobel_edge_detection(processing_image, options)
+        
+    elif options.edge_processing == "edge_detect_canny":
+        result = apply_canny_edge_detection(processing_image, options)
+        
+    elif options.edge_processing == "edge_enhance":
+        result = processing_image.filter(ImageFilter.EDGE_ENHANCE)
+        
+    elif options.edge_processing == "unsharp_mask":
+        result = apply_unsharp_mask(processing_image, options)
+        
+    else:
+        result = processing_image
+    
+    # If original image had alpha channel, preserve it
+    if image.mode == "RGBA" and result.mode == "RGB":
+        result_rgba = result.convert("RGBA")
+        # Use original alpha channel
+        result_rgba.putalpha(image.split()[3])
+        return result_rgba
+    
+    return result
+
+def apply_sobel_edge_detection(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """Apply Sobel edge detection algorithm."""
+    # Convert to grayscale for edge detection
+    gray = image.convert('L')
+    img_array = np.array(gray)
+    
+    # Apply Sobel edge detection
+    sobel_x = ndimage.sobel(img_array, axis=1)
+    sobel_y = ndimage.sobel(img_array, axis=0)
+    sobel_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+    
+    # Normalize to 0-255 range
+    sobel_magnitude = (sobel_magnitude / sobel_magnitude.max() * 255).astype(np.uint8)
+    edge_image = Image.fromarray(sobel_magnitude).convert('RGB')
+    
+    if options.preserve_original:
+        # Overlay edges on original image
+        return blend_edge_overlay(image, edge_image, options.edge_overlay_opacity)
+    else:
+        return edge_image
+
+def apply_canny_edge_detection(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """Apply Canny edge detection algorithm."""
+    try:
+        # Convert PIL to OpenCV format
+        img_array = np.array(image.convert('RGB'))
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        
+        # Apply Canny edge detection
+        edges = cv2.Canny(gray, options.canny_low_threshold, options.canny_high_threshold)
+        edge_image = Image.fromarray(edges).convert('RGB')
+        
+        if options.preserve_original:
+            # Overlay edges on original image
+            return blend_edge_overlay(image, edge_image, options.edge_overlay_opacity)
+        else:
+            return edge_image
+            
+    except Exception as e:
+        logger.warning(f"OpenCV not available or error in Canny detection: {e}. Falling back to Sobel.")
+        return apply_sobel_edge_detection(image, options)
+
+def apply_unsharp_mask(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """Apply unsharp masking for professional edge enhancement."""
+    # Convert to numpy array
+    img_array = np.array(image)
+    
+    # Create blurred version
+    blurred = image.filter(ImageFilter.GaussianBlur(radius=options.unsharp_radius))
+    blurred_array = np.array(blurred)
+    
+    # Create unsharp mask
+    mask = img_array.astype(float) - blurred_array.astype(float)
+    
+    # Apply threshold
+    mask = np.where(np.abs(mask) < options.unsharp_threshold, 0, mask)
+    
+    # Apply the mask
+    sharpened = img_array.astype(float) + (mask * options.unsharp_percent / 100.0)
+    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
+    
+    return Image.fromarray(sharpened)
+
+def blend_edge_overlay(original: Image.Image, edge_image: Image.Image, opacity: float) -> Image.Image:
+    """Blend edge detection results with the original image."""
+    # Convert edge image to have white background and black edges
+    edge_array = np.array(edge_image.convert('L'))
+    # Invert so edges are white on black background
+    edge_inverted = 255 - edge_array
+    edge_colored = Image.fromarray(edge_inverted).convert('RGB')
+    
+    # Blend with original
+    if original.mode == "RGBA":
+        original_rgb = Image.new("RGB", original.size, (255, 255, 255))
+        original_rgb.paste(original, mask=original.split()[3])
+    else:
+        original_rgb = original.convert('RGB')
+    
+    # Use PIL's blend function
+    blended = Image.blend(original_rgb, edge_colored, opacity * 0.3)  # Reduce opacity for better visibility
+    
+    return blended
     """
     Apply various edge processing techniques to the image.
     
