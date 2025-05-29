@@ -17,3 +17,4 @@ python-multipart
 numpy
 scipy
 opencv-python
+pillow_heif
