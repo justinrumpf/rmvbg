@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from contextlib import asynccontextmanager
 
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 2---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
