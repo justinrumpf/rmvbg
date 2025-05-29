@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
 from contextlib import asynccontextmanager
 
-# --- CREATE DIRECTORIES AT THE VERY TOP 2---
+# --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -332,6 +332,24 @@ def blend_edge_overlay(original: Image.Image, edge_image: Image.Image, opacity: 
     blended = Image.blend(original_rgb, edge_colored, opacity * 0.3)  # Reduce opacity for better visibility
     
     return blended
+
+def parse_background_color(color_str: str) -> tuple:
+    """Parse background color string to RGB tuple."""
+    color_str = color_str.lower()
+    if color_str == "white":
+        return (255, 255, 255)
+    elif color_str == "black":
+        return (0, 0, 0)
+    elif color_str == "transparent":
+        return None
+    elif color_str.startswith("#"):
+        try:
+            hex_color = color_str[1:]
+            return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return (255, 255, 255)
+    else:
+        return (255, 255, 255)
     """Parse background color string to RGB tuple."""
     color_str = color_str.lower()
     if color_str == "white":
