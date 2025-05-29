@@ -97,11 +97,17 @@ LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
 
-# Available models, output formats, and edge processing types
-AVAILABLE_MODELS = ["u2net", "u2net_human_seg", "silueta", "isnet-general-use", "sam"]
+# Available models, output formats, edge processing types, and shadow removal options
+AVAILABLE_MODELS = [
+    "u2net", "u2netp", "u2net_human_seg", "u2net_cloth_seg", 
+    "silueta", "isnet-general-use", "isnet-anime", "sam",
+    "birefnet-general", "birefnet-general-lite", "birefnet-portrait",
+    "birefnet-dis", "birefnet-hrsod", "birefnet-cod", "birefnet-massive"
+]
 OUTPUT_FORMATS = ["webp", "png", "jpg", "jpeg"]
 BACKGROUND_COLORS = ["white", "transparent", "black", "custom"]
 EDGE_PROCESSING_TYPES = ["none", "sharpness", "edge_detect_sobel", "edge_detect_canny", "edge_enhance", "unsharp_mask"]
+SHADOW_REMOVAL_METHODS = ["none", "fill_holes", "enhance_shadows", "hybrid"]
 
 # --- Directory and File Paths ---
 BASE_DIR = BASE_DIR_STATIC
@@ -143,6 +149,12 @@ class ProcessingOptions(BaseModel):
     output_format: str = Field(default="webp", description="Output format: webp, png, jpg")
     quality: int = Field(default=90, ge=1, le=100, description="Output quality for lossy formats")
     edge_processing: str = Field(default="none", description="Edge processing type")
+    # Shadow removal options
+    shadow_removal: str = Field(default="none", description="Shadow removal method")
+    shadow_fill_kernel_size: int = Field(default=15, ge=5, le=50, description="Kernel size for morphological operations")
+    shadow_blur_radius: float = Field(default=2.0, ge=0.5, le=10.0, description="Blur radius for shadow smoothing")
+    shadow_brightness_boost: float = Field(default=1.2, ge=1.0, le=2.0, description="Brightness enhancement factor")
+    shadow_contrast_reduction: float = Field(default=0.9, ge=0.5, le=1.0, description="Contrast reduction factor")
     # Sharpness enhancement options
     sharpness_factor: float = Field(default=1.5, ge=0.5, le=3.0, description="Sharpness enhancement factor")
     # Edge detection options
@@ -200,7 +212,154 @@ def validate_file_size(file_size: int) -> None:
             detail=f"File too large. Maximum size: {format_size(MAX_FILE_SIZE)}"
         )
 
-def apply_edge_processing(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+def apply_shadow_removal(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """
+    Apply shadow removal post-processing to handle internal shadows and holes.
+    
+    Methods:
+    - none: No shadow removal
+    - fill_holes: Fill holes in alpha mask using morphological operations
+    - enhance_shadows: Brighten and soften shadows instead of removing
+    - hybrid: Combination of fill_holes and enhance_shadows
+    """
+    if options.shadow_removal == "none":
+        return image
+    
+    logger.info(f"Applying shadow removal method: {options.shadow_removal}")
+    
+    if options.shadow_removal == "fill_holes":
+        return fill_internal_holes(image, options)
+    elif options.shadow_removal == "enhance_shadows":
+        return enhance_shadow_areas(image, options)
+    elif options.shadow_removal == "hybrid":
+        # First enhance shadows, then fill holes
+        enhanced = enhance_shadow_areas(image, options)
+        return fill_internal_holes(enhanced, options)
+    else:
+        return image
+
+def fill_internal_holes(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """
+    Fill holes in the alpha mask to remove unwanted transparent areas like shadows.
+    """
+    if image.mode != 'RGBA':
+        # If no alpha channel, convert and create one based on non-white pixels
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Create alpha mask based on non-white pixels
+        img_array = np.array(image)
+        # Consider pixels as foreground if they're not close to white
+        mask = np.any(img_array < 240, axis=2).astype(np.uint8) * 255
+        
+        # Add alpha channel
+        alpha = Image.fromarray(mask, mode='L')
+        image.putalpha(alpha)
+    
+    # Convert PIL to OpenCV for processing
+    img_array = np.array(image)
+    
+    if img_array.shape[2] == 4:  # RGBA
+        bgr = cv2.cvtColor(img_array[:,:,:3], cv2.COLOR_RGB2BGR)
+        alpha = img_array[:,:,3]
+    else:
+        return image
+    
+    # Create binary mask from alpha channel
+    _, binary_mask = cv2.threshold(alpha, 1, 255, cv2.THRESH_BINARY)
+    
+    # Find external contours (main object boundary)
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # Get the largest contour (should be the main object)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Create filled mask
+        filled_mask = np.zeros_like(alpha)
+        cv2.fillPoly(filled_mask, [largest_contour], 255)
+        
+        # Smooth the filled mask to avoid hard edges
+        kernel_size = max(3, min(options.shadow_fill_kernel_size, 50))
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # Ensure odd number
+        filled_mask = cv2.GaussianBlur(filled_mask, (kernel_size, kernel_size), 0)
+        
+        # Combine original alpha with filled mask (take maximum)
+        new_alpha = np.maximum(alpha, filled_mask)
+        
+        # Create final image
+        result_array = np.dstack([img_array[:,:,:3], new_alpha])
+        result = Image.fromarray(result_array, 'RGBA')
+        
+        logger.info("Successfully filled internal holes in alpha mask")
+        return result
+    
+    return image
+
+def enhance_shadow_areas(image: Image.Image, options: ProcessingOptions) -> Image.Image:
+    """
+    Enhance shadow areas by brightening and reducing harsh contrasts.
+    """
+    # Work with RGBA if available, otherwise convert
+    if image.mode != 'RGBA':
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        # Create alpha channel
+        alpha = Image.new('L', image.size, 255)
+        image.putalpha(alpha)
+    
+    # Separate channels
+    r, g, b, a = image.split()
+    rgb_image = Image.merge('RGB', (r, g, b))
+    
+    # Convert to numpy for advanced processing
+    img_array = np.array(rgb_image)
+    
+    # Identify shadow areas (darker regions)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    shadow_mask = gray < np.percentile(gray[gray > 0], 30)  # Bottom 30% of non-background pixels
+    
+    # Apply brightness boost to shadow areas
+    brightness_factor = options.shadow_brightness_boost
+    enhanced_array = img_array.astype(np.float32)
+    
+    # Apply brightness boost only to shadow areas
+    for i in range(3):  # RGB channels
+        channel = enhanced_array[:,:,i]
+        channel[shadow_mask] = np.clip(channel[shadow_mask] * brightness_factor, 0, 255)
+    
+    enhanced_array = enhanced_array.astype(np.uint8)
+    enhanced_rgb = Image.fromarray(enhanced_array)
+    
+    # Apply contrast reduction for smoother shadows
+    enhancer = ImageEnhance.Contrast(enhanced_rgb)
+    contrast_adjusted = enhancer.enhance(options.shadow_contrast_reduction)
+    
+    # Apply slight blur to soften harsh shadow edges
+    blur_radius = min(options.shadow_blur_radius, 5.0)
+    softened = contrast_adjusted.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    
+    # Combine back with original alpha
+    final_image = Image.merge('RGBA', (*softened.split(), a))
+    
+    logger.info("Successfully enhanced shadow areas")
+    return final_image
+
+def apply_morphological_cleanup(mask: np.ndarray, kernel_size: int) -> np.ndarray:
+    """
+    Apply morphological operations to clean up the mask.
+    """
+    # Create structuring element
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    
+    # Close operation to fill small holes
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    # Optional: Opening to remove small noise
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel//2)
+    
+    return opened
     """
     Apply various edge processing techniques to the image.
     
@@ -432,8 +591,48 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.get("/edge-processing")
-async def list_edge_processing_options():
+@app.get("/shadow-removal")
+async def list_shadow_removal_options():
+    """List available shadow removal options with descriptions."""
+    return {
+        "available_methods": SHADOW_REMOVAL_METHODS,
+        "default_method": "none",
+        "descriptions": {
+            "none": "No shadow removal applied",
+            "fill_holes": "Fill holes in alpha mask caused by internal shadows - best for bags, containers",
+            "enhance_shadows": "Brighten and soften shadow areas instead of removing them",
+            "hybrid": "Combination of fill_holes and enhance_shadows for comprehensive shadow handling"
+        },
+        "use_cases": {
+            "none": "When shadow removal is not needed",
+            "fill_holes": "Handbags, containers, objects with internal shadows creating unwanted holes",
+            "enhance_shadows": "When you want to preserve shadow details but reduce harshness",
+            "hybrid": "Complex objects with both internal holes and harsh shadows"
+        },
+        "parameters": {
+            "shadow_fill_kernel_size": "15 (5-50) - Size of morphological operations for hole filling",
+            "shadow_blur_radius": "2.0 (0.5-10.0) - Blur radius for shadow edge softening",
+            "shadow_brightness_boost": "1.2 (1.0-2.0) - How much to brighten shadow areas",
+            "shadow_contrast_reduction": "0.9 (0.5-1.0) - Reduce contrast in shadow areas"
+        },
+        "recommended_combinations": {
+            "handbags_purses": {
+                "shadow_removal": "fill_holes",
+                "model": "isnet-general-use",
+                "edge_processing": "unsharp_mask"
+            },
+            "product_photography": {
+                "shadow_removal": "enhance_shadows",
+                "model": "u2net",
+                "background_color": "white"
+            },
+            "complex_objects": {
+                "shadow_removal": "hybrid",
+                "model": "isnet-general-use",
+                "edge_processing": "edge_enhance"
+            }
+        }
+    }
     """List available edge processing options with descriptions."""
     return {
         "available_options": EDGE_PROCESSING_TYPES,
@@ -557,6 +756,11 @@ async def submit_form_image_for_processing(
     background_color: str = Form("white"),
     output_format: str = Form("webp"),
     quality: int = Form(90),
+    shadow_removal: str = Form("none"),
+    shadow_fill_kernel_size: int = Form(15),
+    shadow_blur_radius: float = Form(2.0),
+    shadow_brightness_boost: float = Form(1.2),
+    shadow_contrast_reduction: float = Form(0.9),
     edge_processing: str = Form("none"),
     sharpness_factor: float = Form(1.5),
     canny_low_threshold: int = Form(50),
@@ -575,6 +779,12 @@ async def submit_form_image_for_processing(
         raise HTTPException(
             status_code=400,
             detail=f"Invalid model. Available models: {', '.join(AVAILABLE_MODELS)}"
+        )
+    
+    if shadow_removal not in SHADOW_REMOVAL_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid shadow removal method. Available methods: {', '.join(SHADOW_REMOVAL_METHODS)}"
         )
     
     if edge_processing not in EDGE_PROCESSING_TYPES:
@@ -600,6 +810,11 @@ async def submit_form_image_for_processing(
         background_color=background_color,
         output_format=output_format,
         quality=quality,
+        shadow_removal=shadow_removal,
+        shadow_fill_kernel_size=shadow_fill_kernel_size,
+        shadow_blur_radius=shadow_blur_radius,
+        shadow_brightness_boost=shadow_brightness_boost,
+        shadow_contrast_reduction=shadow_contrast_reduction,
         edge_processing=edge_processing,
         sharpness_factor=sharpness_factor,
         canny_low_threshold=canny_low_threshold,
@@ -985,6 +1200,11 @@ async def process_image_with_options(
             square_canvas.paste(final_image, (paste_x, paste_y))
             final_image = square_canvas
     
+    # Apply shadow removal if requested (before edge processing for better results)
+    if options.shadow_removal and options.shadow_removal != "none":
+        logger.info(f"Job {job_id} (Worker {worker_id}): Applying shadow removal: {options.shadow_removal}")
+        final_image = apply_shadow_removal(final_image, options)
+    
     # Apply edge processing if requested
     if options.edge_processing and options.edge_processing != "none":
         logger.info(f"Job {job_id} (Worker {worker_id}): Applying edge processing: {options.edge_processing}")
@@ -1330,6 +1550,10 @@ async def root():
                     <span class="stat-value">{len(EDGE_PROCESSING_TYPES)}</span>
                 </div>
                 <div class="stat">
+                    <span class="stat-label">Shadow Removal Methods</span>
+                    <span class="stat-value">{len(SHADOW_REMOVAL_METHODS)}</span>
+                </div>
+                <div class="stat">
                     <span class="stat-label">Logo Watermark</span>
                     <span class="stat-value">{logo_status}</span>
                 </div>
@@ -1367,6 +1591,9 @@ async def root():
                 <span class="method">GET</span>/edge-processing - List edge processing options and parameters
             </div>
             <div class="endpoint">
+                <span class="method">GET</span>/shadow-removal - List shadow removal methods and parameters
+            </div>
+            <div class="endpoint">
                 <span class="method">GET</span>/stats - Get detailed processing statistics
             </div>
             <div class="endpoint">
@@ -1378,8 +1605,8 @@ async def root():
         </div>
         
         <div class="footer">
-            <p>🚀 Enhanced with true edge detection algorithms including Sobel, Canny, and professional unsharp masking</p>
-            <p>🎯 Edge Processing Options: {', '.join(EDGE_PROCESSING_TYPES)}</p>
+            <p>🚀 Enhanced with true edge detection and intelligent shadow removal for professional results</p>
+            <p>🎯 Shadow Removal: {', '.join(SHADOW_REMOVAL_METHODS)} | Edge Processing: {', '.join(EDGE_PROCESSING_TYPES)}</p>
             <p>Server Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</p>
         </div>
     </div>
