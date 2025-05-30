@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X---
+# --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -41,8 +41,8 @@ app = FastAPI()
 # --- ADD CORS MIDDLEWARE ---
 origins = [
     "null",
-    "https://localhost:44302",
-    "http://127.0.0.1"
+    "http://localhost",
+    "http://127.0.0.1",
 ]
 
 app.add_middleware(
@@ -819,8 +819,8 @@ async def root():
     </head>
     <body>
     <div class="container">
-        <h1>🚀 Image Processing API Dashboard</h1>
-        <p><strong>Status:</strong> <span class="status-good">RUNNING</span></p>
+        <h1>🚀 Threaded Image Processing API Dashboard</h1>
+        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
         
         <div class="stats-grid">
             <div class="stat-card">
@@ -853,6 +853,7 @@ async def root():
         <ul>
             <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
             <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
+            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
             <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
             <li><strong>Logo Watermarking:</strong> {logo_status}</li>
         </ul>
