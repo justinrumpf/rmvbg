@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP Q---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
