@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 3 ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -126,7 +126,7 @@ def format_size(num_bytes: int) -> str:
     else:
         return f"{num_bytes/1024**2:.2f} MB"
 
-def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown"):
+def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown", original_filename: str = ""):
     """Add completed job to history for monitoring"""
     global job_history, total_jobs_completed, total_jobs_failed, total_processing_time
     
@@ -138,7 +138,8 @@ def add_job_to_history(job_id: str, status: str, total_time: float, input_size: 
         "input_size": input_size,
         "output_size": output_size,
         "model": model,
-        "source_type": source_type
+        "source_type": source_type,
+        "original_filename": original_filename
     }
     
     job_history.insert(0, job_record)  # Add to beginning
@@ -338,8 +339,159 @@ async def submit_form_image_for_processing(
         "status_check_url": status_check_url
     }
 
-@app.get("/status/{job_id}")
-async def check_status(request: Request, job_id: str):
+@app.get("/job/{job_id}")
+async def job_details(request: Request, job_id: str):
+    """Display detailed job information with before/after images"""
+    
+    # Find job in history
+    job_info = None
+    for job in job_history:
+        if job["job_id"] == job_id:
+            job_info = job
+            break
+    
+    # If not in history, check current results
+    if not job_info and job_id in results:
+        result = results[job_id]
+        job_info = {
+            "job_id": job_id,
+            "timestamp": time.time(),  # Approximate
+            "status": "active" if result.get("status") not in ["done", "error"] else result.get("status"),
+            "total_time": 0,  # Not available for active jobs
+            "input_size": 0,  # Not available
+            "output_size": 0,  # Not available
+            "model": "unknown",
+            "source_type": "unknown",
+            "original_filename": ""
+        }
+    
+    if not job_info:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    public_url_base = get_proxy_url(request)
+    
+    # Build image URLs
+    original_image_url = None
+    processed_image_url = None
+    
+    # Check for original image
+    original_extensions = ['.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+    for ext in original_extensions:
+        original_filename = f"{job_id}_original{ext}"
+        original_path = os.path.join(UPLOADS_DIR, original_filename)
+        if os.path.exists(original_path):
+            original_image_url = f"{public_url_base}/originals/{original_filename}"
+            break
+    
+    # Check for processed image
+    processed_filename = f"{job_id}.webp"
+    processed_path = os.path.join(PROCESSED_DIR, processed_filename)
+    if os.path.exists(processed_path):
+        processed_image_url = f"{public_url_base}/images/{processed_filename}"
+    
+    # Additional job details from results dict
+    result_details = results.get(job_id, {})
+    
+    return HTMLResponse(content=f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Job Details - {job_id[:8]}</title>
+        <style>
+            body {{ font-family: sans-serif; margin: 20px; background-color: #f9f9f9; }}
+            .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }}
+            .status-badge {{ padding: 5px 10px; border-radius: 15px; font-weight: bold; text-transform: uppercase; }}
+            .status-completed {{ background-color: #d4edda; color: #155724; }}
+            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
+            .status-active {{ background-color: #d1ecf1; color: #0c5460; }}
+            .details-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
+            .detail-card {{ background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; }}
+            .detail-label {{ font-size: 12px; color: #6c757d; text-transform: uppercase; margin-bottom: 5px; }}
+            .detail-value {{ font-size: 18px; font-weight: bold; color: #495057; }}
+            .images-section {{ margin-top: 30px; }}
+            .images-container {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }}
+            .image-card {{ border: 1px solid #dee2e6; border-radius: 8px; padding: 15px; background: white; }}
+            .image-card h3 {{ margin-top: 0; color: #495057; }}
+            .image-card img {{ max-width: 100%; height: auto; border-radius: 4px; border: 1px solid #dee2e6; }}
+            .no-image {{ color: #6c757d; font-style: italic; text-align: center; padding: 40px; background: #f8f9fa; border-radius: 4px; }}
+            .back-link {{ color: #007bff; text-decoration: none; }}
+            .back-link:hover {{ text-decoration: underline; }}
+            @media (max-width: 768px) {{
+                .images-container {{ grid-template-columns: 1fr; }}
+                .header {{ flex-direction: column; align-items: flex-start; }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Job Details</h1>
+                <a href="/" class="back-link">← Back to Dashboard</a>
+            </div>
+            
+            <div style="margin-bottom: 20px;">
+                <h2>Job ID: <code>{job_id}</code></h2>
+                <span class="status-badge status-{job_info['status'].lower()}">{job_info['status']}</span>
+            </div>
+            
+            <div class="details-grid">
+                <div class="detail-card">
+                    <div class="detail-label">Processed Time</div>
+                    <div class="detail-value">{format_timestamp(job_info['timestamp'])}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">Processing Duration</div>
+                    <div class="detail-value">{job_info['total_time']:.2f}s</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">Model Used</div>
+                    <div class="detail-value">{job_info['model']}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">Source Type</div>
+                    <div class="detail-value">{job_info['source_type'].title()}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">Input Size</div>
+                    <div class="detail-value">{format_size(job_info['input_size'])}</div>
+                </div>
+                <div class="detail-card">
+                    <div class="detail-label">Output Size</div>
+                    <div class="detail-value">{format_size(job_info['output_size']) if job_info['output_size'] > 0 else 'N/A'}</div>
+                </div>
+            </div>
+            
+            {f"<div class='detail-card'><div class='detail-label'>Original Filename</div><div class='detail-value'>{job_info['original_filename']}</div></div>" if job_info.get('original_filename') else ''}
+            
+            <div class="images-section">
+                <h2>Before & After Images</h2>
+                <div class="images-container">
+                    <div class="image-card">
+                        <h3>🔍 Original Image</h3>
+                        {f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available</div>'}
+                    </div>
+                    <div class="image-card">
+                        <h3>✨ Processed Image</h3>
+                        {f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available</div>'}
+                    </div>
+                </div>
+            </div>
+            
+            <div style="margin-top: 30px; padding: 15px; background: #f8f9fa; border-radius: 6px;">
+                <h3>Technical Details</h3>
+                <ul>
+                    <li><strong>Current Status in System:</strong> {result_details.get('status', 'Not in active results')}</li>
+                    <li><strong>Status Check URL:</strong> <a href="{result_details.get('status_check_url', '#')}" target="_blank">API Status</a></li>
+                    {f"<li><strong>Error Message:</strong> {result_details.get('error_message', 'None')}</li>" if result_details.get('error_message') else ''}
+                    <li><strong>Job ID:</strong> <code>{job_id}</code></li>
+                </ul>
+            </div>
+        </div>
+    </body>
+    </html>
+    """, status_code=200)
     job_info = results.get(job_id)
     if not job_info:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -494,9 +646,10 @@ async def image_processing_worker(worker_id: int):
             
             # Determine source type for monitoring
             source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
+            original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
             
             # Add to job history
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type)
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type, original_filename)
             
             logger.info(
                 f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
@@ -531,7 +684,8 @@ async def image_processing_worker(worker_id: int):
                 
                 # Add failed job to history
                 source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type)
+                original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type, original_filename)
                 
                 logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
             queue.task_done()
@@ -620,10 +774,11 @@ async def root():
         
         for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
             status_color = "#4CAF50" if job["status"] == "completed" else "#f44336"
+            job_link = f"/job/{job['job_id']}"
             recent_jobs_html += f"""
-            <tr>
+            <tr style="cursor: pointer;" onclick="window.location.href='{job_link}'">
                 <td>{format_timestamp(job['timestamp'])}</td>
-                <td style='font-family: monospace; font-size: 10px;'>{job['job_id'][:8]}...</td>
+                <td style='font-family: monospace; font-size: 10px;'><a href="{job_link}" style="text-decoration: none; color: #007bff;">{job['job_id'][:8]}...</a></td>
                 <td style='color: {status_color}; font-weight: bold;'>{job['status'].upper()}</td>
                 <td>{job['total_time']:.2f}s</td>
                 <td>{format_size(job['input_size'])}</td>
@@ -646,6 +801,9 @@ async def root():
         .stat-label{{font-size: 14px; color: #6c757d; text-transform: uppercase;}}
         table{{font-size: 14px;}} 
         th{{background-color: #f0f0f0 !important;}}
+        tr:hover{{background-color: #f8f9fa; cursor: pointer;}}
+        .job-link{{color: #007bff; text-decoration: none;}}
+        .job-link:hover{{text-decoration: underline;}}
         li{{margin-bottom: 5px;}}
         .status-good{{color: #28a745;}}
         .status-warning{{color: #ffc107;}}
