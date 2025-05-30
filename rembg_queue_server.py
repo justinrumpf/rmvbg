@@ -819,8 +819,8 @@ async def root():
     </head>
     <body>
     <div class="container">
-        <h1>🚀 Threaded Image Processing API Dashboard</h1>
-        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
+        <h1>🚀 Image Processing API Dashboard</h1>
+        <p><strong>Status:</strong> <span class="status-good">RUNNING</span></p>
         
         <div class="stats-grid">
             <div class="stat-card">
