@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP Q---
+# --- CREATE DIRECTORIES AT THE VERY TOP 11---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -510,7 +510,31 @@ async def job_details(request: Request, job_id: str):
         response_data["error_message"] = job_info.get("error_message")
     return JSONResponse(content=response_data)
 
-# --- Background Worker (now truly async) ---
+# --- Background Cleanup Task ---
+async def cleanup_old_results():
+    """Clean up old completed jobs from results dict after 1 hour"""
+    while True:
+        try:
+            current_time = time.time()
+            expired_jobs = []
+            
+            for job_id, job_data in results.items():
+                completion_time = job_data.get("completion_time")
+                if completion_time and (current_time - completion_time) > 3600:  # 1 hour
+                    expired_jobs.append(job_id)
+            
+            for job_id in expired_jobs:
+                logger.info(f"Cleaning up old job from results: {job_id}")
+                del results[job_id]
+                
+            if expired_jobs:
+                logger.info(f"Cleaned up {len(expired_jobs)} old jobs from results dict")
+                
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}", exc_info=True)
+        
+        # Run cleanup every 10 minutes
+        await asyncio.sleep(600)
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
@@ -648,8 +672,11 @@ async def image_processing_worker(worker_id: int):
             source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
             original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
             
-            # Add to job history
+            # Add to job history but KEEP in results dict for status polling
             add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type, original_filename)
+            
+            # Store completion time for cleanup later
+            results[job_id]["completion_time"] = time.time()
             
             logger.info(
                 f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
@@ -682,10 +709,13 @@ async def image_processing_worker(worker_id: int):
                 t_job_end_error = time.perf_counter()
                 total_job_time_error = t_job_end_error - t_job_start
                 
-                # Add failed job to history
+                # Add failed job to history but KEEP in results dict for status polling
                 source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
                 original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
                 add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type, original_filename)
+                
+                # Store completion time for cleanup later
+                results[job_id]["completion_time"] = time.time()
                 
                 logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
             queue.task_done()
@@ -733,6 +763,10 @@ async def startup_event():
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
     logger.info(f"{MAX_CONCURRENT_TASKS} async workers started. Thread pools: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+    
+    # Start cleanup task
+    asyncio.create_task(cleanup_old_results())
+    logger.info("Background cleanup task started (removes completed jobs from results after 1 hour)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
