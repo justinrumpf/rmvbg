@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP 2---
+# --- CREATE DIRECTORIES AT THE VERY TOP ---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -85,6 +85,14 @@ EXPECTED_API_KEY = "secretApiKey"
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
 
+# Statistics and monitoring
+server_start_time = time.time()
+job_history = []  # List of completed jobs with stats
+total_jobs_completed = 0
+total_jobs_failed = 0
+total_processing_time = 0.0
+MAX_HISTORY_ITEMS = 50  # Keep last 50 jobs in history
+
 MIME_TO_EXT = {
     'image/jpeg': '.jpg',
     'image/png': '.png',
@@ -117,6 +125,51 @@ def format_size(num_bytes: int) -> str:
         return f"{num_bytes/1024:.2f} KB"
     else:
         return f"{num_bytes/1024**2:.2f} MB"
+
+def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown"):
+    """Add completed job to history for monitoring"""
+    global job_history, total_jobs_completed, total_jobs_failed, total_processing_time
+    
+    job_record = {
+        "job_id": job_id,
+        "timestamp": time.time(),
+        "status": status,
+        "total_time": total_time,
+        "input_size": input_size,
+        "output_size": output_size,
+        "model": model,
+        "source_type": source_type
+    }
+    
+    job_history.insert(0, job_record)  # Add to beginning
+    if len(job_history) > MAX_HISTORY_ITEMS:
+        job_history.pop()  # Remove oldest
+    
+    if status == "completed":
+        total_jobs_completed += 1
+        total_processing_time += total_time
+    else:
+        total_jobs_failed += 1
+
+def format_timestamp(timestamp: float) -> str:
+    """Format timestamp to readable string"""
+    import datetime
+    return datetime.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+def get_server_stats():
+    """Get current server statistics"""
+    uptime = time.time() - server_start_time
+    active_jobs = sum(1 for job in results.values() if job.get("status") not in ["done", "error"])
+    
+    return {
+        "uptime": uptime,
+        "queue_size": queue.qsize(),
+        "active_jobs": active_jobs,
+        "total_completed": total_jobs_completed,
+        "total_failed": total_jobs_failed,
+        "avg_processing_time": total_processing_time / max(total_jobs_completed, 1),
+        "recent_jobs": job_history
+    }
 
 # --- CPU-bound functions (run in thread pool) ---
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
@@ -438,6 +491,13 @@ async def image_processing_worker(worker_id: int):
 
             t_job_end = time.perf_counter()
             total_job_time = t_job_end - t_job_start
+            
+            # Determine source type for monitoring
+            source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
+            
+            # Add to job history
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type)
+            
             logger.info(
                 f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
                 f"    Input: {format_size(input_size_bytes)} → Output: {format_size(output_size_bytes)}\n"
@@ -468,6 +528,11 @@ async def image_processing_worker(worker_id: int):
             if results.get(job_id, {}).get("status") == "error":
                 t_job_end_error = time.perf_counter()
                 total_job_time_error = t_job_end_error - t_job_start
+                
+                # Add failed job to history
+                source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type)
+                
                 logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
             queue.task_done()
 
@@ -535,23 +600,113 @@ app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_image
 # --- Root Endpoint ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
+    stats = get_server_stats()
+    
     logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
     if ENABLE_LOGO_WATERMARK and prepared_logo_image:
         logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
     elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
         logo_status += " (Enabled but not loaded/found)"
 
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API</title>
-    <style>body{{font-family:sans-serif;margin:20px}} li{{margin-bottom: 5px;}}</style></head>
-    <body><h1>Threaded Image Processing API</h1>
-    <p>Background removal uses <b>true async processing</b> with thread pools for CPU-bound operations.</p>
-    <p>Settings:<ul>
-    <li>Async Workers: {MAX_CONCURRENT_TASKS}</li>
-    <li>CPU Thread Pool: {CPU_THREAD_POOL_SIZE}</li>
-    <li>PIL Thread Pool: {PIL_THREAD_POOL_SIZE}</li>
-    <li>Queue Capacity: {MAX_QUEUE_SIZE}</li>
-    <li>Logo Watermarking: {logo_status}</li>
-    </ul></p></body></html>"""
+    # Format uptime
+    uptime_hours = stats["uptime"] / 3600
+    uptime_str = f"{uptime_hours:.1f} hours" if uptime_hours >= 1 else f"{stats['uptime']:.0f} seconds"
+    
+    # Build recent jobs table
+    recent_jobs_html = ""
+    if stats["recent_jobs"]:
+        recent_jobs_html = "<h3>Recent Jobs</h3><table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>"
+        recent_jobs_html += "<tr style='background-color: #f0f0f0;'><th>Time</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Input Size</th><th>Output Size</th><th>Model</th><th>Source</th></tr>"
+        
+        for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
+            status_color = "#4CAF50" if job["status"] == "completed" else "#f44336"
+            recent_jobs_html += f"""
+            <tr>
+                <td>{format_timestamp(job['timestamp'])}</td>
+                <td style='font-family: monospace; font-size: 10px;'>{job['job_id'][:8]}...</td>
+                <td style='color: {status_color}; font-weight: bold;'>{job['status'].upper()}</td>
+                <td>{job['total_time']:.2f}s</td>
+                <td>{format_size(job['input_size'])}</td>
+                <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
+                <td>{job['model']}</td>
+                <td>{job['source_type']}</td>
+            </tr>
+            """
+        recent_jobs_html += "</table>"
+    else:
+        recent_jobs_html = "<h3>Recent Jobs</h3><p>No jobs processed yet.</p>"
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
+    <style>
+        body{{font-family:sans-serif;margin:20px; background-color: #f9f9f9;}} 
+        .container{{max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);}}
+        .stats-grid{{display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;}}
+        .stat-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; text-align: center;}}
+        .stat-value{{font-size: 24px; font-weight: bold; color: #007bff; margin-bottom: 5px;}}
+        .stat-label{{font-size: 14px; color: #6c757d; text-transform: uppercase;}}
+        table{{font-size: 14px;}} 
+        th{{background-color: #f0f0f0 !important;}}
+        li{{margin-bottom: 5px;}}
+        .status-good{{color: #28a745;}}
+        .status-warning{{color: #ffc107;}}
+        .status-error{{color: #dc3545;}}
+    </style>
+    <script>
+        function refreshPage() {{
+            location.reload();
+        }}
+        // Auto refresh every 30 seconds
+        setTimeout(refreshPage, 30000);
+    </script>
+    </head>
+    <body>
+    <div class="container">
+        <h1>🚀 Threaded Image Processing API Dashboard</h1>
+        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{uptime_str}</div>
+                <div class="stat-label">Uptime</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['queue_size']}</div>
+                <div class="stat-label">Queue Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['active_jobs']}</div>
+                <div class="stat-label">Active Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-good">{stats['total_completed']}</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-error">{stats['total_failed']}</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
+                <div class="stat-label">Avg Process Time</div>
+            </div>
+        </div>
+
+        <h3>Configuration</h3>
+        <ul>
+            <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
+            <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
+            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
+            <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
+            <li><strong>Logo Watermarking:</strong> {logo_status}</li>
+        </ul>
+
+        {recent_jobs_html}
+        
+        <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
+            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+        </p>
+    </div>
+    </body></html>"""
 
 # --- Main Execution ---
 if __name__ == "__main__":
