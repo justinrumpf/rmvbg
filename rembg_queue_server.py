@@ -6,15 +6,17 @@ import aiofiles
 import logging
 import httpx
 import urllib.parse
-import time # <--- ADDED IMPORT
+import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP ---
+# --- CREATE DIRECTORIES AT THE VERY TOP 2---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s') # Added format
-logger = logging.getLogger(__name__) # This will use the module name, e.g., '__main__' or your script's filename
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 try:
     os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
@@ -54,9 +56,13 @@ app.add_middleware(
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 35 # Keep this, but actual times will be logged
+ESTIMATED_TIME_PER_JOB = 35
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
+
+# Thread pool configuration
+CPU_THREAD_POOL_SIZE = 4  # Adjust based on your CPU cores
+PIL_THREAD_POOL_SIZE = 4  # For PIL operations
 
 ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
@@ -74,6 +80,10 @@ prepared_logo_image = None
 queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results: dict = {}
 EXPECTED_API_KEY = "secretApiKey"
+
+# Thread pools for CPU-bound operations
+cpu_executor: ThreadPoolExecutor = None
+pil_executor: ThreadPoolExecutor = None
 
 MIME_TO_EXT = {
     'image/jpeg': '.jpg',
@@ -108,6 +118,69 @@ def format_size(num_bytes: int) -> str:
     else:
         return f"{num_bytes/1024**2:.2f} MB"
 
+# --- CPU-bound functions (run in thread pool) ---
+def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
+    """Synchronous rembg processing - runs in thread pool"""
+    session = new_session(model_name)
+    output_bytes = remove(
+        input_bytes,
+        session=session,
+        post_process_mask=True,
+        alpha_matting=True
+    )
+    return output_bytes
+
+def process_pil_sync(
+    input_bytes: bytes, 
+    target_size: int, 
+    prepared_logo: Image.Image = None,
+    enable_logo: bool = False,
+    logo_margin: int = 20
+) -> bytes:
+    """Synchronous PIL processing - runs in thread pool"""
+    # Open and convert to RGBA
+    img_rgba = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
+    
+    # Create white background and paste
+    white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255))
+    white_bg_canvas.paste(img_rgba, (0, 0), img_rgba)
+    img_on_white_bg = white_bg_canvas
+    
+    # Get dimensions and validate
+    original_width, original_height = img_on_white_bg.size
+    if original_width == 0 or original_height == 0:
+        raise ValueError("Image dimensions zero after BG processing")
+    
+    # Resize to fit target size while maintaining aspect ratio
+    ratio = min(target_size / original_width, target_size / original_height)
+    new_width, new_height = int(original_width * ratio), int(original_height * ratio)
+    img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    # Create square canvas and center the image
+    square_canvas = Image.new("RGB", (target_size, target_size), (255, 255, 255))
+    paste_x, paste_y = (target_size - new_width) // 2, (target_size - new_height) // 2
+    square_canvas.paste(img_resized_on_white, (paste_x, paste_y))
+    
+    # Add logo watermark if enabled
+    if enable_logo and prepared_logo:
+        if square_canvas.mode != 'RGBA':
+            square_canvas = square_canvas.convert('RGBA')
+        logo_w, logo_h = prepared_logo.size
+        logo_pos_x, logo_pos_y = logo_margin, target_size - logo_h - logo_margin
+        square_canvas.paste(prepared_logo, (logo_pos_x, logo_pos_y), prepared_logo)
+    
+    # Ensure final image is RGB
+    final_image = square_canvas
+    if final_image.mode == 'RGBA':
+        final_opaque_canvas = Image.new("RGB", final_image.size, (255, 255, 255))
+        final_opaque_canvas.paste(final_image, mask=final_image.split()[3])
+        final_image = final_opaque_canvas
+    
+    # Convert to bytes
+    output_buffer = io.BytesIO()
+    final_image.save(output_buffer, 'WEBP', quality=90, background=(255, 255, 255))
+    return output_buffer.getvalue()
+
 # --- API Endpoints ---
 @app.post("/submit")
 async def submit_json_image_for_processing(
@@ -122,7 +195,7 @@ async def submit_json_image_for_processing(
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     try:
-        queue.put_nowait((job_id, str(body.image), body.model, True)) # True for ignored post_process flag
+        queue.put_nowait((job_id, str(body.image), body.model, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue is full. Rejecting JSON request for image {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded (queue full). Max: {MAX_QUEUE_SIZE}")
@@ -184,7 +257,7 @@ async def submit_form_image_for_processing(
 
     file_uri_for_queue = f"file://{original_file_path}"
     try:
-        queue.put_nowait((job_id, file_uri_for_queue, model, True)) # True for ignored post_process flag
+        queue.put_nowait((job_id, file_uri_for_queue, model, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue is full. Rejecting form request for image {original_filename_from_upload} (job {job_id}).")
         if os.path.exists(original_file_path):
@@ -224,7 +297,7 @@ async def check_status(request: Request, job_id: str):
     }
     if job_info.get("original_local_path"):
         original_filename = os.path.basename(job_info["original_local_path"])
-        response_data["downloaded_original_image_url"] = f"{public_url_base}/originals/{original_filename}"
+        response_data["original_image_url"] = f"{public_url_base}/originals/{original_filename}"
     if job_info.get("status") == "done" and job_info.get("processed_path"):
         processed_filename = os.path.basename(job_info["processed_path"])
         response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
@@ -232,16 +305,16 @@ async def check_status(request: Request, job_id: str):
         response_data["error_message"] = job_info.get("error_message")
     return JSONResponse(content=response_data)
 
-# --- Background Worker ---
+# --- Background Worker (now truly async) ---
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
 
     while True:
-        job_id, image_source_str, model_name, _ = await queue.get() # 4th item (post_process_flag) is ignored
+        job_id, image_source_str, model_name, _ = await queue.get()
 
         t_job_start = time.perf_counter()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}. Applying Alpha Matting & Post-Processing.")
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
 
         if job_id not in results:
             logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
@@ -257,9 +330,10 @@ async def image_processing_worker(worker_id: int):
         output_size_bytes: int = 0
 
         try:
+            # === PHASE 1: INPUT FETCH (I/O bound - async) ===
             t_input_fetch_start = time.perf_counter()
             if image_source_str.startswith("file://"):
-                results[job_id]["status"] = "processing_local_file"
+                results[job_id]["status"] = "loading_file"
                 local_path_from_uri = image_source_str[len("file://"):]
                 if not os.path.exists(local_path_from_uri):
                     raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path_from_uri}")
@@ -267,9 +341,7 @@ async def image_processing_worker(worker_id: int):
                 async with aiofiles.open(local_path_from_uri, 'rb') as f:
                     input_bytes_for_rembg = await f.read()
                 input_size_bytes = len(input_bytes_for_rembg)
-                t_input_fetch_end = time.perf_counter()
-                input_fetch_time = t_input_fetch_end - t_input_fetch_start
-                logger.info(f"Job {job_id} (Worker {worker_id}): Read local file {local_path_from_uri} ({format_size(input_size_bytes)}) in {input_fetch_time:.4f}s.")
+                logger.info(f"Job {job_id} (Worker {worker_id}): Loaded local file ({format_size(input_size_bytes)})")
 
             elif image_source_str.startswith(("http://", "https://")):
                 results[job_id]["status"] = "downloading"
@@ -280,13 +352,11 @@ async def image_processing_worker(worker_id: int):
 
                 input_bytes_for_rembg = await img_response.aread()
                 input_size_bytes = len(input_bytes_for_rembg)
-                t_input_fetch_end = time.perf_counter()
-                input_fetch_time = t_input_fetch_end - t_input_fetch_start
-                logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)} from {image_source_str} in {input_fetch_time:.4f}s.")
+                logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)}")
 
+                # Handle content type detection and save original
                 original_content_type_header = img_response.headers.get("content-type", "unknown")
                 content_type = original_content_type_header.lower()
-
                 if content_type == "application/octet-stream" or not content_type.startswith("image/"):
                     file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
                     potential_ct = None
@@ -302,117 +372,123 @@ async def image_processing_worker(worker_id: int):
                 temp_original_filename = f"{job_id}_original_downloaded{extension}"
                 downloaded_original_path = os.path.join(UPLOADS_DIR, temp_original_filename)
                 results[job_id]["original_local_path"] = downloaded_original_path
-                async with aiofiles.open(downloaded_original_path, 'wb') as out_file: # Save downloaded original
+                async with aiofiles.open(downloaded_original_path, 'wb') as out_file:
                     await out_file.write(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (Worker {worker_id}): Saved downloaded original to {downloaded_original_path}")
+                logger.info(f"Job {job_id} (Worker {worker_id}): Saved downloaded original")
             else:
                 raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
 
             if input_bytes_for_rembg is None:
                 raise ValueError(f"Image content for rembg is None for job {job_id}.")
 
+            t_input_fetch_end = time.perf_counter()
+            input_fetch_time = t_input_fetch_end - t_input_fetch_start
+
+            # === PHASE 2: REMBG PROCESSING (CPU bound - thread pool) ===
             results[job_id]["status"] = "processing_rembg"
             logger.info(f"Job {job_id} (Worker {worker_id}): Starting rembg processing (model: {model_name})...")
+            
             t_rembg_start = time.perf_counter()
-            session = new_session(model_name)
-            output_bytes_with_alpha = remove(
+            # Run rembg in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            output_bytes_with_alpha = await loop.run_in_executor(
+                cpu_executor,
+                process_rembg_sync,
                 input_bytes_for_rembg,
-                session=session,
-                post_process_mask=True,
-                alpha_matting=True
+                model_name
             )
             t_rembg_end = time.perf_counter()
             rembg_time = t_rembg_end - t_rembg_start
-            logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s.")
+            logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s")
 
-            results[job_id]["status"] = "processing_pil"
-            logger.info(f"Job {job_id} (Worker {worker_id}): Starting PIL processing (resize, white BG, watermark)...")
+            # === PHASE 3: PIL PROCESSING (CPU bound - thread pool) ===
+            results[job_id]["status"] = "processing_image"
+            logger.info(f"Job {job_id} (Worker {worker_id}): Starting PIL processing...")
+            
             t_pil_start = time.perf_counter()
-            img_rgba = Image.open(io.BytesIO(output_bytes_with_alpha)).convert("RGBA")
-
-            white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255))
-            white_bg_canvas.paste(img_rgba, (0, 0), img_rgba)
-            img_on_white_bg = white_bg_canvas
-
-            original_width, original_height = img_on_white_bg.size
-            if original_width == 0 or original_height == 0:
-                raise ValueError(f"Image dimensions zero after BG processing for job {job_id}.")
-
-            ratio = min(TARGET_SIZE / original_width, TARGET_SIZE / original_height)
-            new_width, new_height = int(original_width * ratio), int(original_height * ratio)
-            img_resized_on_white = img_on_white_bg.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-            square_canvas = Image.new("RGB", (TARGET_SIZE, TARGET_SIZE), (255, 255, 255))
-            paste_x, paste_y = (TARGET_SIZE - new_width) // 2, (TARGET_SIZE - new_height) // 2
-            square_canvas.paste(img_resized_on_white, (paste_x, paste_y))
-
-            if ENABLE_LOGO_WATERMARK and prepared_logo_image:
-                if square_canvas.mode != 'RGBA':
-                    square_canvas = square_canvas.convert('RGBA')
-                logo_w, logo_h = prepared_logo_image.size
-                logo_pos_x, logo_pos_y = LOGO_MARGIN, TARGET_SIZE - logo_h - LOGO_MARGIN
-                square_canvas.paste(prepared_logo_image, (logo_pos_x, logo_pos_y), prepared_logo_image)
-
-            final_image_to_save = square_canvas
-            if final_image_to_save.mode == 'RGBA':
-                 final_opaque_canvas = Image.new("RGB", final_image_to_save.size, (255,255,255))
-                 final_opaque_canvas.paste(final_image_to_save, mask=final_image_to_save.split()[3])
-                 final_image_to_save = final_opaque_canvas
+            # Run PIL processing in thread pool
+            processed_image_bytes = await loop.run_in_executor(
+                pil_executor,
+                process_pil_sync,
+                output_bytes_with_alpha,
+                TARGET_SIZE,
+                prepared_logo_image,
+                ENABLE_LOGO_WATERMARK,
+                LOGO_MARGIN
+            )
             t_pil_end = time.perf_counter()
             pil_time = t_pil_end - t_pil_start
-            logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s.")
+            logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s")
 
+            # === PHASE 4: SAVE TO DISK (I/O bound - async) ===
+            results[job_id]["status"] = "saving"
             processed_filename = f"{job_id}.webp"
             processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
 
-            logger.info(f"Job {job_id} (Worker {worker_id}): Saving processed image to {processed_file_path}...")
             t_save_start = time.perf_counter()
-            final_image_to_save.save(processed_file_path, 'WEBP', quality=90, background=(255,255,255))
+            async with aiofiles.open(processed_file_path, 'wb') as out_file:
+                await out_file.write(processed_image_bytes)
             t_save_end = time.perf_counter()
             save_time = t_save_end - t_save_start
-            output_size_bytes = os.path.getsize(processed_file_path)
-            logger.info(f"Job {job_id} (Worker {worker_id}): Saved processed image ({format_size(output_size_bytes)}) in {save_time:.4f}s.")
+            output_size_bytes = len(processed_image_bytes)
 
+            # === JOB COMPLETION ===
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_file_path
 
             t_job_end = time.perf_counter()
             total_job_time = t_job_end - t_job_start
             logger.info(
-                f"Job {job_id} (Worker {worker_id}) COMPLETED successfully. Processed: {processed_file_path}\n"
-                f"    Input Size: {format_size(input_size_bytes)}, Output Size: {format_size(output_size_bytes)}\n"
-                f"    Timings: InputFetch={input_fetch_time:.4f}s, Rembg={rembg_time:.4f}s, PIL={pil_time:.4f}s, Save={save_time:.4f}s\n"
-                f"    Total Job Time: {total_job_time:.4f}s"
+                f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
+                f"    Input: {format_size(input_size_bytes)} → Output: {format_size(output_size_bytes)}\n"
+                f"    Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s"
             )
 
         except FileNotFoundError as e:
             logger.error(f"Job {job_id} (Worker {worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {str(e)}"
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"File not found: {str(e)}"
         except httpx.HTTPStatusError as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: HTTPStatusError downloading {image_source_str}: {e.response.status_code}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} from {image_source_str}."
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: HTTPStatusError downloading: {e.response.status_code}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code}"
         except httpx.RequestError as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: RequestError downloading {image_source_str}: {e}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error downloading from {image_source_str}: {type(e).__name__}."
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: RequestError downloading: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Network error: {type(e).__name__}"
         except (ValueError, IOError, OSError) as e:
             logger.error(f"Job {job_id} (Worker {worker_id}) Error: Data/file processing error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Data or file error: {str(e)}"
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Processing error: {str(e)}"
         except Exception as e:
-            logger.critical(f"Job {job_id} (Worker {worker_id}) CRITICAL Error: Unexpected processing error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Unexpected processing error: {str(e)}"
+            logger.critical(f"Job {job_id} (Worker {worker_id}) CRITICAL Error: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Unexpected error: {str(e)}"
         finally:
             if results.get(job_id, {}).get("status") == "error":
                 t_job_end_error = time.perf_counter()
                 total_job_time_error = t_job_end_error - t_job_start
-                logger.info(f"Job {job_id} (Worker {worker_id}) FAILED. Total time before failure: {total_job_time_error:.4f}s")
+                logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
             queue.task_done()
 
 # --- Application Startup Logic ---
 @app.on_event("startup")
 async def startup_event():
-    global prepared_logo_image
+    global prepared_logo_image, cpu_executor, pil_executor
     logger.info("Application startup event running...")
 
+    # Initialize thread pools
+    cpu_executor = ThreadPoolExecutor(
+        max_workers=CPU_THREAD_POOL_SIZE,
+        thread_name_prefix="RembgCPU"
+    )
+    pil_executor = ThreadPoolExecutor(
+        max_workers=PIL_THREAD_POOL_SIZE,
+        thread_name_prefix="PILCPU"
+    )
+    logger.info(f"Thread pools initialized: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+
+    # Logo loading
     if ENABLE_LOGO_WATERMARK:
         logger.info(f"Logo watermarking ENABLED. Attempting load from: {LOGO_PATH}")
         if os.path.exists(LOGO_PATH):
@@ -434,9 +510,23 @@ async def startup_event():
         logger.info("Logo watermarking DISABLED.")
         prepared_logo_image = None
 
+    # Start async workers
     for i in range(MAX_CONCURRENT_TASKS):
         asyncio.create_task(image_processing_worker(worker_id=i+1))
-    logger.info(f"{MAX_CONCURRENT_TASKS} workers started. Queue max size: {MAX_QUEUE_SIZE}. ETA per job (rough estimate): {ESTIMATED_TIME_PER_JOB}s.")
+    logger.info(f"{MAX_CONCURRENT_TASKS} async workers started. Thread pools: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global cpu_executor, pil_executor
+    logger.info("Application shutdown event running...")
+    
+    if cpu_executor:
+        cpu_executor.shutdown(wait=True)
+        logger.info("CPU thread pool shut down")
+    
+    if pil_executor:
+        pil_executor.shutdown(wait=True)
+        logger.info("PIL thread pool shut down")
 
 # --- Static File Serving ---
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
@@ -453,11 +543,13 @@ async def root():
 
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API</title>
     <style>body{{font-family:sans-serif;margin:20px}} li{{margin-bottom: 5px;}}</style></head>
-    <body><h1>Image Processing API Running</h1><p>Background removal now <b>always uses alpha matting and post-processing</b> for highest quality.</p>
+    <body><h1>Threaded Image Processing API</h1>
+    <p>Background removal uses <b>true async processing</b> with thread pools for CPU-bound operations.</p>
     <p>Settings:<ul>
-    <li>Workers: {MAX_CONCURRENT_TASKS}</li>
+    <li>Async Workers: {MAX_CONCURRENT_TASKS}</li>
+    <li>CPU Thread Pool: {CPU_THREAD_POOL_SIZE}</li>
+    <li>PIL Thread Pool: {PIL_THREAD_POOL_SIZE}</li>
     <li>Queue Capacity: {MAX_QUEUE_SIZE}</li>
-    <li>Est. Time per Job: {ESTIMATED_TIME_PER_JOB} seconds (actual times logged per job)</li>
     <li>Logo Watermarking: {logo_status}</li>
     </ul></p></body></html>"""
 
