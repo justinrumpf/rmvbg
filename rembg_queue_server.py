@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-# --- CREATE DIRECTORIES AT THE VERY TOP 11---
+# --- CREATE DIRECTORIES AT THE VERY TOP 123---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -338,6 +338,87 @@ async def submit_form_image_for_processing(
         "eta": eta_seconds,
         "status_check_url": status_check_url
     }
+
+@app.get("/status/{job_id}")
+async def check_job_status(request: Request, job_id: str):
+    """Check status of a specific job by ID"""
+    logger.info(f"Status check requested for job_id: {job_id}")
+    logger.info(f"Current results dict has {len(results)} jobs: {list(results.keys())[:5]}...")
+    logger.info(f"Job history has {len(job_history)} jobs")
+    
+    job_info = results.get(job_id)
+    logger.info(f"Job {job_id} found in results: {job_info is not None}")
+    
+    # If not in active results, check job history for completed/failed jobs
+    if not job_info:
+        historical_job = None
+        for job in job_history:
+            if job["job_id"] == job_id:
+                historical_job = job
+                break
+        
+        logger.info(f"Job {job_id} found in history: {historical_job is not None}")
+        
+        if historical_job:
+            # Reconstruct response for historical job
+            public_url_base = get_proxy_url(request)
+            status = "done" if historical_job["status"] == "completed" else "error"
+            
+            response_data = {
+                "job_id": job_id,
+                "status": status,
+                "input_image_url": f"(historical: {historical_job.get('original_filename', 'unknown')})",
+                "status_check_url": f"{public_url_base}/status/{job_id}"
+            }
+            
+            # Check if files still exist and add URLs
+            # Check for original image
+            original_extensions = ['.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
+            for ext in original_extensions:
+                original_filename = f"{job_id}_original{ext}"
+                original_path = os.path.join(UPLOADS_DIR, original_filename)
+                if os.path.exists(original_path):
+                    response_data["original_image_url"] = f"{public_url_base}/originals/{original_filename}"
+                    break
+            
+            # Check for processed image
+            if status == "done":
+                processed_filename = f"{job_id}.webp"
+                processed_path = os.path.join(PROCESSED_DIR, processed_filename)
+                if os.path.exists(processed_path):
+                    response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
+            else:
+                response_data["error_message"] = f"Job failed after {historical_job['total_time']:.2f}s"
+            
+            logger.info(f"Returning historical job data for {job_id}")
+            return JSONResponse(content=response_data)
+    
+    # Job not found in either location
+    if not job_info:
+        logger.error(f"Job {job_id} not found in results or history - returning 404")
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Handle active job (original logic)
+    public_url_base = get_proxy_url(request)
+    response_data = {
+        "job_id": job_id, 
+        "status": job_info.get("status"),
+        "input_image_url": job_info.get("input_image_url"), 
+        "status_check_url": job_info.get("status_check_url")
+    }
+    
+    if job_info.get("original_local_path"):
+        original_filename = os.path.basename(job_info["original_local_path"])
+        response_data["original_image_url"] = f"{public_url_base}/originals/{original_filename}"
+    
+    if job_info.get("status") == "done" and job_info.get("processed_path"):
+        processed_filename = os.path.basename(job_info["processed_path"])
+        response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
+    elif job_info.get("status") == "error":
+        response_data["error_message"] = job_info.get("error_message")
+    
+    logger.info(f"Returning active job data for {job_id}: status={job_info.get('status')}")
+    return JSONResponse(content=response_data)
 
 @app.get("/job/{job_id}")
 async def job_details(request: Request, job_id: str):
