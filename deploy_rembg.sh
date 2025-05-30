@@ -17,8 +17,11 @@ fi
 cd rmvbg
 
 # 🔁 Prompt for Pod ID and update Python file
-read -p "🌐 Enter your RunPod Pod ID (e.g., abc123): " pod_id
-proxy_url="https://${pod_id}-7000.proxy.runpod.net"
+# read -p "🌐 Enter your RunPod Pod ID (e.g., abc123): " pod_id
+# proxy_url="https://${pod_id}-7000.proxy.runpod.net"
+
+# Use POD ID in proxy url
+proxy_url="https://${RUNPOD_POD_ID}-7000.proxy.runpod.net"
 
 echo "🛠️  Inserting public proxy URL into rembg_queue_server.py..."
 sed -i "s|{public_url}|$proxy_url|g" rembg_queue_server.py
