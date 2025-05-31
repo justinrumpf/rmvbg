@@ -19,3 +19,4 @@ scipy
 opencv-python
 pillow_heif
 pynvml
+psutil
