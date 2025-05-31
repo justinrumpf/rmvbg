@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP V1---
+# --- CREATE DIRECTORIES AT THE VERY TOP 123---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -64,6 +64,11 @@ ESTIMATED_TIME_PER_JOB = 35
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
 
+# --- Monitoring Configuration ---
+MONITORING_HISTORY_MINUTES = 60  # Keep 60 minutes of history
+MONITORING_SAMPLE_INTERVAL = 5   # Sample every 5 seconds
+MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
+
 # Thread pool configuration
 CPU_THREAD_POOL_SIZE = 4  # Adjust based on your CPU cores
 PIL_THREAD_POOL_SIZE = 4  # For PIL operations
@@ -72,11 +77,6 @@ ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
-
-# --- Monitoring Configuration ---
-MONITORING_HISTORY_MINUTES = 60  # Keep 60 minutes of history
-MONITORING_SAMPLE_INTERVAL = 5   # Sample every 5 seconds
-MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
 
 # --- Directory and File Paths ---
 BASE_DIR = BASE_DIR_STATIC
@@ -102,7 +102,7 @@ total_jobs_failed = 0
 total_processing_time = 0.0
 MAX_HISTORY_ITEMS = 50  # Keep last 50 jobs in history
 
-# --- NEW: Worker and System Monitoring ---
+# --- Worker and System Monitoring ---
 worker_activity = defaultdict(deque)  # worker_id -> deque of (timestamp, activity_type)
 system_metrics = deque(maxlen=MAX_MONITORING_SAMPLES)  # (timestamp, cpu%, memory%, gpu_info)
 worker_lock = threading.Lock()
@@ -705,3 +705,674 @@ async def job_details(request: Request, job_id: str):
     </body>
     </html>
     """, status_code=200)
+
+# --- Background Cleanup Task ---
+async def cleanup_old_results():
+    """Clean up old completed jobs from results dict after 1 hour"""
+    while True:
+        try:
+            current_time = time.time()
+            expired_jobs = []
+            
+            for job_id, job_data in results.items():
+                completion_time = job_data.get("completion_time")
+                if completion_time and (current_time - completion_time) > 3600:  # 1 hour
+                    expired_jobs.append(job_id)
+            
+            for job_id in expired_jobs:
+                logger.info(f"Cleaning up old job from results: {job_id}")
+                del results[job_id]
+                
+            if expired_jobs:
+                logger.info(f"Cleaned up {len(expired_jobs)} old jobs from results dict")
+                
+        except Exception as e:
+            logger.error(f"Error in cleanup task: {e}", exc_info=True)
+        
+        # Run cleanup every 10 minutes
+        await asyncio.sleep(600)
+
+async def image_processing_worker(worker_id: int):
+    logger.info(f"Worker {worker_id} started. Listening for jobs...")
+    global prepared_logo_image
+
+    while True:
+        job_id, image_source_str, model_name, _ = await queue.get()
+
+        t_job_start = time.perf_counter()
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
+
+        log_worker_activity(worker_id, WORKER_IDLE)  # Start as idle
+
+        if job_id not in results:
+            logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
+            queue.task_done()
+            continue
+
+        input_bytes_for_rembg: bytes | None = None
+        input_fetch_time: float = 0.0
+        rembg_time: float = 0.0
+        pil_time: float = 0.0
+        save_time: float = 0.0
+        input_size_bytes: int = 0
+        output_size_bytes: int = 0
+
+        try:
+            # === PHASE 1: INPUT FETCH (I/O bound - async) ===
+            log_worker_activity(worker_id, WORKER_FETCHING)
+            t_input_fetch_start = time.perf_counter()
+            if image_source_str.startswith("file://"):
+                results[job_id]["status"] = "loading_file"
+                local_path_from_uri = image_source_str[len("file://"):]
+                if not os.path.exists(local_path_from_uri):
+                    raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path_from_uri}")
+
+                async with aiofiles.open(local_path_from_uri, 'rb') as f:
+                    input_bytes_for_rembg = await f.read()
+                input_size_bytes = len(input_bytes_for_rembg)
+                logger.info(f"Job {job_id} (Worker {worker_id}): Loaded local file ({format_size(input_size_bytes)})")
+
+            elif image_source_str.startswith(("http://", "https://")):
+                results[job_id]["status"] = "downloading"
+                logger.info(f"Job {job_id} (Worker {worker_id}): Downloading from {image_source_str}...")
+                async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+                    img_response = await client.get(image_source_str)
+                    img_response.raise_for_status()
+
+                input_bytes_for_rembg = await img_response.aread()
+                input_size_bytes = len(input_bytes_for_rembg)
+                logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)}")
+
+                # Handle content type detection and save original
+                original_content_type_header = img_response.headers.get("content-type", "unknown")
+                content_type = original_content_type_header.lower()
+                if content_type == "application/octet-stream" or not content_type.startswith("image/"):
+                    file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
+                    potential_ct = None
+                    if file_ext_from_url == ".webp": potential_ct = "image/webp"
+                    elif file_ext_from_url == ".png": potential_ct = "image/png"
+                    elif file_ext_from_url in [".jpg", ".jpeg"]: potential_ct = "image/jpeg"
+                    if potential_ct: content_type = potential_ct
+
+                if not content_type.startswith("image/"):
+                    raise ValueError(f"Invalid final content type '{content_type}' from URL. Not an image.")
+
+                extension = MIME_TO_EXT.get(content_type, ".bin")
+                temp_original_filename = f"{job_id}_original_downloaded{extension}"
+                downloaded_original_path = os.path.join(UPLOADS_DIR, temp_original_filename)
+                results[job_id]["original_local_path"] = downloaded_original_path
+                async with aiofiles.open(downloaded_original_path, 'wb') as out_file:
+                    await out_file.write(input_bytes_for_rembg)
+                logger.info(f"Job {job_id} (Worker {worker_id}): Saved downloaded original")
+            else:
+                raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
+
+            if input_bytes_for_rembg is None:
+                raise ValueError(f"Image content for rembg is None for job {job_id}.")
+
+            t_input_fetch_end = time.perf_counter()
+            input_fetch_time = t_input_fetch_end - t_input_fetch_start
+
+            # === PHASE 2: REMBG PROCESSING (CPU bound - thread pool) ===
+            log_worker_activity(worker_id, WORKER_PROCESSING_REMBG)
+            results[job_id]["status"] = "processing_rembg"
+            logger.info(f"Job {job_id} (Worker {worker_id}): Starting rembg processing (model: {model_name})...")
+            
+            t_rembg_start = time.perf_counter()
+            # Run rembg in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            output_bytes_with_alpha = await loop.run_in_executor(
+                cpu_executor,
+                process_rembg_sync,
+                input_bytes_for_rembg,
+                model_name
+            )
+            t_rembg_end = time.perf_counter()
+            rembg_time = t_rembg_end - t_rembg_start
+            logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s")
+
+            # === PHASE 3: PIL PROCESSING (CPU bound - thread pool) ===
+            log_worker_activity(worker_id, WORKER_PROCESSING_PIL)
+            results[job_id]["status"] = "processing_image"
+            logger.info(f"Job {job_id} (Worker {worker_id}): Starting PIL processing...")
+            
+            t_pil_start = time.perf_counter()
+            # Run PIL processing in thread pool
+            processed_image_bytes = await loop.run_in_executor(
+                pil_executor,
+                process_pil_sync,
+                output_bytes_with_alpha,
+                TARGET_SIZE,
+                prepared_logo_image,
+                ENABLE_LOGO_WATERMARK,
+                LOGO_MARGIN
+            )
+            t_pil_end = time.perf_counter()
+            pil_time = t_pil_end - t_pil_start
+            logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s")
+
+            # === PHASE 4: SAVE TO DISK (I/O bound - async) ===
+            log_worker_activity(worker_id, WORKER_SAVING)
+            results[job_id]["status"] = "saving"
+            processed_filename = f"{job_id}.webp"
+            processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
+
+            t_save_start = time.perf_counter()
+            async with aiofiles.open(processed_file_path, 'wb') as out_file:
+                await out_file.write(processed_image_bytes)
+            t_save_end = time.perf_counter()
+            save_time = t_save_end - t_save_start
+            output_size_bytes = len(processed_image_bytes)
+
+            # === JOB COMPLETION ===
+            log_worker_activity(worker_id, WORKER_IDLE)
+            results[job_id]["status"] = "done"
+            results[job_id]["processed_path"] = processed_file_path
+
+            t_job_end = time.perf_counter()
+            total_job_time = t_job_end - t_job_start
+            
+            # Determine source type for monitoring
+            source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
+            original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
+            
+            # Add to job history but KEEP in results dict for status polling
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type, original_filename)
+            
+            # Store completion time for cleanup later
+            results[job_id]["completion_time"] = time.time()
+            
+            logger.info(
+                f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
+                f"    Input: {format_size(input_size_bytes)} → Output: {format_size(output_size_bytes)}\n"
+                f"    Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s"
+            )
+
+        except FileNotFoundError as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"File not found: {str(e)}"
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: HTTPStatusError downloading: {e.response.status_code}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code}"
+        except httpx.RequestError as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: RequestError downloading: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Network error: {type(e).__name__}"
+        except (ValueError, IOError, OSError) as e:
+            logger.error(f"Job {job_id} (Worker {worker_id}) Error: Data/file processing error: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Processing error: {str(e)}"
+        except Exception as e:
+            logger.critical(f"Job {job_id} (Worker {worker_id}) CRITICAL Error: {e}", exc_info=True)
+            results[job_id]["status"] = "error"
+            results[job_id]["error_message"] = f"Unexpected error: {str(e)}"
+        finally:
+            if results.get(job_id, {}).get("status") == "error":
+                t_job_end_error = time.perf_counter()
+                total_job_time_error = t_job_end_error - t_job_start
+                
+                # Add failed job to history but KEEP in results dict for status polling
+                source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
+                original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type, original_filename)
+                
+                # Store completion time for cleanup later
+                results[job_id]["completion_time"] = time.time()
+                
+                logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
+            
+            log_worker_activity(worker_id, WORKER_IDLE)  # Back to idle
+            queue.task_done()
+
+# --- Application Startup Logic ---
+@app.on_event("startup")
+async def startup_event():
+    global prepared_logo_image, cpu_executor, pil_executor
+    logger.info("Application startup event running...")
+
+    # Initialize thread pools
+    cpu_executor = ThreadPoolExecutor(
+        max_workers=CPU_THREAD_POOL_SIZE,
+        thread_name_prefix="RembgCPU"
+    )
+    pil_executor = ThreadPoolExecutor(
+        max_workers=PIL_THREAD_POOL_SIZE,
+        thread_name_prefix="PILCPU"
+    )
+    logger.info(f"Thread pools initialized: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+
+    # Logo loading
+    if ENABLE_LOGO_WATERMARK:
+        logger.info(f"Logo watermarking ENABLED. Attempting load from: {LOGO_PATH}")
+        if os.path.exists(LOGO_PATH):
+            try:
+                logo = Image.open(LOGO_PATH).convert("RGBA")
+                if logo.width > LOGO_MAX_WIDTH:
+                    l_ratio = LOGO_MAX_WIDTH / logo.width
+                    l_new_width, l_new_height = LOGO_MAX_WIDTH, int(logo.height * l_ratio)
+                    logo = logo.resize((l_new_width, l_new_height), Image.Resampling.LANCZOS)
+                prepared_logo_image = logo
+                logger.info(f"Logo loaded. Dimensions: {prepared_logo_image.size}")
+            except Exception as e:
+                logger.error(f"Failed to load logo: {e}", exc_info=True)
+                prepared_logo_image = None
+        else:
+            logger.warning(f"Logo file not found at {LOGO_PATH}.")
+            prepared_logo_image = None
+    else:
+        logger.info("Logo watermarking DISABLED.")
+        prepared_logo_image = None
+
+    # Start async workers and monitoring
+    for i in range(MAX_CONCURRENT_TASKS):
+        asyncio.create_task(image_processing_worker(worker_id=i+1))
+    logger.info(f"{MAX_CONCURRENT_TASKS} async workers started. Thread pools: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+    
+    # Start cleanup task
+    asyncio.create_task(cleanup_old_results())
+    logger.info("Background cleanup task started (removes completed jobs from results after 1 hour)")
+    
+    # Start system monitoring
+    asyncio.create_task(system_monitor())
+    logger.info("System monitoring task started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global cpu_executor, pil_executor
+    logger.info("Application shutdown event running...")
+    
+    if cpu_executor:
+        cpu_executor.shutdown(wait=True)
+        logger.info("CPU thread pool shut down")
+    
+    if pil_executor:
+        pil_executor.shutdown(wait=True)
+        logger.info("PIL thread pool shut down")
+
+# --- Static File Serving ---
+app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
+app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
+
+# --- Root Endpoint (Index Page) ---
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def root():
+    stats = get_server_stats()
+    
+    logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
+    if ENABLE_LOGO_WATERMARK and prepared_logo_image:
+        logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
+    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
+        logo_status += " (Enabled but not loaded/found)"
+
+    # Format uptime
+    uptime_hours = stats["uptime"] / 3600
+    uptime_str = f"{uptime_hours:.1f} hours" if uptime_hours >= 1 else f"{stats['uptime']:.0f} seconds"
+    
+    # Get current system metrics for display
+    current_metrics = system_metrics[-1] if system_metrics else {
+        "cpu_percent": 0, "memory_percent": 0, "memory_used_gb": 0, 
+        "memory_total_gb": 0, "gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0
+    }
+    
+    # Build recent jobs table
+    recent_jobs_html = ""
+    if stats["recent_jobs"]:
+        recent_jobs_html = "<h3>Recent Jobs</h3><table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>"
+        recent_jobs_html += "<tr style='background-color: #f0f0f0;'><th>Time</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Input Size</th><th>Output Size</th><th>Model</th><th>Source</th></tr>"
+        
+        for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
+            status_color = "#4CAF50" if job["status"] == "completed" else "#f44336"
+            job_link = f"/job/{job['job_id']}"
+            recent_jobs_html += f"""
+            <tr style="cursor: pointer;" onclick="window.location.href='{job_link}'">
+                <td>{format_timestamp(job['timestamp'])}</td>
+                <td style='font-family: monospace; font-size: 10px;'><a href="{job_link}" style="text-decoration: none; color: #007bff;">{job['job_id'][:8]}...</a></td>
+                <td style='color: {status_color}; font-weight: bold;'>{job['status'].upper()}</td>
+                <td>{job['total_time']:.2f}s</td>
+                <td>{format_size(job['input_size'])}</td>
+                <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
+                <td>{job['model']}</td>
+                <td>{job['source_type']}</td>
+            </tr>
+            """
+        recent_jobs_html += "</table>"
+    else:
+        recent_jobs_html = "<h3>Recent Jobs</h3><p>No jobs processed yet.</p>"
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        body{{font-family:sans-serif;margin:20px; background-color: #f9f9f9;}} 
+        .container{{max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);}}
+        .stats-grid{{display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;}}
+        .stat-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; text-align: center;}}
+        .stat-value{{font-size: 24px; font-weight: bold; color: #007bff; margin-bottom: 5px;}}
+        .stat-label{{font-size: 14px; color: #6c757d; text-transform: uppercase;}}
+        .monitoring-section{{margin: 30px 0;}}
+        .charts-container{{display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;}}
+        .chart-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px;}}
+        .chart-title{{font-size: 18px; font-weight: bold; margin-bottom: 15px; color: #495057;}}
+        .chart-container{{position: relative; height: 300px;}}
+        table{{font-size: 14px;}} 
+        th{{background-color: #f0f0f0 !important;}}
+        tr:hover{{background-color: #f8f9fa; cursor: pointer;}}
+        .job-link{{color: #007bff; text-decoration: none;}}
+        .job-link:hover{{text-decoration: underline;}}
+        li{{margin-bottom: 5px;}}
+        .status-good{{color: #28a745;}}
+        .status-warning{{color: #ffc107;}}
+        .status-error{{color: #dc3545;}}
+        .system-metrics{{display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 20px 0;}}
+        .metric-card{{background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 6px; padding: 15px;}}
+        .metric-value{{font-size: 20px; font-weight: bold; margin-bottom: 5px;}}
+        .metric-label{{font-size: 12px; color: #6c757d; text-transform: uppercase;}}
+        @media (max-width: 1200px) {{
+            .charts-container {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+    </head>
+    <body>
+    <div class="container">
+        <h1>🚀 Threaded Image Processing API Dashboard</h1>
+        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{uptime_str}</div>
+                <div class="stat-label">Uptime</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['queue_size']}</div>
+                <div class="stat-label">Queue Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['active_jobs']}</div>
+                <div class="stat-label">Active Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-good">{stats['total_completed']}</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-error">{stats['total_failed']}</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
+                <div class="stat-label">Avg Process Time</div>
+            </div>
+        </div>
+
+        <div class="monitoring-section">
+            <h2>📊 Real-time Monitoring</h2>
+            
+            <div class="system-metrics">
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #dc3545;">{current_metrics['cpu_percent']:.1f}%</div>
+                    <div class="metric-label">CPU Usage</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #fd7e14;">{current_metrics['memory_percent']:.1f}%</div>
+                    <div class="metric-label">Memory Usage ({current_metrics['memory_used_gb']:.1f}GB / {current_metrics['memory_total_gb']:.1f}GB)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #6f42c1;">{current_metrics['gpu_utilization']:.0f}%</div>
+                    <div class="metric-label">GPU Usage ({current_metrics['gpu_used_mb']:.0f}MB / {current_metrics['gpu_total_mb']:.0f}MB)</div>
+                </div>
+            </div>
+            
+            <div class="charts-container">
+                <div class="chart-card">
+                    <div class="chart-title">🔧 Worker Thread Activity</div>
+                    <div class="chart-container">
+                        <canvas id="workerChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-title">💻 System Resources</div>
+                    <div class="chart-container">
+                        <canvas id="systemChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3>Configuration</h3>
+        <ul>
+            <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
+            <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
+            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
+            <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
+            <li><strong>Logo Watermarking:</strong> {logo_status}</li>
+        </ul>
+
+        {recent_jobs_html}
+        
+        <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
+            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+        </p>
+    </div>
+    
+    <script>
+        // Chart colors for workers
+        const workerColors = [
+            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
+            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
+        ];
+        
+        let workerChart, systemChart;
+
+        // Initialize charts
+        function initCharts() {{
+            // Worker Activity Chart
+            const workerCtx = document.getElementById('workerChart').getContext('2d');
+            workerChart = new Chart(workerCtx, {{
+                type: 'line',
+                data: {{
+                    labels: [],
+                    datasets: []
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            position: 'bottom',
+                            labels: {{
+                                boxWidth: 12,
+                                fontSize: 10
+                            }}
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            title: {{
+                                display: true,
+                                text: 'Activity Count'
+                            }}
+                        }},
+                        x: {{
+                            title: {{
+                                display: true,
+                                text: 'Time'
+                            }}
+                        }}
+                    }},
+                    elements: {{
+                        line: {{
+                            tension: 0.4
+                        }},
+                        point: {{
+                            radius: 2
+                        }}
+                    }}
+                }}
+            }});
+
+            // System Resources Chart
+            const systemCtx = document.getElementById('systemChart').getContext('2d');
+            systemChart = new Chart(systemCtx, {{
+                type: 'line',
+                data: {{
+                    labels: [],
+                    datasets: [
+                        {{
+                            label: 'CPU %',
+                            data: [],
+                            borderColor: '#dc3545',
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                            fill: false
+                        }},
+                        {{
+                            label: 'Memory %',
+                            data: [],
+                            borderColor: '#fd7e14',
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+                            fill: false
+                        }},
+                        {{
+                            label: 'GPU %',
+                            data: [],
+                            borderColor: '#6f42c1',
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+                            fill: false
+                        }}
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            position: 'bottom'
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            max: 100,
+                            title: {{
+                                display: true,
+                                text: 'Usage %'
+                            }}
+                        }},
+                        x: {{
+                            title: {{
+                                display: true,
+                                text: 'Time'
+                            }}
+                        }}
+                    }},
+                    elements: {{
+                        line: {{
+                            tension: 0.4
+                        }},
+                        point: {{
+                            radius: 1
+                        }}
+                    }}
+                }}
+            }});
+        }}
+
+        // Update charts with new data
+        async function updateCharts() {{
+            try {{
+                // Fetch worker data
+                const workerResponse = await fetch('/api/monitoring/workers');
+                const workerData = await workerResponse.json();
+                
+                // Fetch system data
+                const systemResponse = await fetch('/api/monitoring/system');
+                const systemData = await systemResponse.json();
+                
+                // Update worker chart
+                updateWorkerChart(workerData);
+                
+                // Update system chart
+                updateSystemChart(systemData);
+                
+            }} catch (error) {{
+                console.error('Error updating charts:', error);
+            }}
+        }}
+
+        function updateWorkerChart(data) {{
+            // Process worker data for chart
+            const workerIds = Object.keys(data).sort();
+            if (workerIds.length === 0) return;
+            
+            // Get time labels from first worker
+            const firstWorker = data[workerIds[0]];
+            const labels = firstWorker.map(bucket => {{
+                const date = new Date(bucket.timestamp * 1000);
+                return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit'}});
+            }});
+            
+            // Create datasets for each worker
+            const datasets = workerIds.map((workerId, index) => {{
+                const workerBuckets = data[workerId];
+                const totalActivity = workerBuckets.map(bucket => 
+                    bucket.fetching + bucket.rembg + bucket.pil + bucket.saving
+                );
+                
+                return {{
+                    label: workerId.replace('worker_', 'Worker '),
+                    data: totalActivity,
+                    borderColor: workerColors[index % workerColors.length],
+                    backgroundColor: workerColors[index % workerColors.length] + '20',
+                    fill: false
+                }};
+            }});
+            
+            workerChart.data.labels = labels;
+            workerChart.data.datasets = datasets;
+            workerChart.update('none');
+        }}
+
+        function updateSystemChart(data) {{
+            if (data.length === 0) return;
+            
+            const labels = data.map(metric => {{
+                const date = new Date(metric.timestamp * 1000);
+                return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit'}});
+            }});
+            
+            const cpuData = data.map(metric => metric.cpu_percent);
+            const memoryData = data.map(metric => metric.memory_percent);
+            const gpuData = data.map(metric => metric.gpu_utilization);
+            
+            systemChart.data.labels = labels;
+            systemChart.data.datasets[0].data = cpuData;
+            systemChart.data.datasets[1].data = memoryData;
+            systemChart.data.datasets[2].data = gpuData;
+            systemChart.update('none');
+        }}
+
+        // Initialize everything when page loads
+        document.addEventListener('DOMContentLoaded', function() {{
+            initCharts();
+            updateCharts();
+            
+            // Update charts every 10 seconds
+            setInterval(updateCharts, 10000);
+        }});
+
+        // Page refresh function
+        function refreshPage() {{
+            location.reload();
+        }}
+        
+        // Auto refresh every 30 seconds
+        setTimeout(refreshPage, 30000);
+    </script>
+    </body></html>"""
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting Uvicorn server for local development...")
+    uvicorn.run(app, host="0.0.0.0", port=7000)
