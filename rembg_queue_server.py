@@ -7,8 +7,12 @@ import logging
 import httpx
 import urllib.parse
 import time
+import psutil
+import threading
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from datetime import datetime, timedelta
 
 # --- CREATE DIRECTORIES AT THE VERY TOP 123---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
@@ -69,6 +73,11 @@ LOGO_MAX_WIDTH = 150
 LOGO_MARGIN = 20
 LOGO_FILENAME = "logo.png"
 
+# --- Monitoring Configuration ---
+MONITORING_HISTORY_MINUTES = 60  # Keep 60 minutes of history
+MONITORING_SAMPLE_INTERVAL = 5   # Sample every 5 seconds
+MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
+
 # --- Directory and File Paths ---
 BASE_DIR = BASE_DIR_STATIC
 UPLOADS_DIR = UPLOADS_DIR_STATIC
@@ -92,6 +101,75 @@ total_jobs_completed = 0
 total_jobs_failed = 0
 total_processing_time = 0.0
 MAX_HISTORY_ITEMS = 50  # Keep last 50 jobs in history
+
+# --- NEW: Worker and System Monitoring ---
+worker_activity = defaultdict(deque)  # worker_id -> deque of (timestamp, activity_type)
+system_metrics = deque(maxlen=MAX_MONITORING_SAMPLES)  # (timestamp, cpu%, memory%, gpu_info)
+worker_lock = threading.Lock()
+
+# Worker activity types
+WORKER_IDLE = "idle"
+WORKER_FETCHING = "fetching"
+WORKER_PROCESSING_REMBG = "rembg"
+WORKER_PROCESSING_PIL = "pil"
+WORKER_SAVING = "saving"
+
+def log_worker_activity(worker_id: int, activity: str):
+    """Log worker activity for monitoring"""
+    with worker_lock:
+        worker_activity[worker_id].append((time.time(), activity))
+        # Keep only recent history
+        cutoff_time = time.time() - (MONITORING_HISTORY_MINUTES * 60)
+        while worker_activity[worker_id] and worker_activity[worker_id][0][0] < cutoff_time:
+            worker_activity[worker_id].popleft()
+
+def get_gpu_info():
+    """Get GPU information if available"""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        return {
+            "gpu_used_mb": mem_info.used // (1024**2),
+            "gpu_total_mb": mem_info.total // (1024**2),
+            "gpu_utilization": utilization.gpu
+        }
+    except:
+        return {"gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0}
+
+async def system_monitor():
+    """Background task to collect system metrics"""
+    while True:
+        try:
+            # CPU and Memory
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+            memory_used_gb = memory.used / (1024**3)
+            memory_total_gb = memory.total / (1024**3)
+            
+            # GPU (if available)
+            gpu_info = get_gpu_info()
+            
+            # Store metrics
+            timestamp = time.time()
+            metrics = {
+                "timestamp": timestamp,
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory_percent,
+                "memory_used_gb": memory_used_gb,
+                "memory_total_gb": memory_total_gb,
+                **gpu_info
+            }
+            
+            system_metrics.append(metrics)
+            
+        except Exception as e:
+            logger.error(f"Error collecting system metrics: {e}")
+        
+        await asyncio.sleep(MONITORING_SAMPLE_INTERVAL)
 
 MIME_TO_EXT = {
     'image/jpeg': '.jpg',
@@ -171,6 +249,50 @@ def get_server_stats():
         "avg_processing_time": total_processing_time / max(total_jobs_completed, 1),
         "recent_jobs": job_history
     }
+
+def get_worker_activity_data():
+    """Get worker activity data for charting"""
+    current_time = time.time()
+    cutoff_time = current_time - (MONITORING_HISTORY_MINUTES * 60)
+    
+    # Create time buckets (30-second intervals for smoother charts)
+    bucket_size = 30  # seconds
+    num_buckets = (MONITORING_HISTORY_MINUTES * 60) // bucket_size
+    
+    worker_data = {}
+    
+    with worker_lock:
+        for worker_id in range(1, MAX_CONCURRENT_TASKS + 1):
+            activities = worker_activity.get(worker_id, deque())
+            
+            # Initialize buckets
+            buckets = []
+            for i in range(num_buckets):
+                bucket_start = cutoff_time + (i * bucket_size)
+                bucket_end = bucket_start + bucket_size
+                buckets.append({
+                    "timestamp": bucket_start,
+                    "idle": 0,
+                    "fetching": 0,
+                    "rembg": 0,
+                    "pil": 0,
+                    "saving": 0
+                })
+            
+            # Fill buckets with activity data
+            for timestamp, activity in activities:
+                if timestamp >= cutoff_time:
+                    bucket_index = int((timestamp - cutoff_time) // bucket_size)
+                    if 0 <= bucket_index < len(buckets):
+                        buckets[bucket_index][activity] += 1
+            
+            worker_data[f"worker_{worker_id}"] = buckets
+    
+    return worker_data
+
+def get_system_metrics_data():
+    """Get system metrics for charting"""
+    return list(system_metrics)
 
 # --- CPU-bound functions (run in thread pool) ---
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
@@ -338,6 +460,16 @@ async def submit_form_image_for_processing(
         "eta": eta_seconds,
         "status_check_url": status_check_url
     }
+
+@app.get("/api/monitoring/workers")
+async def get_worker_monitoring_data():
+    """API endpoint for worker activity data"""
+    return get_worker_activity_data()
+
+@app.get("/api/monitoring/system")
+async def get_system_monitoring_data():
+    """API endpoint for system metrics data"""
+    return get_system_metrics_data()
 
 @app.get("/status/{job_id}")
 async def check_job_status(request: Request, job_id: str):
@@ -573,416 +705,3 @@ async def job_details(request: Request, job_id: str):
     </body>
     </html>
     """, status_code=200)
-    job_info = results.get(job_id)
-    if not job_info:
-        raise HTTPException(status_code=404, detail="Job not found")
-    public_url_base = get_proxy_url(request)
-    response_data = {
-        "job_id": job_id, "status": job_info.get("status"),
-        "input_image_url": job_info.get("input_image_url"), "status_check_url": job_info.get("status_check_url")
-    }
-    if job_info.get("original_local_path"):
-        original_filename = os.path.basename(job_info["original_local_path"])
-        response_data["original_image_url"] = f"{public_url_base}/originals/{original_filename}"
-    if job_info.get("status") == "done" and job_info.get("processed_path"):
-        processed_filename = os.path.basename(job_info["processed_path"])
-        response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
-    elif job_info.get("status") == "error":
-        response_data["error_message"] = job_info.get("error_message")
-    return JSONResponse(content=response_data)
-
-# --- Background Cleanup Task ---
-async def cleanup_old_results():
-    """Clean up old completed jobs from results dict after 1 hour"""
-    while True:
-        try:
-            current_time = time.time()
-            expired_jobs = []
-            
-            for job_id, job_data in results.items():
-                completion_time = job_data.get("completion_time")
-                if completion_time and (current_time - completion_time) > 3600:  # 1 hour
-                    expired_jobs.append(job_id)
-            
-            for job_id in expired_jobs:
-                logger.info(f"Cleaning up old job from results: {job_id}")
-                del results[job_id]
-                
-            if expired_jobs:
-                logger.info(f"Cleaned up {len(expired_jobs)} old jobs from results dict")
-                
-        except Exception as e:
-            logger.error(f"Error in cleanup task: {e}", exc_info=True)
-        
-        # Run cleanup every 10 minutes
-        await asyncio.sleep(600)
-async def image_processing_worker(worker_id: int):
-    logger.info(f"Worker {worker_id} started. Listening for jobs...")
-    global prepared_logo_image
-
-    while True:
-        job_id, image_source_str, model_name, _ = await queue.get()
-
-        t_job_start = time.perf_counter()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
-
-        if job_id not in results:
-            logger.error(f"Worker {worker_id}: Job ID {job_id} from queue not found in results dict. Skipping.")
-            queue.task_done()
-            continue
-
-        input_bytes_for_rembg: bytes | None = None
-        input_fetch_time: float = 0.0
-        rembg_time: float = 0.0
-        pil_time: float = 0.0
-        save_time: float = 0.0
-        input_size_bytes: int = 0
-        output_size_bytes: int = 0
-
-        try:
-            # === PHASE 1: INPUT FETCH (I/O bound - async) ===
-            t_input_fetch_start = time.perf_counter()
-            if image_source_str.startswith("file://"):
-                results[job_id]["status"] = "loading_file"
-                local_path_from_uri = image_source_str[len("file://"):]
-                if not os.path.exists(local_path_from_uri):
-                    raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path_from_uri}")
-
-                async with aiofiles.open(local_path_from_uri, 'rb') as f:
-                    input_bytes_for_rembg = await f.read()
-                input_size_bytes = len(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (Worker {worker_id}): Loaded local file ({format_size(input_size_bytes)})")
-
-            elif image_source_str.startswith(("http://", "https://")):
-                results[job_id]["status"] = "downloading"
-                logger.info(f"Job {job_id} (Worker {worker_id}): Downloading from {image_source_str}...")
-                async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
-                    img_response = await client.get(image_source_str)
-                    img_response.raise_for_status()
-
-                input_bytes_for_rembg = await img_response.aread()
-                input_size_bytes = len(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (Worker {worker_id}): Downloaded {format_size(input_size_bytes)}")
-
-                # Handle content type detection and save original
-                original_content_type_header = img_response.headers.get("content-type", "unknown")
-                content_type = original_content_type_header.lower()
-                if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                    file_ext_from_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
-                    potential_ct = None
-                    if file_ext_from_url == ".webp": potential_ct = "image/webp"
-                    elif file_ext_from_url == ".png": potential_ct = "image/png"
-                    elif file_ext_from_url in [".jpg", ".jpeg"]: potential_ct = "image/jpeg"
-                    if potential_ct: content_type = potential_ct
-
-                if not content_type.startswith("image/"):
-                    raise ValueError(f"Invalid final content type '{content_type}' from URL. Not an image.")
-
-                extension = MIME_TO_EXT.get(content_type, ".bin")
-                temp_original_filename = f"{job_id}_original_downloaded{extension}"
-                downloaded_original_path = os.path.join(UPLOADS_DIR, temp_original_filename)
-                results[job_id]["original_local_path"] = downloaded_original_path
-                async with aiofiles.open(downloaded_original_path, 'wb') as out_file:
-                    await out_file.write(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (Worker {worker_id}): Saved downloaded original")
-            else:
-                raise ValueError(f"Unsupported image source scheme for job {job_id}: {image_source_str}")
-
-            if input_bytes_for_rembg is None:
-                raise ValueError(f"Image content for rembg is None for job {job_id}.")
-
-            t_input_fetch_end = time.perf_counter()
-            input_fetch_time = t_input_fetch_end - t_input_fetch_start
-
-            # === PHASE 2: REMBG PROCESSING (CPU bound - thread pool) ===
-            results[job_id]["status"] = "processing_rembg"
-            logger.info(f"Job {job_id} (Worker {worker_id}): Starting rembg processing (model: {model_name})...")
-            
-            t_rembg_start = time.perf_counter()
-            # Run rembg in thread pool to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            output_bytes_with_alpha = await loop.run_in_executor(
-                cpu_executor,
-                process_rembg_sync,
-                input_bytes_for_rembg,
-                model_name
-            )
-            t_rembg_end = time.perf_counter()
-            rembg_time = t_rembg_end - t_rembg_start
-            logger.info(f"Job {job_id} (Worker {worker_id}): Rembg processing completed in {rembg_time:.4f}s")
-
-            # === PHASE 3: PIL PROCESSING (CPU bound - thread pool) ===
-            results[job_id]["status"] = "processing_image"
-            logger.info(f"Job {job_id} (Worker {worker_id}): Starting PIL processing...")
-            
-            t_pil_start = time.perf_counter()
-            # Run PIL processing in thread pool
-            processed_image_bytes = await loop.run_in_executor(
-                pil_executor,
-                process_pil_sync,
-                output_bytes_with_alpha,
-                TARGET_SIZE,
-                prepared_logo_image,
-                ENABLE_LOGO_WATERMARK,
-                LOGO_MARGIN
-            )
-            t_pil_end = time.perf_counter()
-            pil_time = t_pil_end - t_pil_start
-            logger.info(f"Job {job_id} (Worker {worker_id}): PIL processing completed in {pil_time:.4f}s")
-
-            # === PHASE 4: SAVE TO DISK (I/O bound - async) ===
-            results[job_id]["status"] = "saving"
-            processed_filename = f"{job_id}.webp"
-            processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-
-            t_save_start = time.perf_counter()
-            async with aiofiles.open(processed_file_path, 'wb') as out_file:
-                await out_file.write(processed_image_bytes)
-            t_save_end = time.perf_counter()
-            save_time = t_save_end - t_save_start
-            output_size_bytes = len(processed_image_bytes)
-
-            # === JOB COMPLETION ===
-            results[job_id]["status"] = "done"
-            results[job_id]["processed_path"] = processed_file_path
-
-            t_job_end = time.perf_counter()
-            total_job_time = t_job_end - t_job_start
-            
-            # Determine source type for monitoring
-            source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
-            original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
-            
-            # Add to job history but KEEP in results dict for status polling
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type, original_filename)
-            
-            # Store completion time for cleanup later
-            results[job_id]["completion_time"] = time.time()
-            
-            logger.info(
-                f"Job {job_id} (Worker {worker_id}) COMPLETED successfully in {total_job_time:.4f}s\n"
-                f"    Input: {format_size(input_size_bytes)} → Output: {format_size(output_size_bytes)}\n"
-                f"    Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s"
-            )
-
-        except FileNotFoundError as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"File not found: {str(e)}"
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: HTTPStatusError downloading: {e.response.status_code}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code}"
-        except httpx.RequestError as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: RequestError downloading: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Network error: {type(e).__name__}"
-        except (ValueError, IOError, OSError) as e:
-            logger.error(f"Job {job_id} (Worker {worker_id}) Error: Data/file processing error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Processing error: {str(e)}"
-        except Exception as e:
-            logger.critical(f"Job {job_id} (Worker {worker_id}) CRITICAL Error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Unexpected error: {str(e)}"
-        finally:
-            if results.get(job_id, {}).get("status") == "error":
-                t_job_end_error = time.perf_counter()
-                total_job_time_error = t_job_end_error - t_job_start
-                
-                # Add failed job to history but KEEP in results dict for status polling
-                source_type = "url" if image_source_str.startswith(("http://", "https://")) else "upload"
-                original_filename = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type, original_filename)
-                
-                # Store completion time for cleanup later
-                results[job_id]["completion_time"] = time.time()
-                
-                logger.info(f"Job {job_id} (Worker {worker_id}) FAILED after {total_job_time_error:.4f}s")
-            queue.task_done()
-
-# --- Application Startup Logic ---
-@app.on_event("startup")
-async def startup_event():
-    global prepared_logo_image, cpu_executor, pil_executor
-    logger.info("Application startup event running...")
-
-    # Initialize thread pools
-    cpu_executor = ThreadPoolExecutor(
-        max_workers=CPU_THREAD_POOL_SIZE,
-        thread_name_prefix="RembgCPU"
-    )
-    pil_executor = ThreadPoolExecutor(
-        max_workers=PIL_THREAD_POOL_SIZE,
-        thread_name_prefix="PILCPU"
-    )
-    logger.info(f"Thread pools initialized: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
-
-    # Logo loading
-    if ENABLE_LOGO_WATERMARK:
-        logger.info(f"Logo watermarking ENABLED. Attempting load from: {LOGO_PATH}")
-        if os.path.exists(LOGO_PATH):
-            try:
-                logo = Image.open(LOGO_PATH).convert("RGBA")
-                if logo.width > LOGO_MAX_WIDTH:
-                    l_ratio = LOGO_MAX_WIDTH / logo.width
-                    l_new_width, l_new_height = LOGO_MAX_WIDTH, int(logo.height * l_ratio)
-                    logo = logo.resize((l_new_width, l_new_height), Image.Resampling.LANCZOS)
-                prepared_logo_image = logo
-                logger.info(f"Logo loaded. Dimensions: {prepared_logo_image.size}")
-            except Exception as e:
-                logger.error(f"Failed to load logo: {e}", exc_info=True)
-                prepared_logo_image = None
-        else:
-            logger.warning(f"Logo file not found at {LOGO_PATH}.")
-            prepared_logo_image = None
-    else:
-        logger.info("Logo watermarking DISABLED.")
-        prepared_logo_image = None
-
-    # Start async workers
-    for i in range(MAX_CONCURRENT_TASKS):
-        asyncio.create_task(image_processing_worker(worker_id=i+1))
-    logger.info(f"{MAX_CONCURRENT_TASKS} async workers started. Thread pools: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
-    
-    # Start cleanup task
-    asyncio.create_task(cleanup_old_results())
-    logger.info("Background cleanup task started (removes completed jobs from results after 1 hour)")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global cpu_executor, pil_executor
-    logger.info("Application shutdown event running...")
-    
-    if cpu_executor:
-        cpu_executor.shutdown(wait=True)
-        logger.info("CPU thread pool shut down")
-    
-    if pil_executor:
-        pil_executor.shutdown(wait=True)
-        logger.info("PIL thread pool shut down")
-
-# --- Static File Serving ---
-app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
-app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
-
-# --- Root Endpoint ---
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root():
-    stats = get_server_stats()
-    
-    logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
-    if ENABLE_LOGO_WATERMARK and prepared_logo_image:
-        logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
-    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
-        logo_status += " (Enabled but not loaded/found)"
-
-    # Format uptime
-    uptime_hours = stats["uptime"] / 3600
-    uptime_str = f"{uptime_hours:.1f} hours" if uptime_hours >= 1 else f"{stats['uptime']:.0f} seconds"
-    
-    # Build recent jobs table
-    recent_jobs_html = ""
-    if stats["recent_jobs"]:
-        recent_jobs_html = "<h3>Recent Jobs</h3><table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; width: 100%;'>"
-        recent_jobs_html += "<tr style='background-color: #f0f0f0;'><th>Time</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Input Size</th><th>Output Size</th><th>Model</th><th>Source</th></tr>"
-        
-        for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
-            status_color = "#4CAF50" if job["status"] == "completed" else "#f44336"
-            job_link = f"/job/{job['job_id']}"
-            recent_jobs_html += f"""
-            <tr style="cursor: pointer;" onclick="window.location.href='{job_link}'">
-                <td>{format_timestamp(job['timestamp'])}</td>
-                <td style='font-family: monospace; font-size: 10px;'><a href="{job_link}" style="text-decoration: none; color: #007bff;">{job['job_id'][:8]}...</a></td>
-                <td style='color: {status_color}; font-weight: bold;'>{job['status'].upper()}</td>
-                <td>{job['total_time']:.2f}s</td>
-                <td>{format_size(job['input_size'])}</td>
-                <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
-                <td>{job['model']}</td>
-                <td>{job['source_type']}</td>
-            </tr>
-            """
-        recent_jobs_html += "</table>"
-    else:
-        recent_jobs_html = "<h3>Recent Jobs</h3><p>No jobs processed yet.</p>"
-
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
-    <style>
-        body{{font-family:sans-serif;margin:20px; background-color: #f9f9f9;}} 
-        .container{{max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);}}
-        .stats-grid{{display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;}}
-        .stat-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; text-align: center;}}
-        .stat-value{{font-size: 24px; font-weight: bold; color: #007bff; margin-bottom: 5px;}}
-        .stat-label{{font-size: 14px; color: #6c757d; text-transform: uppercase;}}
-        table{{font-size: 14px;}} 
-        th{{background-color: #f0f0f0 !important;}}
-        tr:hover{{background-color: #f8f9fa; cursor: pointer;}}
-        .job-link{{color: #007bff; text-decoration: none;}}
-        .job-link:hover{{text-decoration: underline;}}
-        li{{margin-bottom: 5px;}}
-        .status-good{{color: #28a745;}}
-        .status-warning{{color: #ffc107;}}
-        .status-error{{color: #dc3545;}}
-    </style>
-    <script>
-        function refreshPage() {{
-            location.reload();
-        }}
-        // Auto refresh every 30 seconds
-        setTimeout(refreshPage, 30000);
-    </script>
-    </head>
-    <body>
-    <div class="container">
-        <h1>🚀 Threaded Image Processing API Dashboard</h1>
-        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value">{uptime_str}</div>
-                <div class="stat-label">Uptime</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['queue_size']}</div>
-                <div class="stat-label">Queue Size</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['active_jobs']}</div>
-                <div class="stat-label">Active Jobs</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value status-good">{stats['total_completed']}</div>
-                <div class="stat-label">Completed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value status-error">{stats['total_failed']}</div>
-                <div class="stat-label">Failed</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
-                <div class="stat-label">Avg Process Time</div>
-            </div>
-        </div>
-
-        <h3>Configuration</h3>
-        <ul>
-            <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
-            <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
-            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
-            <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
-            <li><strong>Logo Watermarking:</strong> {logo_status}</li>
-        </ul>
-
-        {recent_jobs_html}
-        
-        <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
-            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
-        </p>
-    </div>
-    </body></html>"""
-
-# --- Main Execution ---
-if __name__ == "__main__":
-    import uvicorn
-    logger.info("Starting Uvicorn server for local development...")
-    uvicorn.run(app, host="0.0.0.0", port=7000)
