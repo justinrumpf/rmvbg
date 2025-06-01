@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X---
+# --- CREATE DIRECTORIES AT THE VERY TOP X1---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -165,7 +165,7 @@ def get_gpu_info():
         if not hasattr(get_gpu_info, '_error_warned'):
             logger.warning(f"GPU monitoring disabled: {type(e).__name__}: {e}")
             get_gpu_info._error_warned = True
-        return {"gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0} {
+        return  {
             "gpu_used_mb": mem_info.used // (1024**2),
             "gpu_total_mb": mem_info.total // (1024**2),
             "gpu_utilization": utilization.gpu
