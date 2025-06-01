@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X8---
+# --- CREATE DIRECTORIES AT THE VERY TOP X6---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -66,9 +66,10 @@ app.add_middleware(
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 35  # Will be lower with GPU
+ESTIMATED_TIME_PER_JOB = 15  # Adjusted, GPU and BiRefNet might be faster
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
+DEFAULT_MODEL_NAME = "birefnet" # <--- SET DEFAULT MODEL
 
 # --- GPU Configuration for Rembg ---
 REMBG_USE_GPU = True
@@ -158,10 +159,6 @@ def get_gpu_info():
             logger.warning(f"GPU monitoring via pynvml failed: {type(e).__name__}: {e}. This might happen if no NVIDIA GPU is present or drivers are missing.")
             get_gpu_info._error_warned = True
     finally:
-        # pynvml.nvmlShutdown() # Best practice to shut down, but can cause issues if called too often / from threads
-        # For continuous monitoring, it's often initialized once and shut down at app exit.
-        # Since this is called repeatedly, consider initializing once at startup.
-        # For now, let's rely on pynvml to handle repeated Init/Shutdown or not use Shutdown here for simplicity in frequent calls.
         pass
     return gpu_data
 
@@ -198,8 +195,12 @@ MIME_TO_EXT = {
 }
 
 class SubmitJsonBody(BaseModel):
-    image: HttpUrl; key: str; model: str = "u2net"
-    steps: int = 20; samples: int = 1; resolution: str = "1024x1024"
+    image: HttpUrl
+    key: str
+    model: str = DEFAULT_MODEL_NAME # <--- Use default model
+    steps: int = 20
+    samples: int = 1
+    resolution: str = "1024x1024"
 
 def get_proxy_url(request: Request):
     host = request.headers.get("x-forwarded-host", request.headers.get("host", "localhost"))
@@ -254,45 +255,50 @@ def get_system_metrics_data(): return list(system_metrics)
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """Synchronous rembg processing - runs in thread pool. Uses globally configured providers."""
     global active_rembg_providers
+    session = None # Ensure session is defined in this scope
+    intended_providers = list(active_rembg_providers) # What we intend to use
 
-    session_providers = active_rembg_providers
     try:
-        session = new_session(model_name, providers=session_providers)
-        current_providers_in_session = session.get_providers()
-        logger.debug(f"Rembg session for model {model_name} using providers: {current_providers_in_session}")
-
-        is_gpu_provider_configured = any(p.lower().replace("executionprovider", "") in [prov.lower().replace("executionprovider", "") for prov in REMBG_PREFERRED_GPU_PROVIDERS] for p in session_providers)
-        is_gpu_provider_active = any(p.lower().replace("executionprovider", "") in [prov.lower().replace("executionprovider", "") for prov in REMBG_PREFERRED_GPU_PROVIDERS] for p in current_providers_in_session)
+        session = new_session(model_name, providers=intended_providers)
+        # We can't reliably call get_providers() on the rembg session object.
+        # So, we log what we *attempted* to use.
+        logger.debug(f"Rembg session for model {model_name} created with intended providers: {intended_providers}")
         
-        if is_gpu_provider_configured and not is_gpu_provider_active:
-             logger.warning(
-                f"Rembg was configured for GPU ({session_providers}) but is using CPU providers ({current_providers_in_session}). "
-                "Check ONNX Runtime GPU setup (e.g., `pip install onnxruntime-gpu`) and GPU driver compatibility."
-             )
-        elif is_gpu_provider_active:
-            # Only log this verbosely once or a few times to avoid spam
-            if not hasattr(process_rembg_sync, '_gpu_active_logged_count'):
-                process_rembg_sync._gpu_active_logged_count = 0
-            if process_rembg_sync._gpu_active_logged_count < 5:
-                logger.info(f"Rembg is actively using GPU provider(s): {current_providers_in_session}")
-                process_rembg_sync._gpu_active_logged_count +=1
+        # Heuristic check: if GPU was intended and we are not falling back, assume it's trying GPU.
+        is_gpu_provider_intended = any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in intended_providers)
+
+        if is_gpu_provider_intended:
+            if not hasattr(process_rembg_sync, '_gpu_attempt_logged_count'):
+                process_rembg_sync._gpu_attempt_logged_count = 0
+            if process_rembg_sync._gpu_attempt_logged_count < 5:
+                logger.info(f"Rembg attempting to use providers: {intended_providers} (GPU intent)")
+                process_rembg_sync._gpu_attempt_logged_count +=1
+        else:
+             logger.info(f"Rembg using CPU providers: {intended_providers}")
 
 
     except Exception as e:
-        logger.error(f"Failed to initialize rembg session with {session_providers} for model {model_name}: {e}. Falling back to CPU-only: {REMBG_CPU_PROVIDERS}")
-        session_providers = list(REMBG_CPU_PROVIDERS) # Ensure it's a mutable list copy
+        logger.error(f"Failed to initialize rembg session with {intended_providers} for model {model_name}: {e}. Falling back to CPU-only: {REMBG_CPU_PROVIDERS}")
+        intended_providers = list(REMBG_CPU_PROVIDERS) 
         try:
-            session = new_session(model_name, providers=session_providers)
-            logger.info(f"Rembg session for model {model_name} successfully fell back to CPU providers: {session.get_providers()}")
+            session = new_session(model_name, providers=intended_providers)
+            logger.info(f"Rembg session for model {model_name} successfully fell back to CPU providers (intended: {intended_providers})")
         except Exception as e_cpu:
-            logger.critical(f"CRITICAL: Failed to initialize rembg session even with CPU-only providers {session_providers} for model {model_name}: {e_cpu}", exc_info=True)
-            raise # Re-raise the critical error
+            logger.critical(f"CRITICAL: Failed to initialize rembg session even with CPU-only providers {intended_providers} for model {model_name}: {e_cpu}", exc_info=True)
+            raise 
+
+    if session is None: # Should not happen if the above logic is correct, but as a safeguard
+        logger.critical(f"CRITICAL: Rembg session is None after attempts for model {model_name}. This should not happen.")
+        raise RuntimeError(f"Failed to create rembg session for model {model_name}")
 
     output_bytes = remove(
         input_bytes,
         session=session,
-        post_process_mask=True,
-        alpha_matting=True
+        post_process_mask=True, # Consider if BiRefNet needs different post-processing
+        alpha_matting=True      # Consider if BiRefNet needs different post-processing
+        # alpha_matting_foreground_threshold=240, # Example, might need tuning
+        # alpha_matting_background_threshold=10,  # Example, might need tuning
+        # alpha_matting_erode_size=10             # Example, might need tuning
     )
     return output_bytes
 
@@ -330,7 +336,8 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
-    try: queue.put_nowait((job_id, str(body.image), body.model, True))
+    model_to_use = body.model if body.model else DEFAULT_MODEL_NAME # Ensure default if empty
+    try: queue.put_nowait((job_id, str(body.image), model_to_use, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue full. Rejecting JSON request for {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
@@ -338,12 +345,12 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
     results[job_id] = {"status": "queued", "input_image_url": str(body.image), "original_local_path": None,
                        "processed_path": None, "error_message": None, "status_check_url": status_check_url}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (JSON URL: {body.image}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    logger.info(f"Job {job_id} (JSON URL: {body.image}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {"status": "processing", "job_id": job_id, "image_links": [f"{public_url_base}/images/{job_id}.webp"],
             "eta": eta_seconds, "status_check_url": status_check_url}
 
 @app.post("/submit_form")
-async def submit_form_image_for_processing(request: Request, image_file: UploadFile = File(...), key: str = Form(...), model: str = Form("u2net")):
+async def submit_form_image_for_processing(request: Request, image_file: UploadFile = File(...), key: str = Form(...), model: str = Form(DEFAULT_MODEL_NAME)): # <--- Use default model
     if key != EXPECTED_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
@@ -367,8 +374,10 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
         logger.error(f"Error saving upload {saved_fn} for job {job_id}: {e}"); raise HTTPException(status_code=500, detail=f"Save failed: {e}")
     finally: await image_file.close()
     file_uri = f"file://{original_path}"
+    model_to_use = model if model else DEFAULT_MODEL_NAME # Ensure default if empty
+
     try:
-        queue.put_nowait((job_id, file_uri, model, True))
+        queue.put_nowait((job_id, file_uri, model_to_use, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}).")
         if os.path.exists(original_path):
@@ -382,9 +391,12 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
                        "original_local_path": original_path, "processed_path": None,
                        "error_message": None, "status_check_url": status_check_url}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (Form: {original_fn}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {"status": "processing", "job_id": job_id, "original_image_url": f"{public_url_base}/originals/{saved_fn}",
             "image_links": [f"{public_url_base}/images/{job_id}.webp"], "eta": eta_seconds, "status_check_url": status_check_url}
+
+# ... (rest of the API endpoints like /api/monitoring/*, /api/debug/gpu, /status/{job_id}, /job/{job_id} remain largely the same) ...
+# Make sure to double-check escaping in HTML if any further issues arise there.
 
 @app.get("/api/monitoring/workers")
 async def get_worker_monitoring_data(): return get_worker_activity_data()
@@ -415,7 +427,6 @@ async def debug_gpu_status():
                 "device_name": device_name, "memory_used_mb": mem_info.used // (1024**2),
                 "memory_total_mb": mem_info.total // (1024**2), "memory_percent": (mem_info.used / mem_info.total) * 100 if mem_info.total > 0 else 0,
                 "gpu_utilization_percent": util.gpu, "memory_utilization_percent": util.memory}
-        # pynvml.nvmlShutdown() # Consider calling this at app shutdown
     except ImportError: result["error_pynvml"] = "pynvml not installed. pip install pynvml (for NVIDIA GPU stats)"
     except Exception as e: result["error_pynvml"] = f"{type(e).__name__}: {e} (pynvml error)"
     
@@ -481,7 +492,6 @@ async def job_details(request: Request, job_id: str):
     if os.path.exists(os.path.join(PROCESSED_DIR, processed_filename)):
         processed_image_url = f"{public_url_base}/images/{processed_filename}"
     result_details = results.get(job_id, {})
-    # HTML content (same as provided, abbreviated for brevity)
     return HTMLResponse(content=f"""<!DOCTYPE html><html lang="en">
     <head><meta charset="UTF-8"><title>Job Details - {job_id[:8]}</title><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1200px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}}.status-badge{{padding:5px 10px;border-radius:15px;font-weight:bold;text-transform:uppercase;}}.status-completed{{background-color:#d4edda;color:#155724;}}.status-failed{{background-color:#f8d7da;color:#721c24;}}.status-active{{background-color:#d1ecf1;color:#0c5460;}}.details-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.detail-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;}}.detail-label{{font-size:12px;color:#6c757d;text-transform:uppercase;margin-bottom:5px;}}.detail-value{{font-size:18px;font-weight:bold;color:#495057;}}.images-section{{margin-top:30px;}}.images-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}}.image-card{{border:1px solid #dee2e6;border-radius:8px;padding:15px;background:white;}}.image-card h3{{margin-top:0;color:#495057;}}.image-card img{{max-width:100%;height:auto;border-radius:4px;border:1px solid #dee2e6;}}.no-image{{color:#6c757d;font-style:italic;text-align:center;padding:40px;background:#f8f9fa;border-radius:4px;}}.back-link{{color:#007bff;text-decoration:none;}}.back-link:hover{{text-decoration:underline;}}@media (max-width:768px){{.images-container{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}</style></head>
     <body><div class="container"><div class="header"><h1>Job Details</h1><a href="/" class="back-link">← Back to Dashboard</a></div>
@@ -490,6 +500,7 @@ async def job_details(request: Request, job_id: str):
     {f"<div class='detail-card'><div class='detail-label'>Original Filename</div><div class='detail-value'>{job_info['original_filename']}</div></div>" if job_info.get('original_filename') else ''}
     <div class="images-section"><h2>Before & After Images</h2><div class="images-container"><div class="image-card"><h3>🔍 Original Image</h3>{f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available</div>'}</div><div class="image-card"><h3>✨ Processed Image</h3>{f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available</div>'}</div></div></div>
     <div style="margin-top:30px;padding:15px;background:#f8f9fa;border-radius:6px;"><h3>Technical Details</h3><ul><li><strong>Current Status in System:</strong> {result_details.get('status','Not in active results')}</li><li><strong>Status Check URL:</strong> <a href="{result_details.get('status_check_url','#')}" target="_blank">API Status</a></li>{f"<li><strong>Error Message:</strong> {result_details.get('error_message','None')}</li>" if result_details.get('error_message') else ''}<li><strong>Job ID:</strong> <code>{job_id}</code></li></ul></div></div></body></html>""", status_code=200)
+
 
 async def cleanup_old_results():
     while True:
@@ -607,11 +618,10 @@ async def startup_event():
             for provider_name in REMBG_PREFERRED_GPU_PROVIDERS:
                 if provider_name in available_ort_providers:
                     if provider_name not in chosen_providers: chosen_providers.append(provider_name)
-            if 'CPUExecutionProvider' in chosen_providers: chosen_providers.remove('CPUExecutionProvider') # remove if added by mistake
+            if 'CPUExecutionProvider' in chosen_providers: chosen_providers.remove('CPUExecutionProvider') 
             
-            # Ensure CPUExecutionProvider is always at the end as a fallback
             if 'CPUExecutionProvider' in available_ort_providers:
-                 if 'CPUExecutionProvider' not in chosen_providers: # Add if not already there
+                 if 'CPUExecutionProvider' not in chosen_providers: 
                     chosen_providers.append('CPUExecutionProvider')
             else: logger.error("'CPUExecutionProvider' not found in ONNX available_providers. This is unusual.")
 
@@ -622,7 +632,7 @@ async def startup_event():
                 active_rembg_providers = chosen_providers
             
             has_gpu_in_final = any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in active_rembg_providers if p != 'CPUExecutionProvider')
-            if not has_gpu_in_final and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in chosen_providers): # If GPU was available but not selected or CPU is the only one
+            if REMBG_USE_GPU and not has_gpu_in_final : 
                  logger.warning(f"REMBG_USE_GPU is True, but no preferred GPU providers were ultimately selected or only CPU remains. Final: {active_rembg_providers}. Check onnxruntime-gpu/drivers. Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}.")
 
         except ImportError: logger.warning("onnxruntime module not found. Rembg will use CPU. Install onnxruntime or onnxruntime-gpu."); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
@@ -647,7 +657,6 @@ async def startup_event():
     logger.info(f"{MAX_CONCURRENT_TASKS} async workers started.")
     asyncio.create_task(cleanup_old_results()); logger.info("Background cleanup task started.")
     asyncio.create_task(system_monitor()); logger.info("System monitoring task started.")
-    # Initialize pynvml once for monitoring if available
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -667,7 +676,7 @@ async def shutdown_event():
         pynvml.nvmlShutdown()
         logger.info("pynvml shutdown.")
     except Exception:
-        pass # Ignore if not initialized or not available
+        pass 
 
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
@@ -797,6 +806,7 @@ async def root():
             <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
             <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
             <li><strong>Logo Watermarking:</strong> {logo_status}</li>
+            <li><strong>Default Model:</strong> {DEFAULT_MODEL_NAME}</li>
             <li><strong>Rembg GPU Attempt:</strong> {'Enabled' if REMBG_USE_GPU else 'Disabled'}</li>
             <li><strong>Rembg Providers:</strong> {str(active_rembg_providers)}</li>
             <li><strong>GPU Monitoring (pynvml):</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml)'}</li>
@@ -825,209 +835,205 @@ async def root():
         
         let workerChart, systemChart;
 
-        // Initialize charts
-        function initCharts() {{ // Double curly braces for JS block
-            // Worker Activity Chart
+        function initCharts() {{{{ // Escape for Python f-string
             const workerCtx = document.getElementById('workerChart').getContext('2d');
-            workerChart = new Chart(workerCtx, {{ // Double curly braces for JS object
+            workerChart = new Chart(workerCtx, {{{{
                 type: 'line',
-                data: {{ // Double
+                data: {{{{
                     labels: [],
                     datasets: []
-                }},
-                options: {{ // Double
+                }}}},
+                options: {{{{
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {{ // Double
-                        legend: {{ // Double
+                    plugins: {{{{
+                        legend: {{{{
                             position: 'bottom',
-                            labels: {{ // Double
+                            labels: {{{{
                                 boxWidth: 12,
-                            }} // Double
-                        }},
-                        tooltip: {{ // Double
+                            }}}}
+                        }}}},
+                        tooltip: {{{{
                             mode: 'index',
                             intersect: false
-                        }} // Double
-                    }},
-                    scales: {{ // Double
-                        y: {{ // Double
+                        }}}}
+                    }}}},
+                    scales: {{{{
+                        y: {{{{
                             beginAtZero: true,
                             stacked: true, 
-                            title: {{ // Double
+                            title: {{{{
                                 display: true,
                                 text: 'Active Workers / Activity Count'
-                            }} // Double
-                        }},
-                        x: {{ // Double
-                            title: {{ // Double
+                            }}}}
+                        }}}},
+                        x: {{{{
+                            title: {{{{
                                 display: true,
                                 text: 'Time'
-                            }},
-                            ticks: {{ // Double
+                            }}}},
+                            ticks: {{{{
                                 autoSkip: true,
                                 maxTicksLimit: 15 
-                            }} // Double
-                        }} // Double
-                    }},
-                    elements: {{ // Double
-                        line: {{ // Double
+                            }}}}
+                        }}}}
+                    }}}},
+                    elements: {{{{
+                        line: {{{{
                             tension: 0.4 
-                        }},
-                        point: {{ // Double
+                        }}}},
+                        point: {{{{
                             radius: 2
-                        }} // Double
-                    }} // Double
-                }} // Double
-            }}); // Semicolon is fine
+                        }}}}
+                    }}}}
+                }}}}
+            }});
 
-            // System Resources Chart
             const systemCtx = document.getElementById('systemChart').getContext('2d');
-            systemChart = new Chart(systemCtx, {{ // Double
+            systemChart = new Chart(systemCtx, {{{{
                 type: 'line',
-                data: {{ // Double
+                data: {{{{
                     labels: [],
                     datasets: [
-                        {{ // Double
+                        {{{{
                             label: 'CPU %',
                             data: [],
                             borderColor: '#dc3545', 
                             backgroundColor: 'rgba(220, 53, 69, 0.1)',
                             fill: false,
                             yAxisID: 'yPercent' 
-                        }},
-                        {{ // Double
+                        }}}},
+                        {{{{
                             label: 'Memory %',
                             data: [],
                             borderColor: '#fd7e14', 
                             backgroundColor: 'rgba(253, 126, 20, 0.1)',
                             fill: false,
                             yAxisID: 'yPercent' 
-                        }},
-                        {{ // Double
+                        }}}},
+                        {{{{
                             label: 'GPU %',
                             data: [],
                             borderColor: '#6f42c1', 
                             backgroundColor: 'rgba(111, 66, 193, 0.1)',
                             fill: false,
                             yAxisID: 'yPercent' 
-                        }}
+                        }}}}
                     ]
-                }},
-                options: {{ // Double
+                }}}},
+                options: {{{{
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {{ // Double
-                        legend: {{ // Double
+                    plugins: {{{{
+                        legend: {{{{
                             position: 'bottom'
-                        }},
-                        tooltip: {{ // Double
+                        }}}},
+                        tooltip: {{{{
                             mode: 'index',
                             intersect: false
-                        }} // Double
-                    }},
-                    scales: {{ // Double
-                        yPercent: {{ // Double
+                        }}}}
+                    }}}},
+                    scales: {{{{
+                        yPercent: {{{{ 
                             type: 'linear',
                             display: true,
                             position: 'left',
                             beginAtZero: true,
                             max: 100,
-                            title: {{ // Double
+                            title: {{{{
                                 display: true,
                                 text: 'Usage %'
-                            }} // Double
-                        }},
-                        x: {{ // Double
-                            title: {{ // Double
+                            }}}}
+                        }}}},
+                        x: {{{{
+                            title: {{{{
                                 display: true,
                                 text: 'Time'
-                            }},
-                            ticks: {{ // Double
+                            }}}},
+                            ticks: {{{{
                                 autoSkip: true,
                                 maxTicksLimit: 15 
-                            }} // Double
-                        }} // Double
-                    }},
-                    elements: {{ // Double
-                        line: {{ // Double
+                            }}}}
+                        }}}}
+                    }}}},
+                    elements: {{{{
+                        line: {{{{
                             tension: 0.4 
-                        }},
-                        point: {{ // Double
+                        }}}},
+                        point: {{{{
                             radius: 1
-                        }} // Double
-                    }} // Double
-                }} // Double
+                        }}}}
+                    }}}}
+                }}}}
             }});
-        }} // Double
+        }}}}
 
-        // Update charts with new data
-        async function updateCharts() {{ // Double
-            try {{ // Double
+        async function updateCharts() {{{{
+            try {{{{
                 const workerResponse = await fetch('/api/monitoring/workers');
-                if (!workerResponse.ok) {{ // Double
+                if (!workerResponse.ok) {{{{
                     console.error("Failed to fetch worker data:", workerResponse.status);
                     return;
-                }} // Double
+                }}}}
                 const workerData = await workerResponse.json();
                 
                 const systemResponse = await fetch('/api/monitoring/system');
-                 if (!systemResponse.ok) {{ // Double
+                 if (!systemResponse.ok) {{{{
                     console.error("Failed to fetch system data:", systemResponse.status);
                     return;
-                }} // Double
+                }}}}
                 const systemData = await systemResponse.json();
                 
                 updateWorkerChart(workerData);
                 updateSystemChart(systemData);
                 
-            }} catch (error) {{ // Double
+            }}}} catch (error) {{{{
                 console.error('Error updating charts:', error);
-            }} // Double
-        }} // Double
+            }}}}
+        }}}}
 
-        function formatChartTimestamp(unixTimestamp) {{ // Double
+        function formatChartTimestamp(unixTimestamp) {{{{
             const date = new Date(unixTimestamp * 1000);
-            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}}); // Double for object literal
-        }} // Double
+            return date.toLocaleTimeString([], {{{{hour: '2-digit', minute: '2-digit', second: '2-digit'}}}); // Escape object literal for JS
+        }}}}
 
-        function updateWorkerChart(data) {{ // Double
+        function updateWorkerChart(data) {{{{
             if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) return;
             
             const workerIds = Object.keys(data).sort();
             const firstWorkerData = data[workerIds[0]];
 
-            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{ // Double
+            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{{{
                  workerChart.data.labels = [];
                  workerChart.data.datasets = [];
                  workerChart.update('none');
                 return;
-            }} // Double
+            }}}}
             
             const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
             
-            const datasets = workerIds.map((workerId, index) => {{ // Double
+            const datasets = workerIds.map((workerId, index) => {{{{
                 const workerBuckets = data[workerId] || []; 
                 const totalActivity = workerBuckets.map(bucket => 
                     (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
                 );
                 
-                return {{ // Double
+                return {{{{
                     label: workerId.replace('worker_', 'Worker '),
                     data: totalActivity,
                     borderColor: workerColors[index % workerColors.length],
                     backgroundColor: workerColors[index % workerColors.length] + '33', 
                     fill: true, 
                     tension: 0.4
-                }}; // Double
+                }}}};
             }});
             
             workerChart.data.labels = labels;
             workerChart.data.datasets = datasets;
             workerChart.update('none'); 
-        }} // Double
+        }}}}
 
-        function updateSystemChart(data) {{ // Double
+        function updateSystemChart(data) {{{{
             if (!systemChart || !Array.isArray(data) || data.length === 0) return;
             
             const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
@@ -1041,46 +1047,46 @@ async def root():
             systemChart.data.datasets[1].data = memoryData;
             systemChart.data.datasets[2].data = gpuData;
             systemChart.update('none'); 
-        }} // Double
+        }}}}
 
-        document.addEventListener('DOMContentLoaded', function() {{ // Double
+        document.addEventListener('DOMContentLoaded', function() {{{{
             initCharts();
             updateCharts(); 
             
             const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; 
             setInterval(updateCharts, chartUpdateInterval);
-        }});
+        }}}});
 
-        function refreshPage() {{ // Double
-            if (document.visibilityState === 'visible') {{ // Double
+        function refreshPage() {{{{
+            if (document.visibilityState === 'visible') {{{{
                  fetch('/')
                     .then(response => response.text())
-                    .then(html => {{ // Double
+                    .then(html => {{{{
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
                         
                         const newStatsGrid = doc.querySelector('.stats-grid');
                         const currentStatsGrid = document.querySelector('.stats-grid');
-                        if (newStatsGrid && currentStatsGrid) {{ // Double
+                        if (newStatsGrid && currentStatsGrid) {{{{
                             currentStatsGrid.innerHTML = newStatsGrid.innerHTML;
-                        }} // Double
+                        }}}}
                         
                         const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
                         let newRecentJobsDisplay = null;
-                        if (newRecentJobsContainer) {{ // Double
+                        if (newRecentJobsContainer) {{{{
                             newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; 
-                        }} // Double
+                        }}}}
 
                         const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; 
-                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{ // Double
+                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{{{
                             let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
-                             if (newRecentJobsDisplay && currentJobsDisplay) {{ // Double
+                             if (newRecentJobsDisplay && currentJobsDisplay) {{{{
                                 currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML;
-                            }} // Double
-                        }} // Double
+                            }}}}
+                        }}}}
                         
                         const lastUpdatedP = document.getElementById('last-updated-paragraph'); 
-                        if(lastUpdatedP) {{ // Double
+                        if(lastUpdatedP) {{{{
                             const now = new Date();
                             const year = now.getFullYear();
                             const month = (now.getMonth() + 1).toString().padStart(2, '0'); 
@@ -1088,14 +1094,13 @@ async def root():
                             const hours = now.getHours().toString().padStart(2, '0');
                             const minutes = now.getMinutes().toString().padStart(2, '0');
                             const seconds = now.getSeconds().toString().padStart(2, '0');
-                            // For JS template literals inside Python f-string, use ${{...}}
-                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`;
-                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`;
-                        }} // Double
-                    }})
+                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`; // Escaped for JS template literal
+                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`; // Escaped for JS template literal
+                        }}}}
+                    }}}})
                     .catch(err => console.error("Error refreshing page content:", err));
-            }} // Double
-        }} // Double
+            }}}}
+        }}}}
         
         setInterval(refreshPage, 30000); 
     </script>
