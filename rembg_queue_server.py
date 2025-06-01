@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X7---
+# --- CREATE DIRECTORIES AT THE VERY TOP X8---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -689,8 +689,8 @@ async def root():
         recent_jobs_html += "</table>"
     else: recent_jobs_html += "<p>No jobs processed yet.</p>"
     
-    # This is the string that will be evaluated by Python first
-    initial_last_updated_text = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
+    # This is the string that will be evaluated by Python first for the initial page load
+    initial_last_updated_text_py = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
 
 
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
@@ -812,8 +812,8 @@ async def root():
 
         {recent_jobs_html}
         
-        <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
-            {initial_last_updated_text}
+        <p id="last-updated-paragraph" style="margin-top: 30px; font-size: 12px; color: #6c757d;">
+            {initial_last_updated_text_py}
         </p>
     </div>
     
@@ -844,7 +844,6 @@ async def root():
                             position: 'bottom',
                             labels: {{
                                 boxWidth: 12,
-                                // fontSize: 10 // Chart.js v3 uses `font.size`
                             }}
                         }},
                         tooltip: {{
@@ -855,7 +854,7 @@ async def root():
                     scales: {{
                         y: {{
                             beginAtZero: true,
-                            stacked: true, // Good for showing composition of worker activity
+                            stacked: true, 
                             title: {{
                                 display: true,
                                 text: 'Active Workers / Activity Count'
@@ -868,13 +867,13 @@ async def root():
                             }},
                             ticks: {{
                                 autoSkip: true,
-                                maxTicksLimit: 15 // Adjust for readability
+                                maxTicksLimit: 15 
                             }}
                         }}
                     }},
                     elements: {{
                         line: {{
-                            tension: 0.4 // Smoother lines
+                            tension: 0.4 
                         }},
                         point: {{
                             radius: 2
@@ -893,26 +892,26 @@ async def root():
                         {{
                             label: 'CPU %',
                             data: [],
-                            borderColor: '#dc3545', // Red
+                            borderColor: '#dc3545', 
                             backgroundColor: 'rgba(220, 53, 69, 0.1)',
                             fill: false,
-                            yAxisID: 'yPercent' // Assign to a Y-axis
+                            yAxisID: 'yPercent' 
                         }},
                         {{
                             label: 'Memory %',
                             data: [],
-                            borderColor: '#fd7e14', // Orange
+                            borderColor: '#fd7e14', 
                             backgroundColor: 'rgba(253, 126, 20, 0.1)',
                             fill: false,
-                            yAxisID: 'yPercent' // Assign to the same Y-axis
+                            yAxisID: 'yPercent' 
                         }},
                         {{
                             label: 'GPU %',
                             data: [],
-                            borderColor: '#6f42c1', // Purple
+                            borderColor: '#6f42c1', 
                             backgroundColor: 'rgba(111, 66, 193, 0.1)',
                             fill: false,
-                            yAxisID: 'yPercent' // Assign to the same Y-axis
+                            yAxisID: 'yPercent' 
                         }}
                     ]
                 }},
@@ -929,7 +928,7 @@ async def root():
                         }}
                     }},
                     scales: {{
-                        yPercent: {{ // Define the Y-axis for percentages
+                        yPercent: {{ 
                             type: 'linear',
                             display: true,
                             position: 'left',
@@ -947,13 +946,13 @@ async def root():
                             }},
                             ticks: {{
                                 autoSkip: true,
-                                maxTicksLimit: 15 // Adjust for readability
+                                maxTicksLimit: 15 
                             }}
                         }}
                     }},
                     elements: {{
                         line: {{
-                            tension: 0.4 // Smoother lines
+                            tension: 0.4 
                         }},
                         point: {{
                             radius: 1
@@ -966,7 +965,6 @@ async def root():
         // Update charts with new data
         async function updateCharts() {{
             try {{
-                // Fetch worker data
                 const workerResponse = await fetch('/api/monitoring/workers');
                 if (!workerResponse.ok) {{
                     console.error("Failed to fetch worker data:", workerResponse.status);
@@ -974,7 +972,6 @@ async def root():
                 }}
                 const workerData = await workerResponse.json();
                 
-                // Fetch system data
                 const systemResponse = await fetch('/api/monitoring/system');
                  if (!systemResponse.ok) {{
                     console.error("Failed to fetch system data:", systemResponse.status);
@@ -982,10 +979,7 @@ async def root():
                 }}
                 const systemData = await systemResponse.json();
                 
-                // Update worker chart
                 updateWorkerChart(workerData);
-                
-                // Update system chart
                 updateSystemChart(systemData);
                 
             }} catch (error) {{
@@ -999,16 +993,12 @@ async def root():
         }}
 
         function updateWorkerChart(data) {{
-            if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) {{
-                // console.warn("Worker chart not ready or data is invalid/empty.");
-                return;
-            }}
+            if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) return;
             
             const workerIds = Object.keys(data).sort();
             const firstWorkerData = data[workerIds[0]];
 
             if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{
-                // console.warn("First worker data is invalid or empty for labels.");
                  workerChart.data.labels = [];
                  workerChart.data.datasets = [];
                  workerChart.update('none');
@@ -1018,8 +1008,7 @@ async def root():
             const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
             
             const datasets = workerIds.map((workerId, index) => {{
-                const workerBuckets = data[workerId] || []; // Ensure it's an array
-                // Summing up activities for simplicity, could be stacked bars for details
+                const workerBuckets = data[workerId] || []; 
                 const totalActivity = workerBuckets.map(bucket => 
                     (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
                 );
@@ -1028,48 +1017,41 @@ async def root():
                     label: workerId.replace('worker_', 'Worker '),
                     data: totalActivity,
                     borderColor: workerColors[index % workerColors.length],
-                    backgroundColor: workerColors[index % workerColors.length] + '33', // More transparent fill
-                    fill: true, // Can set to true for area chart style
+                    backgroundColor: workerColors[index % workerColors.length] + '33', 
+                    fill: true, 
                     tension: 0.4
                 }};
             }});
             
             workerChart.data.labels = labels;
             workerChart.data.datasets = datasets;
-            workerChart.update('none'); // 'none' for no animation, quicker updates
+            workerChart.update('none'); 
         }}
 
         function updateSystemChart(data) {{
-            if (!systemChart || !Array.isArray(data) || data.length === 0) {{
-                // console.warn("System chart not ready or data is invalid/empty.");
-                return;
-            }}
+            if (!systemChart || !Array.isArray(data) || data.length === 0) return;
             
             const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
             
             const cpuData = data.map(metric => metric.cpu_percent);
             const memoryData = data.map(metric => metric.memory_percent);
-            const gpuData = data.map(metric => metric.gpu_utilization || 0); // Default to 0 if undefined
+            const gpuData = data.map(metric => metric.gpu_utilization || 0); 
             
             systemChart.data.labels = labels;
             systemChart.data.datasets[0].data = cpuData;
             systemChart.data.datasets[1].data = memoryData;
             systemChart.data.datasets[2].data = gpuData;
-            systemChart.update('none'); // 'none' for no animation
+            systemChart.update('none'); 
         }}
 
-        // Initialize everything when page loads
         document.addEventListener('DOMContentLoaded', function() {{
             initCharts();
-            updateCharts(); // Initial fetch
+            updateCharts(); 
             
-            // Update charts every N seconds (make N a bit more than MONITORING_SAMPLE_INTERVAL)
-            // MONITORING_SAMPLE_INTERVAL is defined in Python, so we need to pass it or hardcode a similar value
-            const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; // e.g., if 5s, update charts every 7s
+            const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; 
             setInterval(updateCharts, chartUpdateInterval);
         }});
 
-        // Page refresh function (partial content update)
         function refreshPage() {{
             if (document.visibilityState === 'visible') {{
                  fetch('/')
@@ -1087,10 +1069,10 @@ async def root():
                         const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
                         let newRecentJobsDisplay = null;
                         if (newRecentJobsContainer) {{
-                            newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; // Could be table or p
+                            newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; 
                         }}
 
-                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; //h3
+                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; 
                         if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{
                             let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
                              if (newRecentJobsDisplay && currentJobsDisplay) {{
@@ -1098,11 +1080,17 @@ async def root():
                             }}
                         }}
                         
-                        const lastUpdatedP = document.querySelector('p[style*="font-size: 12px"]');
+                        const lastUpdatedP = document.getElementById('last-updated-paragraph'); // Use ID for reliability
                         if(lastUpdatedP) {{
-                            // Use JavaScript to format the current time for the "Last updated" message
                             const now = new Date();
-                            const timeString = now.toLocaleTimeString([], {{ year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+                            // Example: 2023-10-27 14:35:02
+                            const year = now.getFullYear();
+                            const month = (now.getMonth() + 1).toString().padStart(2, '0');
+                            const day = now.getDate().toString().padStart(2, '0');
+                            const hours = now.getHours().toString().padStart(2, '0');
+                            const minutes = now.getMinutes().toString().padStart(2, '0');
+                            const seconds = now.getSeconds().toString().padStart(2, '0');
+                            const timeString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
                             lastUpdatedP.innerHTML = `Page data refreshed: ${timeString} | Auto-refresh active`;
                         }}
                     }})
@@ -1110,11 +1098,9 @@ async def root():
             }}
         }}
         
-        // Auto refresh page content (not full reload) every 30 seconds
         setInterval(refreshPage, 30000); 
     </script>
     </body></html>"""
-
 
 if __name__ == "__main__":
     import uvicorn
