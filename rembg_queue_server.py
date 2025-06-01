@@ -689,7 +689,6 @@ async def root():
         recent_jobs_html += "</table>"
     else: recent_jobs_html += "<p>No jobs processed yet.</p>"
     
-    # This is the string that will be evaluated by Python first for the initial page load
     initial_last_updated_text_py = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
 
 
@@ -821,75 +820,75 @@ async def root():
         // Chart colors for workers
         const workerColors = [
             '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
-            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF' // Re-used some for more than 6 workers
+            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
         ];
         
         let workerChart, systemChart;
 
         // Initialize charts
-        function initCharts() {{
+        function initCharts() {{ // Double curly braces for JS block
             // Worker Activity Chart
             const workerCtx = document.getElementById('workerChart').getContext('2d');
-            workerChart = new Chart(workerCtx, {{
+            workerChart = new Chart(workerCtx, {{ // Double curly braces for JS object
                 type: 'line',
-                data: {{
+                data: {{ // Double
                     labels: [],
                     datasets: []
                 }},
-                options: {{
+                options: {{ // Double
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {{
-                        legend: {{
+                    plugins: {{ // Double
+                        legend: {{ // Double
                             position: 'bottom',
-                            labels: {{
+                            labels: {{ // Double
                                 boxWidth: 12,
-                            }}
+                            }} // Double
                         }},
-                        tooltip: {{
+                        tooltip: {{ // Double
                             mode: 'index',
                             intersect: false
-                        }}
+                        }} // Double
                     }},
-                    scales: {{
-                        y: {{
+                    scales: {{ // Double
+                        y: {{ // Double
                             beginAtZero: true,
                             stacked: true, 
-                            title: {{
+                            title: {{ // Double
                                 display: true,
                                 text: 'Active Workers / Activity Count'
-                            }}
+                            }} // Double
                         }},
-                        x: {{
-                            title: {{
+                        x: {{ // Double
+                            title: {{ // Double
                                 display: true,
                                 text: 'Time'
                             }},
-                            ticks: {{
+                            ticks: {{ // Double
                                 autoSkip: true,
                                 maxTicksLimit: 15 
-                            }}
-                        }}
+                            }} // Double
+                        }} // Double
                     }},
-                    elements: {{
-                        line: {{
+                    elements: {{ // Double
+                        line: {{ // Double
                             tension: 0.4 
                         }},
-                        point: {{
+                        point: {{ // Double
                             radius: 2
-                        }}
-                    }}
-                }}
-            }});
+                        }} // Double
+                    }} // Double
+                }} // Double
+            }}); // Semicolon is fine
 
             // System Resources Chart
             const systemCtx = document.getElementById('systemChart').getContext('2d');
-            systemChart = new Chart(systemCtx, {{
+            systemChart = new Chart(systemCtx, {{ // Double
                 type: 'line',
-                data: {{
+                data: {{ // Double
                     labels: [],
                     datasets: [
-                        {{
+                        {{ // Double
                             label: 'CPU %',
                             data: [],
                             borderColor: '#dc3545', 
@@ -897,7 +896,7 @@ async def root():
                             fill: false,
                             yAxisID: 'yPercent' 
                         }},
-                        {{
+                        {{ // Double
                             label: 'Memory %',
                             data: [],
                             borderColor: '#fd7e14', 
@@ -905,7 +904,7 @@ async def root():
                             fill: false,
                             yAxisID: 'yPercent' 
                         }},
-                        {{
+                        {{ // Double
                             label: 'GPU %',
                             data: [],
                             borderColor: '#6f42c1', 
@@ -915,120 +914,120 @@ async def root():
                         }}
                     ]
                 }},
-                options: {{
+                options: {{ // Double
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: {{
-                        legend: {{
+                    plugins: {{ // Double
+                        legend: {{ // Double
                             position: 'bottom'
                         }},
-                        tooltip: {{
+                        tooltip: {{ // Double
                             mode: 'index',
                             intersect: false
-                        }}
+                        }} // Double
                     }},
-                    scales: {{
-                        yPercent: {{ 
+                    scales: {{ // Double
+                        yPercent: {{ // Double
                             type: 'linear',
                             display: true,
                             position: 'left',
                             beginAtZero: true,
                             max: 100,
-                            title: {{
+                            title: {{ // Double
                                 display: true,
                                 text: 'Usage %'
-                            }}
+                            }} // Double
                         }},
-                        x: {{
-                            title: {{
+                        x: {{ // Double
+                            title: {{ // Double
                                 display: true,
                                 text: 'Time'
                             }},
-                            ticks: {{
+                            ticks: {{ // Double
                                 autoSkip: true,
                                 maxTicksLimit: 15 
-                            }}
-                        }}
+                            }} // Double
+                        }} // Double
                     }},
-                    elements: {{
-                        line: {{
+                    elements: {{ // Double
+                        line: {{ // Double
                             tension: 0.4 
                         }},
-                        point: {{
+                        point: {{ // Double
                             radius: 1
-                        }}
-                    }}
-                }}
+                        }} // Double
+                    }} // Double
+                }} // Double
             }});
-        }}
+        }} // Double
 
         // Update charts with new data
-        async function updateCharts() {{
-            try {{
+        async function updateCharts() {{ // Double
+            try {{ // Double
                 const workerResponse = await fetch('/api/monitoring/workers');
-                if (!workerResponse.ok) {{
+                if (!workerResponse.ok) {{ // Double
                     console.error("Failed to fetch worker data:", workerResponse.status);
                     return;
-                }}
+                }} // Double
                 const workerData = await workerResponse.json();
                 
                 const systemResponse = await fetch('/api/monitoring/system');
-                 if (!systemResponse.ok) {{
+                 if (!systemResponse.ok) {{ // Double
                     console.error("Failed to fetch system data:", systemResponse.status);
                     return;
-                }}
+                }} // Double
                 const systemData = await systemResponse.json();
                 
                 updateWorkerChart(workerData);
                 updateSystemChart(systemData);
                 
-            }} catch (error) {{
+            }} catch (error) {{ // Double
                 console.error('Error updating charts:', error);
-            }}
-        }}
+            }} // Double
+        }} // Double
 
-        function formatChartTimestamp(unixTimestamp) {{
+        function formatChartTimestamp(unixTimestamp) {{ // Double
             const date = new Date(unixTimestamp * 1000);
-            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
-        }}
+            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}}); // Double for object literal
+        }} // Double
 
-        function updateWorkerChart(data) {{
+        function updateWorkerChart(data) {{ // Double
             if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) return;
             
             const workerIds = Object.keys(data).sort();
             const firstWorkerData = data[workerIds[0]];
 
-            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{
+            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{ // Double
                  workerChart.data.labels = [];
                  workerChart.data.datasets = [];
                  workerChart.update('none');
                 return;
-            }}
+            }} // Double
             
             const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
             
-            const datasets = workerIds.map((workerId, index) => {{
+            const datasets = workerIds.map((workerId, index) => {{ // Double
                 const workerBuckets = data[workerId] || []; 
                 const totalActivity = workerBuckets.map(bucket => 
                     (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
                 );
                 
-                return {{
+                return {{ // Double
                     label: workerId.replace('worker_', 'Worker '),
                     data: totalActivity,
                     borderColor: workerColors[index % workerColors.length],
                     backgroundColor: workerColors[index % workerColors.length] + '33', 
                     fill: true, 
                     tension: 0.4
-                }};
+                }}; // Double
             }});
             
             workerChart.data.labels = labels;
             workerChart.data.datasets = datasets;
             workerChart.update('none'); 
-        }}
+        }} // Double
 
-        function updateSystemChart(data) {{
+        function updateSystemChart(data) {{ // Double
             if (!systemChart || !Array.isArray(data) || data.length === 0) return;
             
             const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
@@ -1042,9 +1041,9 @@ async def root():
             systemChart.data.datasets[1].data = memoryData;
             systemChart.data.datasets[2].data = gpuData;
             systemChart.update('none'); 
-        }}
+        }} // Double
 
-        document.addEventListener('DOMContentLoaded', function() {{
+        document.addEventListener('DOMContentLoaded', function() {{ // Double
             initCharts();
             updateCharts(); 
             
@@ -1052,51 +1051,51 @@ async def root():
             setInterval(updateCharts, chartUpdateInterval);
         }});
 
-        function refreshPage() {{
-            if (document.visibilityState === 'visible') {{
+        function refreshPage() {{ // Double
+            if (document.visibilityState === 'visible') {{ // Double
                  fetch('/')
                     .then(response => response.text())
-                    .then(html => {{
+                    .then(html => {{ // Double
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
                         
                         const newStatsGrid = doc.querySelector('.stats-grid');
                         const currentStatsGrid = document.querySelector('.stats-grid');
-                        if (newStatsGrid && currentStatsGrid) {{
+                        if (newStatsGrid && currentStatsGrid) {{ // Double
                             currentStatsGrid.innerHTML = newStatsGrid.innerHTML;
-                        }}
+                        }} // Double
                         
                         const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
                         let newRecentJobsDisplay = null;
-                        if (newRecentJobsContainer) {{
+                        if (newRecentJobsContainer) {{ // Double
                             newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; 
-                        }}
+                        }} // Double
 
                         const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; 
-                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{
+                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{ // Double
                             let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
-                             if (newRecentJobsDisplay && currentJobsDisplay) {{
+                             if (newRecentJobsDisplay && currentJobsDisplay) {{ // Double
                                 currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML;
-                            }}
-                        }}
+                            }} // Double
+                        }} // Double
                         
-                        const lastUpdatedP = document.getElementById('last-updated-paragraph'); // Use ID for reliability
-                        if(lastUpdatedP) {{
+                        const lastUpdatedP = document.getElementById('last-updated-paragraph'); 
+                        if(lastUpdatedP) {{ // Double
                             const now = new Date();
-                            // Example: 2023-10-27 14:35:02
                             const year = now.getFullYear();
-                            const month = (now.getMonth() + 1).toString().padStart(2, '0');
+                            const month = (now.getMonth() + 1).toString().padStart(2, '0'); 
                             const day = now.getDate().toString().padStart(2, '0');
                             const hours = now.getHours().toString().padStart(2, '0');
                             const minutes = now.getMinutes().toString().padStart(2, '0');
                             const seconds = now.getSeconds().toString().padStart(2, '0');
-                            const timeString = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-                            lastUpdatedP.innerHTML = `Page data refreshed: ${timeString} | Auto-refresh active`;
-                        }}
+                            // For JS template literals inside Python f-string, use ${{...}}
+                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`;
+                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`;
+                        }} // Double
                     }})
                     .catch(err => console.error("Error refreshing page content:", err));
-            }}
-        }}
+            }} // Double
+        }} // Double
         
         setInterval(refreshPage, 30000); 
     </script>
