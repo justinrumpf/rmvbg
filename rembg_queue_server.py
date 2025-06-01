@@ -9,6 +9,7 @@ import urllib.parse
 import time
 import psutil
 import threading
+import warnings
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -21,6 +22,11 @@ BASE_DIR_STATIC = "/workspace/rmvbg"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Silence GPU monitoring warnings and psutil warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="psutil")
+logging.getLogger("pynvml").setLevel(logging.ERROR)
+logging.getLogger("nvidia_ml_py").setLevel(logging.ERROR)
 
 try:
     os.makedirs(UPLOADS_DIR_STATIC, exist_ok=True)
@@ -131,7 +137,35 @@ def get_gpu_info():
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        return {
+        
+        gpu_data = {
+            "gpu_used_mb": mem_info.used // (1024**2),
+            "gpu_total_mb": mem_info.total // (1024**2),
+            "gpu_utilization": utilization.gpu
+        }
+        
+        # Log GPU info for debugging (only first few times)
+        if not hasattr(get_gpu_info, '_logged_count'):
+            get_gpu_info._logged_count = 0
+        
+        if get_gpu_info._logged_count < 3:
+            logger.info(f"GPU Monitor: GPU {utilization.gpu}% | Memory {gpu_data['gpu_used_mb']}/{gpu_data['gpu_total_mb']} MB")
+            get_gpu_info._logged_count += 1
+        
+        return gpu_data
+        
+    except ImportError:
+        # pynvml not installed
+        if not hasattr(get_gpu_info, '_import_warned'):
+            logger.warning("GPU monitoring disabled: pynvml not installed (pip install pynvml)")
+            get_gpu_info._import_warned = True
+        return {"gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0}
+    except Exception as e:
+        # GPU not available or other error
+        if not hasattr(get_gpu_info, '_error_warned'):
+            logger.warning(f"GPU monitoring disabled: {type(e).__name__}: {e}")
+            get_gpu_info._error_warned = True
+        return {"gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0} {
             "gpu_used_mb": mem_info.used // (1024**2),
             "gpu_total_mb": mem_info.total // (1024**2),
             "gpu_utilization": utilization.gpu
@@ -470,6 +504,56 @@ async def get_worker_monitoring_data():
 async def get_system_monitoring_data():
     """API endpoint for system metrics data"""
     return get_system_metrics_data()
+
+@app.get("/api/debug/gpu")
+async def debug_gpu_status():
+    """Debug endpoint to check GPU detection and status"""
+    result = {
+        "pynvml_available": False,
+        "gpu_detected": False,
+        "gpu_count": 0,
+        "error": None,
+        "current_metrics": None
+    }
+    
+    try:
+        import pynvml
+        result["pynvml_available"] = True
+        
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        result["gpu_count"] = device_count
+        
+        if device_count > 0:
+            result["gpu_detected"] = True
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
+            # Get device name
+            device_name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(device_name, bytes):
+                device_name = device_name.decode('utf-8')
+            
+            # Get current metrics
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            
+            result["current_metrics"] = {
+                "device_name": device_name,
+                "memory_used_mb": mem_info.used // (1024**2),
+                "memory_total_mb": mem_info.total // (1024**2),
+                "memory_percent": (mem_info.used / mem_info.total) * 100,
+                "gpu_utilization_percent": utilization.gpu,
+                "memory_utilization_percent": utilization.memory
+            }
+            
+        pynvml.nvmlShutdown()
+        
+    except ImportError as e:
+        result["error"] = f"pynvml not installed: {e}"
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    
+    return result
 
 @app.get("/status/{job_id}")
 async def check_job_status(request: Request, job_id: str):
@@ -1146,7 +1230,15 @@ async def root():
             <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
             <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
             <li><strong>Logo Watermarking:</strong> {logo_status}</li>
+            <li><strong>GPU Monitoring:</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected)'}</li>
         </ul>
+        
+        <div style="margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 6px;">
+            <h4>🔧 Debug Info</h4>
+            <p><strong>GPU Debug:</strong> <a href="/api/debug/gpu" target="_blank">Check GPU Detection Status</a></p>
+            <p><strong>Worker Activity:</strong> <a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p>
+            <p><strong>System Metrics:</strong> <a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p>
+        </div>
 
         {recent_jobs_html}
         
