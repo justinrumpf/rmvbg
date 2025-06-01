@@ -255,12 +255,12 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
-# --- CPU-bound functions (run in thread pool) ---
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """
     Synchronous rembg processing - runs in thread pool.
     Uses providers determined at startup by active_rembg_providers.
-    If REMBG_USE_GPU is True, it will only attempt GPU providers and fail if they are not usable.
+    If REMBG_USE_GPU is True, it will only attempt GPU providers and fail if they are not usable
+    or if the session falls back to CPU-only.
     """
     global active_rembg_providers # This list is determined at startup
     session = None
@@ -269,77 +269,127 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
 
     try:
         logger.info(f"Rembg: Attempting to initialize session for model '{model_name}' with providers: {providers_to_attempt}")
-        session = new_session(model_name, providers=providers_to_attempt)
-        
+        session = new_session(model_name, providers=providers_to_attempt) # This might throw an exception if providers are truly bad
+
+        if session is None: # Explicit check immediately after session creation
+            err_msg_session_none = f"CRITICAL: rembg.new_session returned None for model '{model_name}' with providers {providers_to_attempt}. This indicates a failure in session creation."
+            logger.critical(err_msg_session_none)
+            raise RuntimeError(err_msg_session_none) # This will be caught by the outer try-except
+
+        logger.debug(f"Rembg: Successfully called new_session. Type of session object: {type(session)}")
+
         actual_session_providers = []
-        if hasattr(session, 'get_providers'):
+        try:
+            # EAFP approach to get providers
             actual_session_providers = session.get_providers()
-        else: # Should not happen with modern onnxruntime
-            logger.warning("Rembg session object does not have get_providers(). Cannot verify actual providers.")
-            actual_session_providers = ["Unknown (get_providers not available)"]
+            if not actual_session_providers: # get_providers() could return an empty list
+                 logger.warning(f"Rembg: session.get_providers() returned an empty list for model '{model_name}'. This is highly unusual.")
+                 actual_session_providers = ["Error:GetProvidersReturnedEmpty"] # Mark this as an issue state
+        except AttributeError:
+            logger.error(
+                f"Rembg: session object (type: {type(session)}) does NOT have 'get_providers()' method as expected. "
+                "Cannot verify actual providers used by ONNX Runtime. Defaulting to 'Unknown'. This might lead to incorrect GPU enforcement."
+            )
+            actual_session_providers = ["Error:GetProvidersMethodMissing"]
+        except Exception as e_get_providers:
+            logger.error(
+                f"Rembg: Error calling session.get_providers() for model '{model_name}': {type(e_get_providers).__name__}: {e_get_providers}. "
+                "Cannot verify actual providers. Defaulting to 'Unknown'."
+            )
+            actual_session_providers = [f"Error:GetProvidersCallFailed_{type(e_get_providers).__name__}"]
             
-        logger.info(f"Rembg: Session for model '{model_name}' initialized. Intended: {providers_to_attempt}, Actual in ORT session: {actual_session_providers}")
+        logger.info(f"Rembg: Session for model '{model_name}'. Intended providers: {providers_to_attempt}, Actual providers reported by session: {actual_session_providers}")
 
         if REMBG_USE_GPU:
+            # This check ensures that we are actually trying to use GPU providers if REMBG_USE_GPU is True.
+            # It's a safeguard against misconfiguration where REMBG_USE_GPU=True but providers_to_attempt is CPU or empty.
+            if not providers_to_attempt or not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                logger.critical(
+                    f"CRITICAL LOGIC FLAW: REMBG_USE_GPU is True, but providers_to_attempt ({providers_to_attempt}) "
+                    "does not reflect a GPU intention (it's empty or doesn't contain any of "
+                    f"{REMBG_PREFERRED_GPU_PROVIDERS}). This job will likely fail or use CPU incorrectly. "
+                    "Check startup provider configuration."
+                )
+                # The checks below will likely catch this and raise an error if GPU isn't active.
+
             is_any_preferred_gpu_in_actual = any(p in actual_session_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
             is_cpu_in_actual = 'CPUExecutionProvider' in actual_session_providers
-
-            if not providers_to_attempt or not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
-                # This case implies a misconfiguration if REMBG_USE_GPU is True.
-                # active_rembg_providers should have been set to REMBG_PREFERRED_GPU_PROVIDERS or a dummy error provider.
-                logger.error(f"CRITICAL REMBG LOGIC FLAW: REMBG_USE_GPU is True, but providers_to_attempt ({providers_to_attempt}) does not reflect GPU intention. This job may incorrectly use CPU or fail unexpectedly.")
-                # Still, proceed with the check below to be safe.
+            
+            # Handle cases where provider detection failed (actual_session_providers contains "Error:...")
+            if any("Error:" in p for p in actual_session_providers):
+                err_msg = (
+                    f"FORCED GPU FAILED (Provider Detection Issue): Rembg session for model '{model_name}'. "
+                    f"Could not reliably determine actual providers (reported: {actual_session_providers}). "
+                    f"Intended providers were {providers_to_attempt}. Cannot confirm GPU usage."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
 
             if is_cpu_in_actual and not is_any_preferred_gpu_in_actual:
-                # This means ORT used CPU, and no *preferred* GPU provider is active.
-                # This is a failure to force GPU if any GPU provider was intended.
+                # This means ORT is using CPU, and NO preferred GPU provider is active. This is a failure to force GPU.
                 err_msg = (
-                    f"FORCED GPU FAILED: Rembg session for model '{model_name}' is using CPUExecutionProvider "
-                    f"({actual_session_providers}) despite GPU being intended with {providers_to_attempt}. "
+                    f"FORCED GPU FAILED (CPU Fallback): Rembg session for model '{model_name}' is confirmed to be using CPUExecutionProvider "
+                    f"(actual: {actual_session_providers}) and NO preferred GPU provider is active, despite GPU being intended with {providers_to_attempt}. "
                     "This indicates that all attempted GPU providers failed to initialize and ONNX Runtime defaulted to CPU."
                 )
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
             elif not is_any_preferred_gpu_in_actual and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
-                # Intended GPU, but no preferred GPU provider ended up in the session. This is also a failure.
+                # Intended GPU, but no preferred GPU provider ended up in the session.
+                # This covers cases where actual_session_providers might be empty or contain unexpected non-CPU, non-preferred-GPU providers.
                 err_msg = (
-                    f"FORCED GPU FAILED: Rembg session for model '{model_name}' did not activate any of the "
-                    f"intended preferred GPU providers ({providers_to_attempt}). Actual providers: {actual_session_providers}."
+                    f"FORCED GPU FAILED (No Preferred GPU Active): Rembg session for model '{model_name}' did not activate any of the "
+                    f"intended preferred GPU providers ({providers_to_attempt}). Actual providers reported by session: {actual_session_providers}."
                 )
                 logger.error(err_msg)
                 raise RuntimeError(err_msg)
             elif is_cpu_in_actual and is_any_preferred_gpu_in_actual:
-                 logger.warning(
+                 logger.info( # Changed from warning to info as this is common
                      f"Rembg: A preferred GPU provider is active in session ({actual_session_providers}), "
-                     f"but CPUExecutionProvider is also present. This may not be an exclusive GPU session. Intended: {providers_to_attempt}."
+                     f"and CPUExecutionProvider is also present. This is typical. Intended: {providers_to_attempt}."
                  )
             elif not is_any_preferred_gpu_in_actual and not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
-                # This means GPU was not intended (e.g., providers_to_attempt was ['NonExistentGPUErrProvider'] due to bad config)
-                # OR REMBG_USE_GPU was true, but REMBG_PREFERRED_GPU_PROVIDERS was empty.
-                # The initial new_session call should have failed in this case if providers_to_attempt was like ["NonExistent..."]
-                logger.warning(f"Rembg: No preferred GPU provider was intended or active. Actual providers: {actual_session_providers}. Intended: {providers_to_attempt}")
+                # This case implies GPU was not intended by `providers_to_attempt` (e.g. it was `['MisconfiguredForceGPUErrProvider']`)
+                # OR `REMBG_PREFERRED_GPU_PROVIDERS` was empty. The session init should ideally fail for dummy providers.
+                # If it somehow succeeds with providers like `['CPUExecutionProvider']` due to ORT defaults AND
+                # `providers_to_attempt` was bad, this is a misconfiguration caught by other logs or leading to failure.
+                logger.warning(
+                    f"Rembg: No preferred GPU provider was intended by 'providers_to_attempt' ({providers_to_attempt}) or "
+                    f"none are active in session. Actual providers: {actual_session_providers}. "
+                    "If REMBG_USE_GPU is True, this state likely indicates a startup misconfiguration of providers."
+                )
+            elif is_any_preferred_gpu_in_actual:
+                logger.info(f"Rembg: Successfully using a preferred GPU provider. Actual: {actual_session_providers}, Intended: {providers_to_attempt}")
+            else:
+                # Should be covered by previous conditions, but as a fallback
+                logger.warning(f"Rembg: Unexpected provider state. Actual: {actual_session_providers}, Intended: {providers_to_attempt}, REMBG_USE_GPU: {REMBG_USE_GPU}")
 
 
     except Exception as e:
-        # This catches failures from new_session() or the RuntimeError raised above.
+        # This catches:
+        # 1. Exceptions from new_session() itself (e.g., model file not found, ONNX Runtime internal errors with providers).
+        # 2. RuntimeErrors raised by the logic above (e.g., forced GPU failure, session is None).
+        # 3. Any other unexpected exceptions during this block.
         log_message = (
-            f"CRITICAL: Failed to operate rembg session for model '{model_name}' with "
-            f"providers {providers_to_attempt}: {type(e).__name__}: {e}. "
+            f"CRITICAL: Failed to initialize or verify rembg session for model '{model_name}' with "
+            f"intended providers {providers_to_attempt}. Error: {type(e).__name__}: {e}. "
         )
-        if REMBG_USE_GPU:
-            log_message += "REMBG_USE_GPU was True. NO FALLBACK TO CPU. This job will fail as per 'force GPU' policy."
-        else:
+        if REMBG_USE_GPU and "FORCED GPU FAILED" in str(e): # Error came from our logic
+            log_message += "NO FALLBACK TO CPU. This job will fail as per 'force GPU' policy."
+        elif REMBG_USE_GPU: # Error from new_session() or other unexpected
+             log_message += "REMBG_USE_GPU was True. An error occurred before or during provider verification. NO FALLBACK TO CPU. This job will fail."
+        else: # REMBG_USE_GPU was False
             log_message += "REMBG_USE_GPU was False. Error occurred during CPU or configured provider processing."
         
-        logger.critical(log_message, exc_info=True)
+        logger.critical(log_message, exc_info=True) # Always log full traceback for critical errors
         raise # Re-raise the exception to fail the job.
 
-    if session is None: 
-        # This should ideally be caught by the exception block if new_session() returns None or fails.
-        # Adding as a defensive measure.
-        err_msg_session_none = f"CRITICAL: Rembg session is None after attempt for model '{model_name}' with providers {providers_to_attempt}. This indicates an unexpected failure in session creation that wasn't an exception."
-        logger.critical(err_msg_session_none)
-        raise RuntimeError(err_msg_session_none)
+    # If we've reached here, session initialization and provider verification (if REMBG_USE_GPU=True) were successful.
+    # The 'session is None' check at the end is now redundant due to the check after new_session() call.
+    # if session is None: 
+    #     err_msg_session_none_final = f"CRITICAL: Rembg session is None before remove call for model '{model_name}'. This should have been caught earlier."
+    #     logger.critical(err_msg_session_none_final)
+    #     raise RuntimeError(err_msg_session_none_final)
 
     output_bytes = remove(
         input_bytes,
@@ -348,7 +398,7 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
         alpha_matting=True
     )
     return output_bytes
-
+    
 def process_pil_sync(input_bytes: bytes, target_size: int, prepared_logo: Image.Image = None, enable_logo: bool = False, logo_margin: int = 20) -> bytes:
     img_rgba = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
     white_bg_canvas = Image.new("RGB", img_rgba.size, (255, 255, 255))
