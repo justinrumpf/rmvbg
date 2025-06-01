@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X6---
+# --- CREATE DIRECTORIES AT THE VERY TOP X99---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -681,6 +681,7 @@ async def shutdown_event():
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     stats = get_server_stats()
@@ -700,6 +701,12 @@ async def root():
     
     initial_last_updated_text_py = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
 
+
+    # IMPORTANT:
+    # When embedding JavaScript within a Python f-string:
+    # 1. Python's f-string expressions are {python_variable}.
+    # 2. To get a literal curly brace { or } for JavaScript, use {{ or }} respectively.
+    # 3. For JavaScript template literals `${js_variable}`, use `${{js_variable}}` in the Python f-string.
 
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
@@ -827,7 +834,6 @@ async def root():
     </div>
     
     <script>
-        // Chart colors for workers
         const workerColors = [
             '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
             '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
@@ -835,57 +841,19 @@ async def root():
         
         let workerChart, systemChart;
 
-        function initCharts() {{{{ // Escape for Python f-string
+        function initCharts() {{{{
             const workerCtx = document.getElementById('workerChart').getContext('2d');
             workerChart = new Chart(workerCtx, {{{{
                 type: 'line',
-                data: {{{{
-                    labels: [],
-                    datasets: []
-                }}}},
+                data: {{{{ labels: [], datasets: [] }}}},
                 options: {{{{
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {{{{
-                        legend: {{{{
-                            position: 'bottom',
-                            labels: {{{{
-                                boxWidth: 12,
-                            }}}}
-                        }}}},
-                        tooltip: {{{{
-                            mode: 'index',
-                            intersect: false
-                        }}}}
-                    }}}},
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {{{{ legend: {{{{ position: 'bottom', labels: {{{{ boxWidth: 12 }}}} }}}}, tooltip: {{{{ mode: 'index', intersect: false }}}} }}}},
                     scales: {{{{
-                        y: {{{{
-                            beginAtZero: true,
-                            stacked: true, 
-                            title: {{{{
-                                display: true,
-                                text: 'Active Workers / Activity Count'
-                            }}}}
-                        }}}},
-                        x: {{{{
-                            title: {{{{
-                                display: true,
-                                text: 'Time'
-                            }}}},
-                            ticks: {{{{
-                                autoSkip: true,
-                                maxTicksLimit: 15 
-                            }}}}
-                        }}}}
+                        y: {{{{ beginAtZero: true, stacked: true, title: {{{{ display: true, text: 'Active Workers / Activity Count' }}}} }}}},
+                        x: {{{{ title: {{{{ display: true, text: 'Time' }}}}, ticks: {{{{ autoSkip: true, maxTicksLimit: 15 }}}} }}}}
                     }}}},
-                    elements: {{{{
-                        line: {{{{
-                            tension: 0.4 
-                        }}}},
-                        point: {{{{
-                            radius: 2
-                        }}}}
-                    }}}}
+                    elements: {{{{ line: {{{{ tension: 0.4 }}}}, point: {{{{ radius: 2 }}}} }}}}
                 }}}}
             }});
 
@@ -895,75 +863,19 @@ async def root():
                 data: {{{{
                     labels: [],
                     datasets: [
-                        {{{{
-                            label: 'CPU %',
-                            data: [],
-                            borderColor: '#dc3545', 
-                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
-                            fill: false,
-                            yAxisID: 'yPercent' 
-                        }}}},
-                        {{{{
-                            label: 'Memory %',
-                            data: [],
-                            borderColor: '#fd7e14', 
-                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
-                            fill: false,
-                            yAxisID: 'yPercent' 
-                        }}}},
-                        {{{{
-                            label: 'GPU %',
-                            data: [],
-                            borderColor: '#6f42c1', 
-                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
-                            fill: false,
-                            yAxisID: 'yPercent' 
-                        }}}}
+                        {{{{ label: 'CPU %', data: [], borderColor: '#dc3545', backgroundColor: 'rgba(220, 53, 69, 0.1)', fill: false, yAxisID: 'yPercent' }}}},
+                        {{{{ label: 'Memory %', data: [], borderColor: '#fd7e14', backgroundColor: 'rgba(253, 126, 20, 0.1)', fill: false, yAxisID: 'yPercent' }}}},
+                        {{{{ label: 'GPU %', data: [], borderColor: '#6f42c1', backgroundColor: 'rgba(111, 66, 193, 0.1)', fill: false, yAxisID: 'yPercent' }}}}
                     ]
                 }}}},
                 options: {{{{
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {{{{
-                        legend: {{{{
-                            position: 'bottom'
-                        }}}},
-                        tooltip: {{{{
-                            mode: 'index',
-                            intersect: false
-                        }}}}
-                    }}}},
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {{{{ legend: {{{{ position: 'bottom' }}}}, tooltip: {{{{ mode: 'index', intersect: false }}}} }}}},
                     scales: {{{{
-                        yPercent: {{{{ 
-                            type: 'linear',
-                            display: true,
-                            position: 'left',
-                            beginAtZero: true,
-                            max: 100,
-                            title: {{{{
-                                display: true,
-                                text: 'Usage %'
-                            }}}}
-                        }}}},
-                        x: {{{{
-                            title: {{{{
-                                display: true,
-                                text: 'Time'
-                            }}}},
-                            ticks: {{{{
-                                autoSkip: true,
-                                maxTicksLimit: 15 
-                            }}}}
-                        }}}}
+                        yPercent: {{{{ type: 'linear', display: true, position: 'left', beginAtZero: true, max: 100, title: {{{{ display: true, text: 'Usage %' }}}} }}}},
+                        x: {{{{ title: {{{{ display: true, text: 'Time' }}}}, ticks: {{{{ autoSkip: true, maxTicksLimit: 15 }}}} }}}}
                     }}}},
-                    elements: {{{{
-                        line: {{{{
-                            tension: 0.4 
-                        }}}},
-                        point: {{{{
-                            radius: 1
-                        }}}}
-                    }}}}
+                    elements: {{{{ line: {{{{ tension: 0.4 }}}}, point: {{{{ radius: 1 }}}} }}}}
                 }}}}
             }});
         }}}}
@@ -971,88 +883,53 @@ async def root():
         async function updateCharts() {{{{
             try {{{{
                 const workerResponse = await fetch('/api/monitoring/workers');
-                if (!workerResponse.ok) {{{{
-                    console.error("Failed to fetch worker data:", workerResponse.status);
-                    return;
-                }}}}
+                if (!workerResponse.ok) {{{{ console.error("Worker data fetch failed:", workerResponse.status); return; }}}}
                 const workerData = await workerResponse.json();
                 
                 const systemResponse = await fetch('/api/monitoring/system');
-                 if (!systemResponse.ok) {{{{
-                    console.error("Failed to fetch system data:", systemResponse.status);
-                    return;
-                }}}}
+                if (!systemResponse.ok) {{{{ console.error("System data fetch failed:", systemResponse.status); return; }}}}
                 const systemData = await systemResponse.json();
                 
                 updateWorkerChart(workerData);
                 updateSystemChart(systemData);
-                
-            }}}} catch (error) {{{{
-                console.error('Error updating charts:', error);
-            }}}}
+            }}}} catch (error) {{{{ console.error('Error updating charts:', error); }}}}
         }}}}
 
         function formatChartTimestamp(unixTimestamp) {{{{
             const date = new Date(unixTimestamp * 1000);
-            return date.toLocaleTimeString([], {{{{hour: '2-digit', minute: '2-digit', second: '2-digit'}}}); // Escape object literal for JS
+            return date.toLocaleTimeString([], {{{{hour: '2-digit', minute: '2-digit', second: '2-digit'}}});
         }}}}
 
         function updateWorkerChart(data) {{{{
             if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) return;
-            
             const workerIds = Object.keys(data).sort();
             const firstWorkerData = data[workerIds[0]];
-
             if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{{{
-                 workerChart.data.labels = [];
-                 workerChart.data.datasets = [];
-                 workerChart.update('none');
-                return;
+                 workerChart.data.labels = []; workerChart.data.datasets = []; workerChart.update('none'); return;
             }}}}
-            
             const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
-            
             const datasets = workerIds.map((workerId, index) => {{{{
                 const workerBuckets = data[workerId] || []; 
-                const totalActivity = workerBuckets.map(bucket => 
-                    (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
-                );
-                
-                return {{{{
-                    label: workerId.replace('worker_', 'Worker '),
-                    data: totalActivity,
-                    borderColor: workerColors[index % workerColors.length],
-                    backgroundColor: workerColors[index % workerColors.length] + '33', 
-                    fill: true, 
-                    tension: 0.4
-                }}}};
-            }});
-            
-            workerChart.data.labels = labels;
-            workerChart.data.datasets = datasets;
-            workerChart.update('none'); 
+                const totalActivity = workerBuckets.map(bucket => (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0));
+                return {{{{ label: workerId.replace('worker_', 'Worker '), data: totalActivity, borderColor: workerColors[index % workerColors.length], backgroundColor: workerColors[index % workerColors.length] + '33', fill: true, tension: 0.4 }}}};
+            }}}});
+            workerChart.data.labels = labels; workerChart.data.datasets = datasets; workerChart.update('none'); 
         }}}}
 
         function updateSystemChart(data) {{{{
             if (!systemChart || !Array.isArray(data) || data.length === 0) return;
-            
             const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
-            
             const cpuData = data.map(metric => metric.cpu_percent);
             const memoryData = data.map(metric => metric.memory_percent);
             const gpuData = data.map(metric => metric.gpu_utilization || 0); 
-            
             systemChart.data.labels = labels;
-            systemChart.data.datasets[0].data = cpuData;
-            systemChart.data.datasets[1].data = memoryData;
-            systemChart.data.datasets[2].data = gpuData;
+            systemChart.data.datasets[0].data = cpuData; systemChart.data.datasets[1].data = memoryData; systemChart.data.datasets[2].data = gpuData;
             systemChart.update('none'); 
         }}}}
 
         document.addEventListener('DOMContentLoaded', function() {{{{
             initCharts();
             updateCharts(); 
-            
             const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; 
             setInterval(updateCharts, chartUpdateInterval);
         }}}});
@@ -1064,25 +941,18 @@ async def root():
                     .then(html => {{{{
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
-                        
                         const newStatsGrid = doc.querySelector('.stats-grid');
                         const currentStatsGrid = document.querySelector('.stats-grid');
-                        if (newStatsGrid && currentStatsGrid) {{{{
-                            currentStatsGrid.innerHTML = newStatsGrid.innerHTML;
-                        }}}}
+                        if (newStatsGrid && currentStatsGrid) {{{{ currentStatsGrid.innerHTML = newStatsGrid.innerHTML; }}}}
                         
                         const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
                         let newRecentJobsDisplay = null;
-                        if (newRecentJobsContainer) {{{{
-                            newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; 
-                        }}}}
+                        if (newRecentJobsContainer) {{{{ newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; }}}}
 
                         const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; 
                         if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{{{
                             let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
-                             if (newRecentJobsDisplay && currentJobsDisplay) {{{{
-                                currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML;
-                            }}}}
+                             if (newRecentJobsDisplay && currentJobsDisplay) {{{{ currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML; }}}}
                         }}}}
                         
                         const lastUpdatedP = document.getElementById('last-updated-paragraph'); 
@@ -1094,8 +964,8 @@ async def root():
                             const hours = now.getHours().toString().padStart(2, '0');
                             const minutes = now.getMinutes().toString().padStart(2, '0');
                             const seconds = now.getSeconds().toString().padStart(2, '0');
-                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`; // Escaped for JS template literal
-                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`; // Escaped for JS template literal
+                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`;
+                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`;
                         }}}}
                     }}}})
                     .catch(err => console.error("Error refreshing page content:", err));
@@ -1105,6 +975,9 @@ async def root():
         setInterval(refreshPage, 30000); 
     </script>
     </body></html>"""
+
+
+
 
 if __name__ == "__main__":
     import uvicorn
