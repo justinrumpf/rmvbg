@@ -1087,7 +1087,7 @@ async def root():
                         // Add similar updates for other dynamic parts like recent_jobs_html
                         const newRecentJobs = doc.querySelector('.monitoring-section + h3 + table, .monitoring-section + h3 + p');
                         const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; //h3
-                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){ //table or p
+                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){
                             let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
                              if (newRecentJobs && currentJobsDisplay) {{
                                 currentJobsDisplay.outerHTML = newRecentJobs.outerHTML;
