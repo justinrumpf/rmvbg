@@ -66,15 +66,16 @@ app.add_middleware(
 # --- Configuration Constants ---
 MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 15  # Adjusted, GPU and BiRefNet might be faster
+ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
-DEFAULT_MODEL_NAME = "birefnet" # <--- SET DEFAULT MODEL
+DEFAULT_MODEL_NAME = "birefnet"
 
 # --- GPU Configuration for Rembg ---
-REMBG_USE_GPU = True
-# Order matters: TensorRT > CUDA > DML. CPU is added as fallback.
+REMBG_USE_GPU = True # User wants to force GPU, so this should be True.
+# Order matters: TensorRT > CUDA > DML. CPU is NOT a fallback here if REMBG_USE_GPU is True.
 REMBG_PREFERRED_GPU_PROVIDERS = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'DmlExecutionProvider']
+# This list is used ONLY if REMBG_USE_GPU is False, or as a last resort if startup catastrophically fails to find any provider.
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
 
@@ -105,7 +106,9 @@ EXPECTED_API_KEY = "secretApiKey"
 
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
-active_rembg_providers: list[str] = list(REMBG_CPU_PROVIDERS) # Default, will be updated at startup
+# active_rembg_providers will be determined at startup.
+# Initialize defensively, will be overwritten.
+active_rembg_providers: list[str] = list(REMBG_CPU_PROVIDERS) 
 
 server_start_time = time.time()
 job_history = []
@@ -146,19 +149,20 @@ def get_gpu_info():
         
         if not hasattr(get_gpu_info, '_logged_count'):
             get_gpu_info._logged_count = 0
-        if get_gpu_info._logged_count < 3:
-            logger.info(f"GPU Monitor (pynvml): GPU {utilization.gpu}% | Memory {gpu_data['gpu_used_mb']}/{gpu_data['gpu_total_mb']} MB")
+        if get_gpu_info._logged_count < 3: # Log first few times
+            logger.debug(f"GPU Monitor (pynvml): GPU {utilization.gpu}% | Memory {gpu_data['gpu_used_mb']}/{gpu_data['gpu_total_mb']} MB")
             get_gpu_info._logged_count += 1
             
     except ImportError:
         if not hasattr(get_gpu_info, '_import_warned'):
             logger.warning("GPU monitoring via pynvml disabled: pynvml not installed (pip install pynvml). This is mainly for NVIDIA GPUs.")
             get_gpu_info._import_warned = True
-    except Exception as e: # Catches pynvml.NVMLError, etc.
+    except Exception as e: 
         if not hasattr(get_gpu_info, '_error_warned'):
             logger.warning(f"GPU monitoring via pynvml failed: {type(e).__name__}: {e}. This might happen if no NVIDIA GPU is present or drivers are missing.")
             get_gpu_info._error_warned = True
     finally:
+        # pynvml.nvmlShutdown() # Don't shutdown here if called frequently
         pass
     return gpu_data
 
@@ -172,7 +176,7 @@ async def system_monitor():
             memory_used_gb = memory.used / (1024**3)
             memory_total_gb = memory.total / (1024**3)
             
-            gpu_info = get_gpu_info()
+            gpu_info = get_gpu_info() # pynvml.nvmlInit is called inside
             
             timestamp = time.time()
             metrics = {
@@ -197,7 +201,7 @@ MIME_TO_EXT = {
 class SubmitJsonBody(BaseModel):
     image: HttpUrl
     key: str
-    model: str = DEFAULT_MODEL_NAME # <--- Use default model
+    model: str = DEFAULT_MODEL_NAME
     steps: int = 20
     samples: int = 1
     resolution: str = "1024x1024"
@@ -253,52 +257,95 @@ def get_system_metrics_data(): return list(system_metrics)
 
 # --- CPU-bound functions (run in thread pool) ---
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
-    """Synchronous rembg processing - runs in thread pool. Uses globally configured providers."""
-    global active_rembg_providers
-    session = None # Ensure session is defined in this scope
-    intended_providers = list(active_rembg_providers) # What we intend to use
+    """
+    Synchronous rembg processing - runs in thread pool.
+    Uses providers determined at startup by active_rembg_providers.
+    If REMBG_USE_GPU is True, it will only attempt GPU providers and fail if they are not usable.
+    """
+    global active_rembg_providers # This list is determined at startup
+    session = None
+    
+    providers_to_attempt = list(active_rembg_providers) 
 
     try:
-        session = new_session(model_name, providers=intended_providers)
-        # We can't reliably call get_providers() on the rembg session object.
-        # So, we log what we *attempted* to use.
-        logger.debug(f"Rembg session for model {model_name} created with intended providers: {intended_providers}")
+        logger.info(f"Rembg: Attempting to initialize session for model '{model_name}' with providers: {providers_to_attempt}")
+        session = new_session(model_name, providers=providers_to_attempt)
         
-        # Heuristic check: if GPU was intended and we are not falling back, assume it's trying GPU.
-        is_gpu_provider_intended = any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in intended_providers)
+        actual_session_providers = []
+        if hasattr(session, 'get_providers'):
+            actual_session_providers = session.get_providers()
+        else: # Should not happen with modern onnxruntime
+            logger.warning("Rembg session object does not have get_providers(). Cannot verify actual providers.")
+            actual_session_providers = ["Unknown (get_providers not available)"]
+            
+        logger.info(f"Rembg: Session for model '{model_name}' initialized. Intended: {providers_to_attempt}, Actual in ORT session: {actual_session_providers}")
 
-        if is_gpu_provider_intended:
-            if not hasattr(process_rembg_sync, '_gpu_attempt_logged_count'):
-                process_rembg_sync._gpu_attempt_logged_count = 0
-            if process_rembg_sync._gpu_attempt_logged_count < 5:
-                logger.info(f"Rembg attempting to use providers: {intended_providers} (GPU intent)")
-                process_rembg_sync._gpu_attempt_logged_count +=1
-        else:
-             logger.info(f"Rembg using CPU providers: {intended_providers}")
+        if REMBG_USE_GPU:
+            is_any_preferred_gpu_in_actual = any(p in actual_session_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
+            is_cpu_in_actual = 'CPUExecutionProvider' in actual_session_providers
+
+            if not providers_to_attempt or not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                # This case implies a misconfiguration if REMBG_USE_GPU is True.
+                # active_rembg_providers should have been set to REMBG_PREFERRED_GPU_PROVIDERS or a dummy error provider.
+                logger.error(f"CRITICAL REMBG LOGIC FLAW: REMBG_USE_GPU is True, but providers_to_attempt ({providers_to_attempt}) does not reflect GPU intention. This job may incorrectly use CPU or fail unexpectedly.")
+                # Still, proceed with the check below to be safe.
+
+            if is_cpu_in_actual and not is_any_preferred_gpu_in_actual:
+                # This means ORT used CPU, and no *preferred* GPU provider is active.
+                # This is a failure to force GPU if any GPU provider was intended.
+                err_msg = (
+                    f"FORCED GPU FAILED: Rembg session for model '{model_name}' is using CPUExecutionProvider "
+                    f"({actual_session_providers}) despite GPU being intended with {providers_to_attempt}. "
+                    "This indicates that all attempted GPU providers failed to initialize and ONNX Runtime defaulted to CPU."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
+            elif not is_any_preferred_gpu_in_actual and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                # Intended GPU, but no preferred GPU provider ended up in the session. This is also a failure.
+                err_msg = (
+                    f"FORCED GPU FAILED: Rembg session for model '{model_name}' did not activate any of the "
+                    f"intended preferred GPU providers ({providers_to_attempt}). Actual providers: {actual_session_providers}."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
+            elif is_cpu_in_actual and is_any_preferred_gpu_in_actual:
+                 logger.warning(
+                     f"Rembg: A preferred GPU provider is active in session ({actual_session_providers}), "
+                     f"but CPUExecutionProvider is also present. This may not be an exclusive GPU session. Intended: {providers_to_attempt}."
+                 )
+            elif not is_any_preferred_gpu_in_actual and not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                # This means GPU was not intended (e.g., providers_to_attempt was ['NonExistentGPUErrProvider'] due to bad config)
+                # OR REMBG_USE_GPU was true, but REMBG_PREFERRED_GPU_PROVIDERS was empty.
+                # The initial new_session call should have failed in this case if providers_to_attempt was like ["NonExistent..."]
+                logger.warning(f"Rembg: No preferred GPU provider was intended or active. Actual providers: {actual_session_providers}. Intended: {providers_to_attempt}")
 
 
     except Exception as e:
-        logger.error(f"Failed to initialize rembg session with {intended_providers} for model {model_name}: {e}. Falling back to CPU-only: {REMBG_CPU_PROVIDERS}")
-        intended_providers = list(REMBG_CPU_PROVIDERS) 
-        try:
-            session = new_session(model_name, providers=intended_providers)
-            logger.info(f"Rembg session for model {model_name} successfully fell back to CPU providers (intended: {intended_providers})")
-        except Exception as e_cpu:
-            logger.critical(f"CRITICAL: Failed to initialize rembg session even with CPU-only providers {intended_providers} for model {model_name}: {e_cpu}", exc_info=True)
-            raise 
+        # This catches failures from new_session() or the RuntimeError raised above.
+        log_message = (
+            f"CRITICAL: Failed to operate rembg session for model '{model_name}' with "
+            f"providers {providers_to_attempt}: {type(e).__name__}: {e}. "
+        )
+        if REMBG_USE_GPU:
+            log_message += "REMBG_USE_GPU was True. NO FALLBACK TO CPU. This job will fail as per 'force GPU' policy."
+        else:
+            log_message += "REMBG_USE_GPU was False. Error occurred during CPU or configured provider processing."
+        
+        logger.critical(log_message, exc_info=True)
+        raise # Re-raise the exception to fail the job.
 
-    if session is None: # Should not happen if the above logic is correct, but as a safeguard
-        logger.critical(f"CRITICAL: Rembg session is None after attempts for model {model_name}. This should not happen.")
-        raise RuntimeError(f"Failed to create rembg session for model {model_name}")
+    if session is None: 
+        # This should ideally be caught by the exception block if new_session() returns None or fails.
+        # Adding as a defensive measure.
+        err_msg_session_none = f"CRITICAL: Rembg session is None after attempt for model '{model_name}' with providers {providers_to_attempt}. This indicates an unexpected failure in session creation that wasn't an exception."
+        logger.critical(err_msg_session_none)
+        raise RuntimeError(err_msg_session_none)
 
     output_bytes = remove(
         input_bytes,
         session=session,
-        post_process_mask=True, # Consider if BiRefNet needs different post-processing
-        alpha_matting=True      # Consider if BiRefNet needs different post-processing
-        # alpha_matting_foreground_threshold=240, # Example, might need tuning
-        # alpha_matting_background_threshold=10,  # Example, might need tuning
-        # alpha_matting_erode_size=10             # Example, might need tuning
+        post_process_mask=True,
+        alpha_matting=True
     )
     return output_bytes
 
@@ -336,7 +383,7 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
-    model_to_use = body.model if body.model else DEFAULT_MODEL_NAME # Ensure default if empty
+    model_to_use = body.model if body.model else DEFAULT_MODEL_NAME
     try: queue.put_nowait((job_id, str(body.image), model_to_use, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue full. Rejecting JSON request for {body.image}.")
@@ -350,7 +397,7 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
             "eta": eta_seconds, "status_check_url": status_check_url}
 
 @app.post("/submit_form")
-async def submit_form_image_for_processing(request: Request, image_file: UploadFile = File(...), key: str = Form(...), model: str = Form(DEFAULT_MODEL_NAME)): # <--- Use default model
+async def submit_form_image_for_processing(request: Request, image_file: UploadFile = File(...), key: str = Form(...), model: str = Form(DEFAULT_MODEL_NAME)):
     if key != EXPECTED_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
@@ -374,17 +421,15 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
         logger.error(f"Error saving upload {saved_fn} for job {job_id}: {e}"); raise HTTPException(status_code=500, detail=f"Save failed: {e}")
     finally: await image_file.close()
     file_uri = f"file://{original_path}"
-    model_to_use = model if model else DEFAULT_MODEL_NAME # Ensure default if empty
+    model_to_use = model if model else DEFAULT_MODEL_NAME
 
     try:
         queue.put_nowait((job_id, file_uri, model_to_use, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}).")
         if os.path.exists(original_path):
-            try:
-                os.remove(original_path)
-            except OSError as e_clean:
-                logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
+            try: os.remove(original_path)
+            except OSError as e_clean: logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": f"(form_upload: {original_fn})",
@@ -394,9 +439,6 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {"status": "processing", "job_id": job_id, "original_image_url": f"{public_url_base}/originals/{saved_fn}",
             "image_links": [f"{public_url_base}/images/{job_id}.webp"], "eta": eta_seconds, "status_check_url": status_check_url}
-
-# ... (rest of the API endpoints like /api/monitoring/*, /api/debug/gpu, /status/{job_id}, /job/{job_id} remain largely the same) ...
-# Make sure to double-check escaping in HTML if any further issues arise there.
 
 @app.get("/api/monitoring/workers")
 async def get_worker_monitoring_data(): return get_worker_activity_data()
@@ -409,7 +451,10 @@ async def debug_gpu_status():
     global active_rembg_providers
     result = {"pynvml_available": False, "gpu_detected_pynvml": False, "gpu_count_pynvml": 0,
               "error_pynvml": None, "current_metrics_pynvml": None,
-              "onnxruntime_info": {"available": False, "providers": [], "error": None, "currently_configured_rembg_providers": active_rembg_providers}}
+              "onnxruntime_info": {"available": False, "providers": [], "error": None, 
+                                   "rembg_use_gpu_config": REMBG_USE_GPU,
+                                   "rembg_preferred_gpu_providers_config": REMBG_PREFERRED_GPU_PROVIDERS,
+                                   "currently_active_rembg_providers_for_workers": active_rembg_providers}}
     try:
         import pynvml
         result["pynvml_available"] = True
@@ -427,6 +472,7 @@ async def debug_gpu_status():
                 "device_name": device_name, "memory_used_mb": mem_info.used // (1024**2),
                 "memory_total_mb": mem_info.total // (1024**2), "memory_percent": (mem_info.used / mem_info.total) * 100 if mem_info.total > 0 else 0,
                 "gpu_utilization_percent": util.gpu, "memory_utilization_percent": util.memory}
+        # pynvml.nvmlShutdown() # Temporarily removed for stability if get_gpu_info also uses it.
     except ImportError: result["error_pynvml"] = "pynvml not installed. pip install pynvml (for NVIDIA GPU stats)"
     except Exception as e: result["error_pynvml"] = f"{type(e).__name__}: {e} (pynvml error)"
     
@@ -458,7 +504,7 @@ async def check_job_status(request: Request, job_id: str):
                 processed_filename = f"{job_id}.webp"
                 if os.path.exists(os.path.join(PROCESSED_DIR, processed_filename)):
                     response_data["processed_image_url"] = f"{public_url_base}/images/{processed_filename}"
-            else: response_data["error_message"] = f"Job failed after {historical_job['total_time']:.2f}s"
+            else: response_data["error_message"] = f"Job failed after {historical_job['total_time']:.2f}s" # Simplified, real error not stored in history
             return JSONResponse(content=response_data)
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -475,44 +521,98 @@ async def check_job_status(request: Request, job_id: str):
 
 @app.get("/job/{job_id}")
 async def job_details(request: Request, job_id: str):
-    job_info = next((job for job in job_history if job["job_id"] == job_id), None)
-    if not job_info and job_id in results:
-        result = results[job_id]
-        job_info = {"job_id": job_id, "timestamp": time.time(), "status": "active" if result.get("status") not in ["done", "error"] else result.get("status"),
-                    "total_time": 0, "input_size": 0, "output_size": 0, "model": "unknown", "source_type": "unknown", "original_filename": ""}
-    if not job_info: raise HTTPException(status_code=404, detail="Job not found")
+    job_info_hist = next((job for job in job_history if job["job_id"] == job_id), None)
+    result_details = results.get(job_id, {})
+    
+    display_job_info = {}
+    if job_info_hist:
+        display_job_info = job_info_hist.copy()
+    elif result_details: # Job is active or just finished but not in history yet
+        display_job_info = {
+            "job_id": job_id, 
+            "timestamp": time.time(), # approx. current time for active
+            "status": result_details.get("status", "unknown"),
+            "total_time": 0, "input_size": 0, "output_size": 0, 
+            "model": "N/A (active)", "source_type": "N/A (active)", 
+            "original_filename": result_details.get("input_image_url", "N/A (active)").split('/')[-1]
+        }
+    else:
+        raise HTTPException(status_code=404, detail="Job not found in active results or history")
+
     public_url_base = get_proxy_url(request)
     original_image_url, processed_image_url = None, None
-    original_extensions = ['.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff']
-    for ext in original_extensions:
-        original_filename = f"{job_id}_original{ext}"
-        if os.path.exists(os.path.join(UPLOADS_DIR, original_filename)):
-            original_image_url = f"{public_url_base}/originals/{original_filename}"; break
+    
+    # Try to find original image if path is known
+    if result_details.get("original_local_path"):
+         original_image_url = f"{public_url_base}/originals/{os.path.basename(result_details['original_local_path'])}"
+    elif display_job_info.get("source_type") == "upload": # Try to guess from history if it was an upload
+        original_fn_guess = display_job_info.get('original_filename', '')
+        # This part is tricky as extension might not be in original_filename from history.
+        # We'll rely on the common extensions.
+        original_extensions = ['.webp', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff'] # Add more if needed
+        found_orig = False
+        for ext in original_extensions:
+            # Try to construct a plausible original filename if not directly known
+            potential_orig_fn = f"{job_id}_original{ext}"
+            if os.path.exists(os.path.join(UPLOADS_DIR, potential_orig_fn)):
+                original_image_url = f"{public_url_base}/originals/{potential_orig_fn}"
+                found_orig = True
+                break
+        if not found_orig and original_fn_guess: # Fallback for URL based original filename in history if needed
+             pass # URL-based original is usually just the URL itself.
+
+    # Processed image
     processed_filename = f"{job_id}.webp"
     if os.path.exists(os.path.join(PROCESSED_DIR, processed_filename)):
         processed_image_url = f"{public_url_base}/images/{processed_filename}"
-    result_details = results.get(job_id, {})
+    elif result_details.get("processed_path"): # From active job
+        processed_image_url = f"{public_url_base}/images/{os.path.basename(result_details['processed_path'])}"
+
+
     return HTMLResponse(content=f"""<!DOCTYPE html><html lang="en">
-    <head><meta charset="UTF-8"><title>Job Details - {job_id[:8]}</title><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1200px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}}.status-badge{{padding:5px 10px;border-radius:15px;font-weight:bold;text-transform:uppercase;}}.status-completed{{background-color:#d4edda;color:#155724;}}.status-failed{{background-color:#f8d7da;color:#721c24;}}.status-active{{background-color:#d1ecf1;color:#0c5460;}}.details-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.detail-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;}}.detail-label{{font-size:12px;color:#6c757d;text-transform:uppercase;margin-bottom:5px;}}.detail-value{{font-size:18px;font-weight:bold;color:#495057;}}.images-section{{margin-top:30px;}}.images-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}}.image-card{{border:1px solid #dee2e6;border-radius:8px;padding:15px;background:white;}}.image-card h3{{margin-top:0;color:#495057;}}.image-card img{{max-width:100%;height:auto;border-radius:4px;border:1px solid #dee2e6;}}.no-image{{color:#6c757d;font-style:italic;text-align:center;padding:40px;background:#f8f9fa;border-radius:4px;}}.back-link{{color:#007bff;text-decoration:none;}}.back-link:hover{{text-decoration:underline;}}@media (max-width:768px){{.images-container{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}</style></head>
+    <head><meta charset="UTF-8"><title>Job Details - {job_id[:8]}</title><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1200px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}}.status-badge{{padding:5px 10px;border-radius:15px;font-weight:bold;text-transform:uppercase;}}.status-completed{{background-color:#d4edda;color:#155724;}}.status-failed,.status-error{{background-color:#f8d7da;color:#721c24;}}.status-active,.status-queued,.status-processing_rembg,.status-processing_image,.status-saving,.status-loading_file,.status-downloading{{background-color:#d1ecf1;color:#0c5460;}}.details-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.detail-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;}}.detail-label{{font-size:12px;color:#6c757d;text-transform:uppercase;margin-bottom:5px;}}.detail-value{{font-size:18px;font-weight:bold;color:#495057;}}.images-section{{margin-top:30px;}}.images-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}}.image-card{{border:1px solid #dee2e6;border-radius:8px;padding:15px;background:white;}}.image-card h3{{margin-top:0;color:#495057;}}.image-card img{{max-width:100%;height:auto;border-radius:4px;border:1px solid #dee2e6;}}.no-image{{color:#6c757d;font-style:italic;text-align:center;padding:40px;background:#f8f9fa;border-radius:4px;}}.back-link{{color:#007bff;text-decoration:none;}}.back-link:hover{{text-decoration:underline;}}@media (max-width:768px){{.images-container{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}</style></head>
     <body><div class="container"><div class="header"><h1>Job Details</h1><a href="/" class="back-link">← Back to Dashboard</a></div>
-    <div style="margin-bottom:20px;"><h2>Job ID: <code>{job_id}</code></h2><span class="status-badge status-{job_info['status'].lower()}">{job_info['status']}</span></div>
-    <div class="details-grid"><div class="detail-card"><div class="detail-label">Processed Time</div><div class="detail-value">{format_timestamp(job_info['timestamp'])}</div></div><div class="detail-card"><div class="detail-label">Processing Duration</div><div class="detail-value">{job_info['total_time']:.2f}s</div></div><div class="detail-card"><div class="detail-label">Model Used</div><div class="detail-value">{job_info['model']}</div></div><div class="detail-card"><div class="detail-label">Source Type</div><div class="detail-value">{job_info['source_type'].title()}</div></div><div class="detail-card"><div class="detail-label">Input Size</div><div class="detail-value">{format_size(job_info['input_size'])}</div></div><div class="detail-card"><div class="detail-label">Output Size</div><div class="detail-value">{format_size(job_info['output_size']) if job_info['output_size']>0 else 'N/A'}</div></div></div>
-    {f"<div class='detail-card'><div class='detail-label'>Original Filename</div><div class='detail-value'>{job_info['original_filename']}</div></div>" if job_info.get('original_filename') else ''}
-    <div class="images-section"><h2>Before & After Images</h2><div class="images-container"><div class="image-card"><h3>🔍 Original Image</h3>{f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available</div>'}</div><div class="image-card"><h3>✨ Processed Image</h3>{f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available</div>'}</div></div></div>
-    <div style="margin-top:30px;padding:15px;background:#f8f9fa;border-radius:6px;"><h3>Technical Details</h3><ul><li><strong>Current Status in System:</strong> {result_details.get('status','Not in active results')}</li><li><strong>Status Check URL:</strong> <a href="{result_details.get('status_check_url','#')}" target="_blank">API Status</a></li>{f"<li><strong>Error Message:</strong> {result_details.get('error_message','None')}</li>" if result_details.get('error_message') else ''}<li><strong>Job ID:</strong> <code>{job_id}</code></li></ul></div></div></body></html>""", status_code=200)
+    <div style="margin-bottom:20px;"><h2>Job ID: <code>{job_id}</code></h2><span class="status-badge status-{display_job_info['status'].lower()}">{display_job_info['status']}</span></div>
+    <div class="details-grid">
+        <div class="detail-card"><div class="detail-label">Time</div><div class="detail-value">{format_timestamp(display_job_info['timestamp'])}</div></div>
+        <div class="detail-card"><div class="detail-label">Processing Duration</div><div class="detail-value">{display_job_info['total_time']:.2f}s</div></div>
+        <div class="detail-card"><div class="detail-label">Model Used</div><div class="detail-value">{display_job_info['model']}</div></div>
+        <div class="detail-card"><div class="detail-label">Source Type</div><div class="detail-value">{str(display_job_info['source_type']).title()}</div></div>
+        <div class="detail-card"><div class="detail-label">Input Size</div><div class="detail-value">{format_size(display_job_info['input_size'])}</div></div>
+        <div class="detail-card"><div class="detail-label">Output Size</div><div class="detail-value">{format_size(display_job_info['output_size']) if display_job_info['output_size']>0 else 'N/A'}</div></div>
+    </div>
+    {f"<div class='detail-card' style='grid-column: span / auto;'><div class='detail-label'>Original Filename/URL</div><div class='detail-value' style='word-break:break-all;'>{display_job_info.get('original_filename', result_details.get('input_image_url','N/A'))}</div></div>" if display_job_info.get('original_filename') or result_details.get('input_image_url') else ''}
+    <div class="images-section"><h2>Before & After Images</h2><div class="images-container"><div class="image-card"><h3>🔍 Original Image</h3>{f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available or not yet processed</div>'}</div><div class="image-card"><h3>✨ Processed Image</h3>{f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available or job failed/pending</div>'}</div></div></div>
+    <div style="margin-top:30px;padding:15px;background:#f8f9fa;border-radius:6px;"><h3>Technical Details (Live Job Data if Active)</h3><ul>
+        <li><strong>Current Status in System:</strong> {result_details.get('status','Not in active results (check history details above)')}</li>
+        <li><strong>Status Check URL:</strong> <a href="{result_details.get('status_check_url', f'{public_url_base}/status/{job_id}')}" target="_blank">API Status</a></li>
+        {f"<li><strong>Error Message:</strong> {result_details.get('error_message','None')}</li>" if result_details.get('error_message') else ''}
+        <li><strong>Job ID:</strong> <code>{job_id}</code></li>
+    </ul></div></div></body></html>""", status_code=200)
 
 
 async def cleanup_old_results():
     while True:
         try:
             current_time = time.time(); expired_jobs = []
-            for job_id, job_data in results.items():
+            # Clean from active 'results' dictionary
+            for job_id, job_data in list(results.items()): # list() for safe iteration
                 completion_time = job_data.get("completion_time")
-                if completion_time and (current_time - completion_time) > 3600: expired_jobs.append(job_id)
-            for job_id in expired_jobs: logger.info(f"Cleaning up old job from results: {job_id}"); del results[job_id]
-            if expired_jobs: logger.info(f"Cleaned up {len(expired_jobs)} old jobs from results dict")
+                # Only remove if job is done or errored AND old. Queued/processing jobs should stay.
+                if job_data.get("status") in ["done", "error"] and completion_time and (current_time - completion_time) > 3600 : # 1 hour
+                     expired_jobs.append(job_id)
+            
+            for job_id in expired_jobs:
+                logger.info(f"Cleaning up old job from active results: {job_id}")
+                del results[job_id]
+            if expired_jobs:
+                logger.info(f"Cleaned up {len(expired_jobs)} old jobs from active results dict")
+
+            # Optional: Clean old files (more complex, ensure not to delete files for jobs still in history view)
+            # For now, focusing on 'results' dict cleanup.
+
         except Exception as e: logger.error(f"Error in cleanup task: {e}", exc_info=True)
-        await asyncio.sleep(600)
+        await asyncio.sleep(600) # Run every 10 minutes
 
 async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
@@ -521,20 +621,31 @@ async def image_processing_worker(worker_id: int):
         job_id, image_source_str, model_name, _ = await queue.get()
         t_job_start = time.perf_counter()
         logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
-        log_worker_activity(worker_id, WORKER_IDLE)
-        if job_id not in results:
-            logger.error(f"Worker {worker_id}: Job {job_id} from queue not in results. Skipping."); queue.task_done(); continue
+        log_worker_activity(worker_id, WORKER_IDLE) # Initial state before fetch
+        
+        if job_id not in results: # Should not happen if enqueuing adds to results first
+            logger.error(f"Worker {worker_id}: Job {job_id} (from queue) not found in 'results' dict. Skipping."); 
+            queue.task_done(); continue
+        
         input_bytes_for_rembg: bytes | None = None
         input_fetch_time, rembg_time, pil_time, save_time = 0.0, 0.0, 0.0, 0.0
         input_size_bytes, output_size_bytes = 0, 0
+        original_fn_for_history = image_source_str.split('/')[-1] # Default/URL case
+        source_type_for_history = "url" if image_source_str.startswith(("http:", "https:")) else "upload"
+
         try:
+            results[job_id]["status"] = "fetching_input" # More generic initial status
             log_worker_activity(worker_id, WORKER_FETCHING); t_input_fetch_start = time.perf_counter()
+            
             if image_source_str.startswith("file://"):
-                results[job_id]["status"] = "loading_file"; local_path = image_source_str[len("file://"):]
-                if not os.path.exists(local_path): raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path}")
+                results[job_id]["status"] = "loading_file"; 
+                local_path = image_source_str[len("file://"):]
+                if not os.path.exists(local_path): 
+                    raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path}")
                 async with aiofiles.open(local_path, 'rb') as f: input_bytes_for_rembg = await f.read()
                 input_size_bytes = len(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (W{worker_id}): Loaded local file ({format_size(input_size_bytes)})")
+                original_fn_for_history = os.path.basename(local_path) # More accurate for files
+                logger.info(f"Job {job_id} (W{worker_id}): Loaded local file '{original_fn_for_history}' ({format_size(input_size_bytes)})")
             elif image_source_str.startswith(("http://", "https://")):
                 results[job_id]["status"] = "downloading"
                 logger.info(f"Job {job_id} (W{worker_id}): Downloading from {image_source_str}...")
@@ -542,24 +653,30 @@ async def image_processing_worker(worker_id: int):
                     img_response = await client.get(image_source_str); img_response.raise_for_status()
                 input_bytes_for_rembg = await img_response.aread(); input_size_bytes = len(input_bytes_for_rembg)
                 logger.info(f"Job {job_id} (W{worker_id}): Downloaded {format_size(input_size_bytes)}")
+                
+                # Save downloaded original for record-keeping /originals endpoint
                 content_type = img_response.headers.get("content-type", "unknown").lower()
-                if content_type == "application/octet-stream" or not content_type.startswith("image/"):
-                    ext_url = os.path.splitext(urllib.parse.urlparse(image_source_str).path)[1].lower()
-                    ct_map = {".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
-                    if ext_url in ct_map: content_type = ct_map[ext_url]
-                if not content_type.startswith("image/"): raise ValueError(f"Invalid final content type '{content_type}'. Not image.")
-                extension = MIME_TO_EXT.get(content_type, ".bin")
-                dl_original_path = os.path.join(UPLOADS_DIR, f"{job_id}_original_downloaded{extension}")
-                results[job_id]["original_local_path"] = dl_original_path
+                parsed_url_path = urllib.parse.urlparse(image_source_str).path
+                _, url_ext = os.path.splitext(parsed_url_path)
+                extension = MIME_TO_EXT.get(content_type, url_ext if url_ext else ".bin")
+                
+                dl_original_fn = f"{job_id}_original_downloaded{extension}"
+                dl_original_path = os.path.join(UPLOADS_DIR, dl_original_fn)
+                results[job_id]["original_local_path"] = dl_original_path # Store for /status endpoint
                 async with aiofiles.open(dl_original_path, 'wb') as out_file: await out_file.write(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (W{worker_id}): Saved downloaded original")
-            else: raise ValueError(f"Unsupported image source: {image_source_str}")
-            if input_bytes_for_rembg is None: raise ValueError(f"Image content is None for job {job_id}.")
+                original_fn_for_history = dl_original_fn # Update for history
+                logger.info(f"Job {job_id} (W{worker_id}): Saved downloaded original as '{dl_original_fn}'")
+            else: 
+                raise ValueError(f"Unsupported image source format: {image_source_str}")
+            
+            if input_bytes_for_rembg is None: 
+                raise ValueError(f"Image content is None for job {job_id} after fetch attempt.")
             input_fetch_time = time.perf_counter() - t_input_fetch_start
 
             log_worker_activity(worker_id, WORKER_PROCESSING_REMBG); results[job_id]["status"] = "processing_rembg"
-            logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name}, providers: {active_rembg_providers})...")
+            logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
             t_rembg_start = time.perf_counter(); loop = asyncio.get_event_loop()
+            # process_rembg_sync now uses active_rembg_providers internally
             output_bytes_with_alpha = await loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
             rembg_time = time.perf_counter() - t_rembg_start
             logger.info(f"Job {job_id} (W{worker_id}): Rembg done in {rembg_time:.4f}s")
@@ -577,28 +694,34 @@ async def image_processing_worker(worker_id: int):
             async with aiofiles.open(processed_path, 'wb') as out_file: await out_file.write(processed_image_bytes)
             save_time = time.perf_counter() - t_save_start; output_size_bytes = len(processed_image_bytes)
 
-            log_worker_activity(worker_id, WORKER_IDLE); results[job_id]["status"] = "done"
+            results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_path
             total_job_time = time.perf_counter() - t_job_start
-            source_type = "url" if image_source_str.startswith(("http:", "https:")) else "upload"
-            original_fn_hist = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type, original_fn_hist)
-            results[job_id]["completion_time"] = time.time()
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history)
+            results[job_id]["completion_time"] = time.time() # For cleanup task
             logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
-        except FileNotFoundError as e: logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {e}"
-        except httpx.HTTPStatusError as e: logger.error(f"Job {job_id} (W{worker_id}) Error: HTTPStatusError: {e.response.status_code}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code}"
-        except httpx.RequestError as e: logger.error(f"Job {job_id} (W{worker_id}) Error: RequestError: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error: {type(e).__name__}"
-        except (ValueError, IOError, OSError) as e: logger.error(f"Job {job_id} (W{worker_id}) Error: Data/file processing: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Processing error: {e}"
-        except Exception as e: logger.critical(f"Job {job_id} (W{worker_id}) CRITICAL Error: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Unexpected error: {e}"
+        
+        except FileNotFoundError as e: 
+            logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {e}"
+        except httpx.HTTPStatusError as e: 
+            logger.error(f"Job {job_id} (W{worker_id}) Error: HTTPStatusError downloading {image_source_str}: {e.response.status_code}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} for {image_source_str}"
+        except httpx.RequestError as e: # Covers timeouts, connection errors etc.
+            logger.error(f"Job {job_id} (W{worker_id}) Error: httpx.RequestError downloading {image_source_str}: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Network error during download: {type(e).__name__}"
+        except (ValueError, IOError, OSError) as e: # PIL errors, file system errors during save etc.
+            logger.error(f"Job {job_id} (W{worker_id}) Error: Data/file processing error: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Processing error: {e}"
+        except RuntimeError as e: # Specifically for forced GPU failure or other critical runtime issues
+            logger.critical(f"Job {job_id} (W{worker_id}) CRITICAL RuntimeError: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Critical runtime error: {e}"
+        except Exception as e: 
+            logger.critical(f"Job {job_id} (W{worker_id}) UNHANDLED CRITICAL Error: {e}", exc_info=True); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"Unexpected critical error: {e}"
         finally:
             if results.get(job_id, {}).get("status") == "error":
                 total_job_time_error = time.perf_counter() - t_job_start
-                source_type = "url" if image_source_str.startswith(("http:", "https:")) else "upload"
-                original_fn_hist = results[job_id].get("input_image_url", "").split("/")[-1] if source_type == "url" else results[job_id].get("input_image_url", "").replace("(form_upload: ", "").replace(")", "")
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type, original_fn_hist)
-                results[job_id]["completion_time"] = time.time()
-                logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s")
-            log_worker_activity(worker_id, WORKER_IDLE); queue.task_done()
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history)
+                results[job_id]["completion_time"] = time.time() # For cleanup task
+                logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
+            
+            log_worker_activity(worker_id, WORKER_IDLE) # Ensure worker state is reset
+            queue.task_done()
 
 @app.on_event("startup")
 async def startup_event():
@@ -606,39 +729,59 @@ async def startup_event():
     logger.info("Application startup...")
     cpu_executor = ThreadPoolExecutor(max_workers=CPU_THREAD_POOL_SIZE, thread_name_prefix="RembgCPU")
     pil_executor = ThreadPoolExecutor(max_workers=PIL_THREAD_POOL_SIZE, thread_name_prefix="PILCPU")
-    logger.info(f"Thread pools: CPU={CPU_THREAD_POOL_SIZE}, PIL={PIL_THREAD_POOL_SIZE}")
+    logger.info(f"Thread pools initialized: RembgCPU Bound={CPU_THREAD_POOL_SIZE}, PILCPU Bound={PIL_THREAD_POOL_SIZE}")
+
+    # Determine active_rembg_providers based on configuration
+    available_ort_providers = []
+    try:
+        import onnxruntime as ort
+        available_ort_providers = ort.get_available_providers()
+        logger.info(f"ONNX Runtime available providers: {available_ort_providers}")
+    except ImportError:
+        logger.error("onnxruntime module not found. Rembg processing will likely fail. Install onnxruntime or onnxruntime-gpu.")
+    except Exception as e:
+        logger.error(f"Error getting ONNX Runtime available providers: {e}. Rembg processing may be unstable.", exc_info=True)
 
     if REMBG_USE_GPU:
-        logger.info("REMBG_USE_GPU is True. Detecting ONNX Runtime providers...")
-        try:
-            import onnxruntime as ort
-            available_ort_providers = ort.get_available_providers()
-            logger.info(f"ONNX Runtime available providers: {available_ort_providers}")
-            chosen_providers = []
-            for provider_name in REMBG_PREFERRED_GPU_PROVIDERS:
-                if provider_name in available_ort_providers:
-                    if provider_name not in chosen_providers: chosen_providers.append(provider_name)
-            if 'CPUExecutionProvider' in chosen_providers: chosen_providers.remove('CPUExecutionProvider') 
+        logger.info(f"REMBG_USE_GPU is True. Configuring rembg to use ONLY preferred GPU providers: {REMBG_PREFERRED_GPU_PROVIDERS}")
+        
+        if not REMBG_PREFERRED_GPU_PROVIDERS:
+            logger.critical(
+                "CRITICAL MISCONFIGURATION: REMBG_USE_GPU is True, but REMBG_PREFERRED_GPU_PROVIDERS is empty. "
+                "Cannot force GPU without specifying preferred GPU providers. "
+                "Setting active providers to a dummy value to force failure rather than allow ONNX default to CPU."
+            )
+            active_rembg_providers = ["MisconfiguredForceGPUErrProvider"] 
+        else:
+            # We will pass REMBG_PREFERRED_GPU_PROVIDERS directly to rembg.
+            # rembg/ONNX Runtime will try them in order. If none work, new_session() should error out.
+            active_rembg_providers = list(REMBG_PREFERRED_GPU_PROVIDERS)
             
-            if 'CPUExecutionProvider' in available_ort_providers:
-                 if 'CPUExecutionProvider' not in chosen_providers: 
-                    chosen_providers.append('CPUExecutionProvider')
-            else: logger.error("'CPUExecutionProvider' not found in ONNX available_providers. This is unusual.")
-
-            if not chosen_providers or (len(chosen_providers) == 1 and 'CPUExecutionProvider' in chosen_providers and not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in chosen_providers)):
-                logger.warning(f"Could not form valid ONNX provider list with preferred GPU providers. Falling back to CPU-only default. Configured Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}, Chosen: {chosen_providers}")
-                active_rembg_providers = list(REMBG_CPU_PROVIDERS)
+            # Log availability for diagnostics
+            actually_available_gpus = [p for p in active_rembg_providers if p in available_ort_providers]
+            if not actually_available_gpus:
+                logger.warning(
+                    f"REMBG_USE_GPU is True. While forcing preferred GPU providers {active_rembg_providers}, "
+                    f"note that NONE of them seem to be available in ONNX Runtime ({available_ort_providers}). "
+                    "Rembg session initialization with these providers is expected to FAIL."
+                )
             else:
-                active_rembg_providers = chosen_providers
-            
-            has_gpu_in_final = any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in active_rembg_providers if p != 'CPUExecutionProvider')
-            if REMBG_USE_GPU and not has_gpu_in_final : 
-                 logger.warning(f"REMBG_USE_GPU is True, but no preferred GPU providers were ultimately selected or only CPU remains. Final: {active_rembg_providers}. Check onnxruntime-gpu/drivers. Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}.")
-
-        except ImportError: logger.warning("onnxruntime module not found. Rembg will use CPU. Install onnxruntime or onnxruntime-gpu."); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
-        except Exception as e: logger.error(f"Error detecting ONNX providers: {e}. Defaulting to CPU.", exc_info=True); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
-    else: logger.info("REMBG_USE_GPU is False. Using CPU providers for rembg."); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
-    logger.info(f"Rembg will attempt to use providers: {active_rembg_providers}")
+                logger.info(
+                    f"REMBG_USE_GPU is True. Will attempt to use providers {active_rembg_providers}. "
+                    f"Of these, the following are reported as available by ONNX Runtime: {actually_available_gpus}."
+                )
+    else: # REMBG_USE_GPU is False
+        logger.info("REMBG_USE_GPU is False. Configuring CPU-only providers for rembg.")
+        if REMBG_CPU_PROVIDERS[0] in available_ort_providers: # Assuming REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
+            active_rembg_providers = list(REMBG_CPU_PROVIDERS)
+        else:
+            logger.error(
+                f"CRITICAL: REMBG_USE_GPU is False, but the CPU provider ({REMBG_CPU_PROVIDERS[0]}) "
+                f"is not in ONNX available_providers ({available_ort_providers}). Rembg CPU processing will likely fail."
+            )
+            active_rembg_providers = [] # Let rembg try to default or fail, but this is bad.
+    
+    logger.info(f"Final 'active_rembg_providers' determined at startup (will be used by workers): {active_rembg_providers}")
 
     if ENABLE_LOGO_WATERMARK:
         logger.info(f"Logo watermarking ENABLED. Loading from: {LOGO_PATH}")
@@ -650,39 +793,51 @@ async def startup_event():
                     logo = logo.resize((LOGO_MAX_WIDTH, int(logo.height * l_ratio)), Image.Resampling.LANCZOS)
                 prepared_logo_image = logo; logger.info(f"Logo loaded: {prepared_logo_image.size}")
             except Exception as e: logger.error(f"Failed to load logo: {e}", exc_info=True); prepared_logo_image = None
-        else: logger.warning(f"Logo file not found at {LOGO_PATH}."); prepared_logo_image = None
+        else: logger.warning(f"Logo file not found at {LOGO_PATH}. Watermarking will be skipped."); prepared_logo_image = None
     else: logger.info("Logo watermarking DISABLED."); prepared_logo_image = None
 
     for i in range(MAX_CONCURRENT_TASKS): asyncio.create_task(image_processing_worker(worker_id=i+1))
-    logger.info(f"{MAX_CONCURRENT_TASKS} async workers started.")
-    asyncio.create_task(cleanup_old_results()); logger.info("Background cleanup task started.")
+    logger.info(f"{MAX_CONCURRENT_TASKS} async image processing workers started.")
+    asyncio.create_task(cleanup_old_results()); logger.info("Background cleanup task for old job results started.")
     asyncio.create_task(system_monitor()); logger.info("System monitoring task started.")
+    
+    # Initialize pynvml once at startup for get_gpu_info to use if needed without re-init/shutdown cycles
     try:
         import pynvml
         pynvml.nvmlInit()
-        logger.info("pynvml initialized for GPU monitoring.")
-    except Exception:
-        logger.info("pynvml could not be initialized (normal if no NVIDIA GPU or pynvml not installed).")
+        logger.info("pynvml initialized for GPU monitoring (if NVIDIA GPU is present).")
+    except Exception as e:
+        logger.info(f"pynvml could not be initialized at startup (this is normal if no NVIDIA GPU or pynvml not installed): {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     global cpu_executor, pil_executor
-    logger.info("Application shutdown...")
-    if cpu_executor: cpu_executor.shutdown(wait=True); logger.info("CPU thread pool shut down")
-    if pil_executor: pil_executor.shutdown(wait=True); logger.info("PIL thread pool shut down")
+    logger.info("Application shutdown sequence initiated...")
+    
+    # Gracefully shutdown thread pools
+    if cpu_executor: 
+        cpu_executor.shutdown(wait=True)
+        logger.info("RembgCPU thread pool shut down.")
+    if pil_executor: 
+        pil_executor.shutdown(wait=True)
+        logger.info("PILCPU thread pool shut down.")
+    
+    # Shutdown pynvml
     try:
         import pynvml
+        # Check if nvmlInit was called (e.g. by checking a flag or if a handle exists)
+        # For simplicity, just try to shut down. If not initialized, it might error or do nothing.
         pynvml.nvmlShutdown()
         logger.info("pynvml shutdown.")
-    except Exception:
-        pass 
+    except ImportError:
+        logger.info("pynvml not imported, no shutdown needed.")
+    except Exception as e: # Catches NVMLError if already shutdown or not init
+        logger.info(f"Error during pynvml shutdown (may be benign): {e}")
+    logger.info("Application shutdown complete.")
 
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
-
-# ... (Keep all your existing Python code from the previous working version) ...
-# ... (Imports, FastAPI setup, helper functions, endpoints, workers, etc.) ...
 
 # --- Root Endpoint (Index Page) ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -695,8 +850,17 @@ async def root():
     elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
         logo_status += " (Enabled but not loaded/found)"
 
-    uptime_hours = stats["uptime"] / 3600
-    uptime_str = f"{uptime_hours:.1f} hours" if uptime_hours >= 1 else f"{stats['uptime']:.0f} seconds"
+    uptime_seconds = stats["uptime"]
+    days, remainder = divmod(uptime_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str_parts = []
+    if days > 0: uptime_str_parts.append(f"{int(days)}d")
+    if hours > 0: uptime_str_parts.append(f"{int(hours)}h")
+    if minutes > 0: uptime_str_parts.append(f"{int(minutes)}m")
+    uptime_str_parts.append(f"{int(seconds)}s")
+    uptime_str = " ".join(uptime_str_parts) if uptime_str_parts else "0s"
+
     
     current_metrics = system_metrics[-1] if system_metrics else {
         "cpu_percent": 0, "memory_percent": 0, "memory_used_gb": 0, 
@@ -718,15 +882,20 @@ async def root():
                         <th>Output</th>
                         <th>Model</th>
                         <th>Source</th>
+                        <th>Filename</th>
                     </tr>
                 </thead>
                 <tbody>"""
         
-        for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
+        for job in stats["recent_jobs"][:20]: 
             status_class = "status-completed" if job["status"] == "completed" else "status-failed"
             job_link = f"/job/{job['job_id']}"
+            orig_fn_display = job.get('original_filename', '')
+            if len(orig_fn_display) > 30: # Truncate long filenames
+                orig_fn_display = orig_fn_display[:15] + "..." + orig_fn_display[-12:]
+
             recent_jobs_html += f"""
-                    <tr onclick="window.location.href='{job_link}'">
+                    <tr onclick="window.location.href='{job_link}'" style="cursor:pointer;">
                         <td>{format_timestamp(job['timestamp'])}</td>
                         <td><a href="{job_link}" class="job-link-id">{job['job_id'][:8]}...</a></td>
                         <td><span class="status-badge {status_class}">{job['status'].upper()}</span></td>
@@ -735,6 +904,7 @@ async def root():
                         <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
                         <td>{job['model']}</td>
                         <td>{job['source_type']}</td>
+                        <td title="{job.get('original_filename', '')}">{orig_fn_display}</td>
                     </tr>"""
         recent_jobs_html += """
                 </tbody>
@@ -768,7 +938,7 @@ async def root():
             box-shadow: 0 6px 12px rgba(0,0,0,0.08);
         }}
         h1 {{
-            color: #0056b3; /* Darker blue */
+            color: #0056b3; 
             margin-bottom: 10px;
             font-size: 2.2em;
             font-weight: 600;
@@ -795,7 +965,7 @@ async def root():
 
         .stats-grid, .system-metrics {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }}
@@ -813,13 +983,13 @@ async def root():
             box-shadow: 0 4px 8px rgba(0,0,0,0.08);
         }}
         .stat-value, .metric-value {{
-            font-size: 2em;
+            font-size: 1.8em; /* Slightly reduced for better fit */
             font-weight: 700;
             margin-bottom: 8px;
             color: #007bff;
         }}
         .stat-label, .metric-label {{
-            font-size: 0.95em;
+            font-size: 0.90em; /* Slightly reduced */
             color: #6c757d;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -851,7 +1021,7 @@ async def root():
         }}
         .chart-container {{
             position: relative;
-            height: 320px; /* Adjusted height */
+            height: 300px; 
         }}
 
         .config-list {{
@@ -862,19 +1032,26 @@ async def root():
             border-radius: 8px;
             padding: 20px;
             margin-bottom: 30px;
+            font-size: 0.95em;
         }}
         .config-list li {{
-            padding: 8px 0;
+            padding: 10px 0; /* Increased padding */
             border-bottom: 1px solid #e9ecef;
+            display: flex; /* For alignment */
+            justify-content: space-between; /* For alignment */
         }}
         .config-list li:last-child {{
             border-bottom: none;
         }}
         .config-list strong {{
             color: #0056b3;
-            min-width: 180px;
-            display: inline-block;
+            margin-right: 10px; /* Spacing */
         }}
+        .config-list span {{ /* Value part */
+            text-align: right;
+            word-break: break-all; /* For long provider lists */
+        }}
+
 
         .debug-info {{
             background: #e9ecef;
@@ -893,7 +1070,7 @@ async def root():
         }}
 
         .table-responsive {{
-            overflow-x: auto; /* Ensure table is scrollable on small screens */
+            overflow-x: auto; 
         }}
         .styled-table {{
             width: 100%;
@@ -902,7 +1079,7 @@ async def root():
             font-size: 0.9em;
             box-shadow: 0 2px 8px rgba(0,0,0,0.07);
             border-radius: 8px;
-            overflow: hidden; /* For border-radius to work on table */
+            overflow: hidden; 
         }}
         .styled-table thead tr {{
             background-color: #007bff;
@@ -913,6 +1090,11 @@ async def root():
         .styled-table th, .styled-table td {{
             padding: 12px 15px;
             border-bottom: 1px solid #dddddd;
+            white-space: nowrap; /* Prevent text wrapping in cells */
+        }}
+         .styled-table td:nth-child(9) {{ /* Last column (Filename) */
+            white-space: normal; /* Allow filename to wrap if very long */
+            word-break: break-all;
         }}
         .styled-table tbody tr {{
             background-color: #fdfdfd;
@@ -923,7 +1105,6 @@ async def root():
         }}
         .styled-table tbody tr:hover {{
             background-color: #e9ecef;
-            cursor: pointer;
         }}
         .styled-table tbody tr:last-of-type td {{
             border-bottom: 2px solid #007bff;
@@ -938,16 +1119,21 @@ async def root():
 
         .status-badge {{
             padding: 4px 8px;
-            border-radius: 12px; /* Pill shape */
+            border-radius: 12px; 
             font-size: 0.8em;
             font-weight: bold;
             text-transform: uppercase;
             color: white;
+            display: inline-block; /* Ensures proper padding */
         }}
         .status-badge.status-completed {{ background-color: #28a745; }}
         .status-badge.status-failed {{ background-color: #dc3545; }}
-        .status-badge.status-active {{ background-color: #17a2b8; }} /* Info blue */
-        .status-badge.status-queued {{ background-color: #ffc107; color: #212529;}} /* Warning yellow */
+        .status-badge.status-error {{ background-color: #dc3545; }}
+        .status-badge.status-active {{ background-color: #17a2b8; }} 
+        .status-badge.status-queued, 
+        .status-badge.status-processing_rembg, .status-badge.status-processing_image, 
+        .status-badge.status-saving, .status-badge.status-loading_file, 
+        .status-badge.status-downloading, .status-badge.status-fetching_input {{ background-color: #ffc107; color: #212529;}} 
 
 
         .footer {{
@@ -968,10 +1154,12 @@ async def root():
         }}
         @media (max-width: 768px) {{
             .stats-grid, .system-metrics {{
-                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); /* Adjusted minmax */
             }}
-            .stat-value, .metric-value {{ font-size: 1.6em; }}
+            .stat-value, .metric-value {{ font-size: 1.5em; }}
             .container {{ padding: 15px; margin: 15px; }}
+            .config-list li {{ flex-direction: column; align-items: flex-start; }}
+            .config-list span {{ text-align: left; margin-top: 4px; }}
         }}
     </style>
 </head>
@@ -1043,206 +1231,127 @@ async def root():
 
         <h2 class="section-title">⚙️ Configuration & Debug</h2>
         <ul class="config-list">
-            <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
-            <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
-            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
-            <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
-            <li><strong>Logo Watermarking:</strong> {logo_status}</li>
-            <li><strong>Rembg GPU Attempt:</strong> {'Enabled' if REMBG_USE_GPU else 'Disabled'}</li>
-            <li><strong>Rembg Providers:</strong> {str(active_rembg_providers)}</li>
-            <li><strong>GPU Monitoring (pynvml):</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml)'}</li>
+            <li><strong>Async Workers:</strong> <span>{MAX_CONCURRENT_TASKS}</span></li>
+            <li><strong>Rembg Thread Pool:</strong> <span>{CPU_THREAD_POOL_SIZE}</span></li>
+            <li><strong>PIL Thread Pool:</strong> <span>{PIL_THREAD_POOL_SIZE}</span></li>
+            <li><strong>Queue Capacity:</strong> <span>{MAX_QUEUE_SIZE}</span></li>
+            <li><strong>Logo Watermarking:</strong> <span>{logo_status}</span></li>
+            <li><strong>Force GPU (REMBG_USE_GPU):</strong> <span style="font-weight:bold; color: { 'green' if REMBG_USE_GPU else 'orange' };">{'Enabled' if REMBG_USE_GPU else 'Disabled'}</span></li>
+            <li><strong>Preferred GPU Providers (Config):</strong> <span>{str(REMBG_PREFERRED_GPU_PROVIDERS)}</span></li>
+            <li><strong>Active Rembg Providers (Runtime):</strong> <span style="font-weight:bold;">{str(active_rembg_providers)}</span></li>
+            <li><strong>GPU Monitoring (pynvml):</strong> <span>{current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml required)'}</span></li>
         </ul>
         
         <div class="debug-info">
             <h4>🔧 Debug Links</h4>
-            <p><a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status</a></p>
-            <p><a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p>
-            <p><a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p>
+            <p><a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status & Rembg Provider Config</a></p>
+            <p><a href="/api/monitoring/workers" target="_blank">View Raw Worker Data (JSON)</a></p>
+            <p><a href="/api/monitoring/system" target="_blank">View Raw System Data (JSON)</a></p>
         </div>
 
-        <h2 class="section-title">📋 Job History</h2>
+        <h2 class="section-title">📋 Job History (Last {MAX_HISTORY_ITEMS})</h2>
         {recent_jobs_html}
         
         <div class="footer">
-            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+            Page auto-refreshes every 30 seconds (charts update every {MONITORING_SAMPLE_INTERVAL}s) | Last updated: {format_timestamp(time.time())}
         </div>
     </div>
     
     <script>
-        // Chart colors for workers
-        const workerColors = [
-            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
-            '#9966FF', '#FF9F40', '#C9CBCF', '#77DD77' // Added more distinct colors
-        ];
-        
+        const workerColors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#C9CBCF', '#77DD77'];
         let workerChart, systemChart;
 
-        // Initialize charts
         function initCharts() {{
-            // Worker Activity Chart
-            const workerCtx = document.getElementById('workerChart').getContext('2d');
-            workerChart = new Chart(workerCtx, {{
-                type: 'line',
-                data: {{
-                    labels: [],
-                    datasets: []
+            const commonChartOptions = (yLabel, xLabel = 'Time') => ({{
+                responsive: true, maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 15 }} }} }},
+                scales: {{
+                    y: {{ beginAtZero: true, title: {{ display: true, text: yLabel }} }},
+                    x: {{ title: {{ display: true, text: xLabel }}, ticks: {{ autoSkip: true, maxTicksLimit: 12, maxRotation: 0, minRotation: 0 }} }}
                 }},
-                options: {{
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {{
-                        legend: {{
-                            position: 'bottom',
-                            labels: {{
-                                boxWidth: 12,
-                                padding: 15
-                            }}
-                        }}
-                    }},
-                    scales: {{
-                        y: {{
-                            beginAtZero: true,
-                            title: {{ display: true, text: 'Activity Count' }}
-                        }},
-                        x: {{
-                            title: {{ display: true, text: 'Time' }},
-                            ticks: {{ autoSkip: true, maxTicksLimit: 10 }}
-                        }}
-                    }},
-                    elements: {{ line: {{ tension: 0.3 }}, point: {{ radius: 2 }} }}
-                }}
+                elements: {{ line: {{ tension: 0.25 }}, point: {{ radius: 1.5 }} }},
+                animation: {{ duration: 400, easing: 'easeInOutQuad' }}
             }});
 
-            // System Resources Chart
-            const systemCtx = document.getElementById('systemChart').getContext('2d');
-            systemChart = new Chart(systemCtx, {{
-                type: 'line',
-                data: {{
-                    labels: [],
-                    datasets: [
-                        {{
-                            label: 'CPU %', data: [], borderColor: '#dc3545',
-                            backgroundColor: 'rgba(220, 53, 69, 0.1)', fill: true
-                        }},
-                        {{
-                            label: 'Memory %', data: [], borderColor: '#fd7e14',
-                            backgroundColor: 'rgba(253, 126, 20, 0.1)', fill: true
-                        }},
-                        {{
-                            label: 'GPU %', data: [], borderColor: '#6f42c1',
-                            backgroundColor: 'rgba(111, 66, 193, 0.1)', fill: true
-                        }}
-                    ]
-                }},
-                options: {{
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {{ legend: {{ position: 'bottom', labels: {{ padding: 15 }} }} }},
-                    scales: {{
-                        y: {{
-                            beginAtZero: true, max: 100,
-                            title: {{ display: true, text: 'Usage %' }}
-                        }},
-                        x: {{
-                            title: {{ display: true, text: 'Time' }},
-                            ticks: {{ autoSkip: true, maxTicksLimit: 10 }}
-                        }}
-                    }},
-                    elements: {{ line: {{ tension: 0.3 }}, point: {{ radius: 1 }} }}
-                }}
+            workerChart = new Chart(document.getElementById('workerChart').getContext('2d'), {{
+                type: 'line', data: {{ labels: [], datasets: [] }},
+                options: commonChartOptions('Active Tasks per Worker')
+            }});
+            systemChart = new Chart(document.getElementById('systemChart').getContext('2d'), {{
+                type: 'line', data: {{ labels: [], datasets: [
+                    {{ label: 'CPU %', data: [], borderColor: '#dc3545', backgroundColor: 'rgba(220, 53, 69, 0.1)', fill: 'origin' }},
+                    {{ label: 'Memory %', data: [], borderColor: '#fd7e14', backgroundColor: 'rgba(253, 126, 20, 0.1)', fill: 'origin' }},
+                    {{ label: 'GPU %', data: [], borderColor: '#6f42c1', backgroundColor: 'rgba(111, 66, 193, 0.1)', fill: 'origin' }}
+                ]}},
+                options: {{ ...commonChartOptions('Usage %'), scales: {{ ...commonChartOptions('Usage %').scales, y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Usage %' }} }} }} }}
             }});
         }}
 
-        // Update charts with new data
         async function updateCharts() {{
             try {{
-                const workerResponse = await fetch('/api/monitoring/workers');
+                const [workerResponse, systemResponse] = await Promise.all([
+                    fetch('/api/monitoring/workers'),
+                    fetch('/api/monitoring/system')
+                ]);
+                if (!workerResponse.ok || !systemResponse.ok) {{
+                    console.error('Failed to fetch monitoring data:', workerResponse.status, systemResponse.status);
+                    return;
+                }}
                 const workerData = await workerResponse.json();
-                
-                const systemResponse = await fetch('/api/monitoring/system');
                 const systemData = await systemResponse.json();
                 
                 updateWorkerChart(workerData);
                 updateSystemChart(systemData);
-                
-            }} catch (error) {{
-                console.error('Error updating charts:', error);
-            }}
+            }} catch (error) {{ console.error('Error updating charts:', error); }}
         }}
 
         function formatChartTimestamp(timestamp) {{
-            const date = new Date(timestamp * 1000);
-            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+            return new Date(timestamp * 1000).toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
         }}
 
         function updateWorkerChart(data) {{
             const workerIds = Object.keys(data).sort();
-            if (workerIds.length === 0 || !data[workerIds[0]] || data[workerIds[0]].length === 0) {{
-                workerChart.data.labels = [];
-                workerChart.data.datasets = [];
-                workerChart.update('none');
-                return;
+            if (!workerIds.length || !data[workerIds[0]] || !data[workerIds[0]].length) {{
+                workerChart.data.labels = []; workerChart.data.datasets = [];
+                workerChart.update('none'); return;
             }}
             
-            const firstWorkerBuckets = data[workerIds[0]];
-            const labels = firstWorkerBuckets.map(bucket => formatChartTimestamp(bucket.timestamp));
-            
+            const labels = data[workerIds[0]].map(bucket => formatChartTimestamp(bucket.timestamp));
             const datasets = workerIds.map((workerId, index) => {{
-                const workerBuckets = data[workerId] || []; // Handle if a worker has no data yet
-                const totalActivity = workerBuckets.map(bucket => 
-                    (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
-                );
-                
+                const buckets = data[workerId] || [];
+                const totalActivity = buckets.map(b => (b.fetching||0) + (b.rembg||0) + (b.pil||0) + (b.saving||0));
                 return {{
-                    label: workerId.replace('worker_', 'Worker '),
-                    data: totalActivity,
+                    label: workerId.replace('worker_', 'W'), data: totalActivity,
                     borderColor: workerColors[index % workerColors.length],
-                    backgroundColor: workerColors[index % workerColors.length] + '33', // Lighter fill
-                    fill: true, // Changed to area chart
-                    borderWidth: 1.5
+                    backgroundColor: workerColors[index % workerColors.length] + '22', fill: 'origin'
                 }};
             }});
-            
-            workerChart.data.labels = labels;
-            workerChart.data.datasets = datasets;
-            workerChart.update('none'); // 'none' for no animation to avoid flicker on frequent updates
+            workerChart.data.labels = labels; workerChart.data.datasets = datasets;
+            workerChart.update('none');
         }}
 
         function updateSystemChart(data) {{
-            if (!data || data.length === 0) {{
-                systemChart.data.labels = [];
-                systemChart.data.datasets.forEach(ds => ds.data = []);
-                systemChart.update('none');
-                return;
+            if (!data || !data.length) {{
+                systemChart.data.labels = []; systemChart.data.datasets.forEach(ds => ds.data = []);
+                systemChart.update('none'); return;
             }}
-            
-            const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
-            const cpuData = data.map(metric => metric.cpu_percent);
-            const memoryData = data.map(metric => metric.memory_percent);
-            const gpuData = data.map(metric => metric.gpu_utilization);
-            
-            systemChart.data.labels = labels;
-            systemChart.data.datasets[0].data = cpuData;
-            systemChart.data.datasets[1].data = memoryData;
-            systemChart.data.datasets[2].data = gpuData;
+            systemChart.data.labels = data.map(m => formatChartTimestamp(m.timestamp));
+            systemChart.data.datasets[0].data = data.map(m => m.cpu_percent);
+            systemChart.data.datasets[1].data = data.map(m => m.memory_percent);
+            systemChart.data.datasets[2].data = data.map(m => m.gpu_utilization);
             systemChart.update('none');
         }}
 
-        // Initialize everything when page loads
         document.addEventListener('DOMContentLoaded', function() {{
-            initCharts();
-            updateCharts(); // Initial fetch
-            
-            // Update charts every N seconds (e.g., 5 seconds for more responsiveness)
-            setInterval(updateCharts, {MONITORING_SAMPLE_INTERVAL * 1000}); // Use config from Python
+            initCharts(); updateCharts();
+            setInterval(updateCharts, {MONITORING_SAMPLE_INTERVAL * 1000});
+            // Auto refresh page less frequently for non-chart data if needed
+            // setTimeout(() => location.reload(), 30000);
         }});
+        
+        // Auto refresh for non-chart data every 30s
+        setTimeout(() => {{ document.querySelector('.footer').textContent = 'Refreshing...'; location.reload(); }}, 30000);
 
-        // Page refresh function (optional, charts update live)
-        // function refreshPage() {{
-        //     location.reload();
-        // }}
-        // Auto refresh every 30 seconds (can be removed if live chart updates are sufficient)
-        // setTimeout(refreshPage, 30000);
     </script>
 </body>
 </html>
@@ -1251,5 +1360,7 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Uvicorn server for local development...")
+    # Recommended: set UVICORN_LOG_LEVEL=warning or error for cleaner console in dev
+    # uvicorn.run("your_module_name:app", host="0.0.0.0", port=7000, reload=True) # if running with uvicorn CLI
+    logger.info("Starting Uvicorn server for local development on http://0.0.0.0:7000 ...")
     uvicorn.run(app, host="0.0.0.0", port=7000)
