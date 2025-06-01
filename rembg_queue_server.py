@@ -681,239 +681,572 @@ async def shutdown_event():
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
 app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_images")
 
+# ... (Keep all your existing Python code from the previous working version) ...
+# ... (Imports, FastAPI setup, helper functions, endpoints, workers, etc.) ...
 
+# --- Root Endpoint (Index Page) ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     stats = get_server_stats()
+    
     logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
-    if ENABLE_LOGO_WATERMARK: logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})" if prepared_logo_image else " (Enabled but not loaded/found)"
+    if ENABLE_LOGO_WATERMARK and prepared_logo_image:
+        logo_status += f" (Loaded, {prepared_logo_image.width}x{prepared_logo_image.height})"
+    elif ENABLE_LOGO_WATERMARK and not prepared_logo_image:
+        logo_status += " (Enabled but not loaded/found)"
+
     uptime_hours = stats["uptime"] / 3600
     uptime_str = f"{uptime_hours:.1f} hours" if uptime_hours >= 1 else f"{stats['uptime']:.0f} seconds"
-    current_metrics = system_metrics[-1] if system_metrics else {"cpu_percent":0,"memory_percent":0,"memory_used_gb":0,"memory_total_gb":0,"gpu_used_mb":0,"gpu_total_mb":0,"gpu_utilization":0}
+    
+    current_metrics = system_metrics[-1] if system_metrics else {
+        "cpu_percent": 0, "memory_percent": 0, "memory_used_gb": 0, 
+        "memory_total_gb": 0, "gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0
+    }
+    
     recent_jobs_html = "<h3>Recent Jobs</h3>"
     if stats["recent_jobs"]:
-        recent_jobs_html += "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;width:100%;'><tr style='background-color:#f0f0f0;'><th>Time</th><th>Job ID</th><th>Status</th><th>Duration</th><th>Input</th><th>Output</th><th>Model</th><th>Source</th></tr>"
-        for job in stats["recent_jobs"][:20]:
-            status_color = "#4CAF50" if job["status"] == "completed" else "#f44336"; job_link = f"/job/{job['job_id']}"
-            recent_jobs_html += f"""<tr style="cursor:pointer;" onclick="window.location.href='{job_link}'"><td>{format_timestamp(job['timestamp'])}</td><td style='font-family:monospace;font-size:10px;'><a href="{job_link}" style="text-decoration:none;color:#007bff;">{job['job_id'][:8]}...</a></td><td style='color:{status_color};font-weight:bold;'>{job['status'].upper()}</td><td>{job['total_time']:.2f}s</td><td>{format_size(job['input_size'])}</td><td>{format_size(job['output_size']) if job['output_size']>0 else 'N/A'}</td><td>{job['model']}</td><td>{job['source_type']}</td></tr>"""
-        recent_jobs_html += "</table>"
-    else: recent_jobs_html += "<p>No jobs processed yet.</p>"
-    
-    initial_last_updated_text_py = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
+        recent_jobs_html += """
+        <div class="table-responsive">
+            <table class="styled-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Job ID</th>
+                        <th>Status</th>
+                        <th>Duration</th>
+                        <th>Input</th>
+                        <th>Output</th>
+                        <th>Model</th>
+                        <th>Source</th>
+                    </tr>
+                </thead>
+                <tbody>"""
+        
+        for job in stats["recent_jobs"][:20]:  # Show last 20 jobs
+            status_class = "status-completed" if job["status"] == "completed" else "status-failed"
+            job_link = f"/job/{job['job_id']}"
+            recent_jobs_html += f"""
+                    <tr onclick="window.location.href='{job_link}'">
+                        <td>{format_timestamp(job['timestamp'])}</td>
+                        <td><a href="{job_link}" class="job-link-id">{job['job_id'][:8]}...</a></td>
+                        <td><span class="status-badge {status_class}">{job['status'].upper()}</span></td>
+                        <td>{job['total_time']:.2f}s</td>
+                        <td>{format_size(job['input_size'])}</td>
+                        <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
+                        <td>{job['model']}</td>
+                        <td>{job['source_type']}</td>
+                    </tr>"""
+        recent_jobs_html += """
+                </tbody>
+            </table>
+        </div>"""
+    else:
+        recent_jobs_html = "<h3>Recent Jobs</h3><p>No jobs processed yet.</p>"
 
-    # Escape curly braces for JavaScript by doubling them: {{ and }}
-    # For JS template literals `${js_var}`, use `${{js_var}}`
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
+    return HTMLResponse(content=f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Processing API Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>
-        body{{font-family:sans-serif;margin:20px; background-color: #f9f9f9;}} 
-        .container{{max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);}}
-        /* ... other styles ... (keeping them collapsed for brevity) */
-        .metric-label{{font-size: 12px; color: #6c757d; text-transform: uppercase;}}
-        @media (max-width: 1200px) {{
-            .charts-container {{ grid-template-columns: 1fr; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            margin: 0;
+            background-color: #f4f6f9;
+            color: #343a40;
+            line-height: 1.6;
+        }}
+        .container {{
+            max-width: 1600px;
+            margin: 30px auto;
+            padding: 25px;
+            background: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 6px 12px rgba(0,0,0,0.08);
+        }}
+        h1 {{
+            color: #0056b3; /* Darker blue */
+            margin-bottom: 10px;
+            font-size: 2.2em;
+            font-weight: 600;
+            text-align: center;
+        }}
+        .subtitle {{
+            text-align: center;
+            color: #555;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }}
+        .status-good {{ color: #28a745; font-weight: bold; }}
+        .status-warning {{ color: #ffc107; font-weight: bold; }}
+        .status-error {{ color: #dc3545; font-weight: bold; }}
+
+        .section-title {{
+            font-size: 1.6em;
+            color: #333;
+            margin-top: 40px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e9ecef;
+        }}
+
+        .stats-grid, .system-metrics {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .stat-card, .metric-card {{
+            background: #f8f9fa;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }}
+        .stat-card:hover, .metric-card:hover {{
+            transform: translateY(-3px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.08);
+        }}
+        .stat-value, .metric-value {{
+            font-size: 2em;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: #007bff;
+        }}
+        .stat-label, .metric-label {{
+            font-size: 0.95em;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        .metric-card .metric-value {{ color: #343a40; }}
+        .metric-card .cpu {{ color: #dc3545; }}
+        .metric-card .memory {{ color: #fd7e14; }}
+        .metric-card .gpu {{ color: #6f42c1; }}
+
+
+        .charts-container {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 25px;
+            margin-bottom: 30px;
+        }}
+        .chart-card {{
+            background: #ffffff;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 25px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.05);
+        }}
+        .chart-title {{
+            font-size: 1.3em;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #495057;
+        }}
+        .chart-container {{
+            position: relative;
+            height: 320px; /* Adjusted height */
+        }}
+
+        .config-list {{
+            list-style: none;
+            padding: 0;
+            background-color: #f8f9fa;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }}
+        .config-list li {{
+            padding: 8px 0;
+            border-bottom: 1px solid #e9ecef;
+        }}
+        .config-list li:last-child {{
+            border-bottom: none;
+        }}
+        .config-list strong {{
+            color: #0056b3;
+            min-width: 180px;
+            display: inline-block;
+        }}
+
+        .debug-info {{
+            background: #e9ecef;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }}
+        .debug-info h4 {{ margin-top: 0; color: #343a40; }}
+        .debug-info p a {{
+            color: #007bff;
+            text-decoration: none;
+            font-weight: 500;
+        }}
+        .debug-info p a:hover {{
+            text-decoration: underline;
+        }}
+
+        .table-responsive {{
+            overflow-x: auto; /* Ensure table is scrollable on small screens */
+        }}
+        .styled-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            font-size: 0.9em;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+            border-radius: 8px;
+            overflow: hidden; /* For border-radius to work on table */
+        }}
+        .styled-table thead tr {{
+            background-color: #007bff;
+            color: #ffffff;
+            text-align: left;
+            font-weight: bold;
+        }}
+        .styled-table th, .styled-table td {{
+            padding: 12px 15px;
+            border-bottom: 1px solid #dddddd;
+        }}
+        .styled-table tbody tr {{
+            background-color: #fdfdfd;
+            transition: background-color 0.2s ease;
+        }}
+        .styled-table tbody tr:nth-of-type(even) {{
+            background-color: #f3f3f3;
+        }}
+        .styled-table tbody tr:hover {{
+            background-color: #e9ecef;
+            cursor: pointer;
+        }}
+        .styled-table tbody tr:last-of-type td {{
+            border-bottom: 2px solid #007bff;
+        }}
+        .job-link-id {{
+            font-family: monospace;
+            font-size: 0.95em;
+            color: #0056b3;
+            text-decoration: none;
+        }}
+        .job-link-id:hover {{ text-decoration: underline; }}
+
+        .status-badge {{
+            padding: 4px 8px;
+            border-radius: 12px; /* Pill shape */
+            font-size: 0.8em;
+            font-weight: bold;
+            text-transform: uppercase;
+            color: white;
+        }}
+        .status-badge.status-completed {{ background-color: #28a745; }}
+        .status-badge.status-failed {{ background-color: #dc3545; }}
+        .status-badge.status-active {{ background-color: #17a2b8; }} /* Info blue */
+        .status-badge.status-queued {{ background-color: #ffc107; color: #212529;}} /* Warning yellow */
+
+
+        .footer {{
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #e9ecef;
+            font-size: 0.9em;
+            color: #6c757d;
+        }}
+
+        @media (max-width: 992px) {{
+            .charts-container {{
+                grid-template-columns: 1fr;
+            }}
+            h1 {{ font-size: 1.8em; }}
+            .section-title {{ font-size: 1.4em; }}
+        }}
+        @media (max-width: 768px) {{
+            .stats-grid, .system-metrics {{
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            }}
+            .stat-value, .metric-value {{ font-size: 1.6em; }}
+            .container {{ padding: 15px; margin: 15px; }}
         }}
     </style>
-    </head>
-    <body>
+</head>
+<body>
     <div class="container">
-        <h1>🚀 Threaded Image Processing API Dashboard</h1>
-        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
+        <h1>🚀 Image Processing API Dashboard</h1>
+        <p class="subtitle">
+            <strong>Status:</strong> <span class="status-good">RUNNING</span> | Real-time monitoring of image processing tasks.
+        </p>
         
         <div class="stats-grid">
-            <div class="stat-card"><div class="stat-value">{uptime_str}</div><div class="stat-label">Uptime</div></div>
-            <div class="stat-card"><div class="stat-value">{stats['queue_size']}</div><div class="stat-label">Queue Size</div></div>
-            <div class="stat-card"><div class="stat-value">{stats['active_jobs']}</div><div class="stat-label">Active Jobs</div></div>
-            <div class="stat-card"><div class="stat-value status-good">{stats['total_completed']}</div><div class="stat-label">Completed</div></div>
-            <div class="stat-card"><div class="stat-value status-error">{stats['total_failed']}</div><div class="stat-label">Failed</div></div>
-            <div class="stat-card"><div class="stat-value">{stats['avg_processing_time']:.2f}s</div><div class="stat-label">Avg Process Time</div></div>
+            <div class="stat-card">
+                <div class="stat-value">{uptime_str}</div>
+                <div class="stat-label">Uptime</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['queue_size']}</div>
+                <div class="stat-label">Queue Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['active_jobs']}</div>
+                <div class="stat-label">Active Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-good">{stats['total_completed']}</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-error">{stats['total_failed']}</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
+                <div class="stat-label">Avg Process Time</div>
+            </div>
         </div>
 
-        <div class="monitoring-section">
-            <h2>📊 Real-time Monitoring</h2>
-            <div class="system-metrics">
-                <div class="metric-card"><div class="metric-value" style="color: #dc3545;">{current_metrics['cpu_percent']:.1f}%</div><div class="metric-label">CPU Usage</div></div>
-                <div class="metric-card"><div class="metric-value" style="color: #fd7e14;">{current_metrics['memory_percent']:.1f}%</div><div class="metric-label">Memory Usage ({current_metrics['memory_used_gb']:.1f}GB / {current_metrics['memory_total_gb']:.1f}GB)</div></div>
-                <div class="metric-card"><div class="metric-value" style="color: #6f42c1;">{current_metrics['gpu_utilization']:.0f}%</div><div class="metric-label">GPU Usage ({current_metrics['gpu_used_mb']:.0f}MB / {current_metrics['gpu_total_mb']:.0f}MB)</div></div>
+        <h2 class="section-title">📊 Real-time Monitoring</h2>
+        
+        <div class="system-metrics">
+            <div class="metric-card">
+                <div class="metric-value cpu">{current_metrics['cpu_percent']:.1f}%</div>
+                <div class="metric-label">CPU Usage</div>
             </div>
-            <div class="charts-container">
-                <div class="chart-card"><div class="chart-title">🔧 Worker Thread Activity</div><div class="chart-container"><canvas id="workerChart"></canvas></div></div>
-                <div class="chart-card"><div class="chart-title">💻 System Resources</div><div class="chart-container"><canvas id="systemChart"></canvas></div></div>
+            <div class="metric-card">
+                <div class="metric-value memory">{current_metrics['memory_percent']:.1f}%</div>
+                <div class="metric-label">Memory ({current_metrics['memory_used_gb']:.1f}GB / {current_metrics['memory_total_gb']:.1f}GB)</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value gpu">{current_metrics['gpu_utilization']:.0f}%</div>
+                <div class="metric-label">GPU ({current_metrics['gpu_used_mb']:.0f}MB / {current_metrics['gpu_total_mb']:.0f}MB)</div>
+            </div>
+        </div>
+            
+        <div class="charts-container">
+            <div class="chart-card">
+                <div class="chart-title">🔧 Worker Thread Activity</div>
+                <div class="chart-container">
+                    <canvas id="workerChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-card">
+                <div class="chart-title">💻 System Resources</div>
+                <div class="chart-container">
+                    <canvas id="systemChart"></canvas>
+                </div>
             </div>
         </div>
 
-        <h3>Configuration</h3>
-        <ul>
+        <h2 class="section-title">⚙️ Configuration & Debug</h2>
+        <ul class="config-list">
             <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
             <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
             <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
             <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
             <li><strong>Logo Watermarking:</strong> {logo_status}</li>
-            <li><strong>Default Model:</strong> {DEFAULT_MODEL_NAME}</li>
             <li><strong>Rembg GPU Attempt:</strong> {'Enabled' if REMBG_USE_GPU else 'Disabled'}</li>
             <li><strong>Rembg Providers:</strong> {str(active_rembg_providers)}</li>
             <li><strong>GPU Monitoring (pynvml):</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml)'}</li>
         </ul>
         
-        <div style="margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 6px;">
-            <h4>🔧 Debug Info</h4>
-            <p><strong>GPU Debug:</strong> <a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status</a></p>
-            <p><strong>Worker Activity:</strong> <a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p>
-            <p><strong>System Metrics:</strong> <a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p>
+        <div class="debug-info">
+            <h4>🔧 Debug Links</h4>
+            <p><a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status</a></p>
+            <p><a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p>
+            <p><a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p>
         </div>
 
+        <h2 class="section-title">📋 Job History</h2>
         {recent_jobs_html}
         
-        <p id="last-updated-paragraph" style="margin-top: 30px; font-size: 12px; color: #6c757d;">
-            {initial_last_updated_text_py}
-        </p>
+        <div class="footer">
+            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+        </div>
     </div>
     
     <script>
+        // Chart colors for workers
         const workerColors = [
             '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
-            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
+            '#9966FF', '#FF9F40', '#C9CBCF', '#77DD77' // Added more distinct colors
         ];
         
         let workerChart, systemChart;
 
-        function initCharts() {{ // JS function block: {{
+        // Initialize charts
+        function initCharts() {{
+            // Worker Activity Chart
             const workerCtx = document.getElementById('workerChart').getContext('2d');
-            workerChart = new Chart(workerCtx, {{ // JS object literal: {{
+            workerChart = new Chart(workerCtx, {{
                 type: 'line',
-                data: {{ labels: [], datasets: [] }}, // JS object
-                options: {{ // JS object
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12 }} }}, tooltip: {{ mode: 'index', intersect: false }} }}, // Nested JS objects
-                    scales: {{ // JS object
-                        y: {{ beginAtZero: true, stacked: true, title: {{ display: true, text: 'Active Workers / Activity Count' }} }}, // JS objects
-                        x: {{ title: {{ display: true, text: 'Time' }}, ticks: {{ autoSkip: true, maxTicksLimit: 15 }} }} // JS objects
-                    }}, // End scales
-                    elements: {{ line: {{ tension: 0.4 }}, point: {{ radius: 2 }} }} // JS objects
-                }} // End options
-            }}); // End new Chart
+                data: {{
+                    labels: [],
+                    datasets: []
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            position: 'bottom',
+                            labels: {{
+                                boxWidth: 12,
+                                padding: 15
+                            }}
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            title: {{ display: true, text: 'Activity Count' }}
+                        }},
+                        x: {{
+                            title: {{ display: true, text: 'Time' }},
+                            ticks: {{ autoSkip: true, maxTicksLimit: 10 }}
+                        }}
+                    }},
+                    elements: {{ line: {{ tension: 0.3 }}, point: {{ radius: 2 }} }}
+                }}
+            }});
 
+            // System Resources Chart
             const systemCtx = document.getElementById('systemChart').getContext('2d');
-            systemChart = new Chart(systemCtx, {{ // JS object
+            systemChart = new Chart(systemCtx, {{
                 type: 'line',
-                data: {{ // JS object
+                data: {{
                     labels: [],
                     datasets: [
-                        {{ label: 'CPU %', data: [], borderColor: '#dc3545', backgroundColor: 'rgba(220, 53, 69, 0.1)', fill: false, yAxisID: 'yPercent' }}, // JS object
-                        {{ label: 'Memory %', data: [], borderColor: '#fd7e14', backgroundColor: 'rgba(253, 126, 20, 0.1)', fill: false, yAxisID: 'yPercent' }}, // JS object
-                        {{ label: 'GPU %', data: [], borderColor: '#6f42c1', backgroundColor: 'rgba(111, 66, 193, 0.1)', fill: false, yAxisID: 'yPercent' }} // JS object
+                        {{
+                            label: 'CPU %', data: [], borderColor: '#dc3545',
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)', fill: true
+                        }},
+                        {{
+                            label: 'Memory %', data: [], borderColor: '#fd7e14',
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)', fill: true
+                        }},
+                        {{
+                            label: 'GPU %', data: [], borderColor: '#6f42c1',
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)', fill: true
+                        }}
                     ]
-                }}, // End data
-                options: {{ // JS object
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: {{ legend: {{ position: 'bottom' }}, tooltip: {{ mode: 'index', intersect: false }} }}, // JS objects
-                    scales: {{ // JS object
-                        yPercent: {{ type: 'linear', display: true, position: 'left', beginAtZero: true, max: 100, title: {{ display: true, text: 'Usage %' }} }}, // JS object
-                        x: {{ title: {{ display: true, text: 'Time' }}, ticks: {{ autoSkip: true, maxTicksLimit: 15 }} }} // JS objects
-                    }}, // End scales
-                    elements: {{ line: {{ tension: 0.4 }}, point: {{ radius: 1 }} }} // JS objects
-                }} // End options
-            }}); // End new Chart
-        }} // End initCharts
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{ legend: {{ position: 'bottom', labels: {{ padding: 15 }} }} }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true, max: 100,
+                            title: {{ display: true, text: 'Usage %' }}
+                        }},
+                        x: {{
+                            title: {{ display: true, text: 'Time' }},
+                            ticks: {{ autoSkip: true, maxTicksLimit: 10 }}
+                        }}
+                    }},
+                    elements: {{ line: {{ tension: 0.3 }}, point: {{ radius: 1 }} }}
+                }}
+            }});
+        }}
 
-        async function updateCharts() {{ // JS function block
-            try {{ // JS try block
+        // Update charts with new data
+        async function updateCharts() {{
+            try {{
                 const workerResponse = await fetch('/api/monitoring/workers');
-                if (!workerResponse.ok) {{ console.error("Worker data fetch failed:", workerResponse.status); return; }} // JS if block
                 const workerData = await workerResponse.json();
                 
                 const systemResponse = await fetch('/api/monitoring/system');
-                if (!systemResponse.ok) {{ console.error("System data fetch failed:", systemResponse.status); return; }} // JS if block
                 const systemData = await systemResponse.json();
                 
                 updateWorkerChart(workerData);
                 updateSystemChart(systemData);
-            }} catch (error) {{ console.error('Error updating charts:', error); }} // JS catch block
-        }} // End updateCharts
+                
+            }} catch (error) {{
+                console.error('Error updating charts:', error);
+            }}
+        }}
 
-        function formatChartTimestamp(unixTimestamp) {{ // JS function block
-            const date = new Date(unixTimestamp * 1000);
-            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}}); // JS object literal for options
-        }} // End formatChartTimestamp
+        function formatChartTimestamp(timestamp) {{
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+        }}
 
-        function updateWorkerChart(data) {{ // JS function block
-            if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) return;
+        function updateWorkerChart(data) {{
             const workerIds = Object.keys(data).sort();
-            const firstWorkerData = data[workerIds[0]];
-            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{ // JS if block
-                 workerChart.data.labels = []; workerChart.data.datasets = []; workerChart.update('none'); return;
-            }} // End if
-            const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
-            const datasets = workerIds.map((workerId, index) => {{ // JS arrow function block
-                const workerBuckets = data[workerId] || []; 
-                const totalActivity = workerBuckets.map(bucket => (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0));
-                return {{ label: workerId.replace('worker_', 'Worker '), data: totalActivity, borderColor: workerColors[index % workerColors.length], backgroundColor: workerColors[index % workerColors.length] + '33', fill: true, tension: 0.4 }}; // JS object
-            }}); // End map
-            workerChart.data.labels = labels; workerChart.data.datasets = datasets; workerChart.update('none'); 
-        }} // End updateWorkerChart
+            if (workerIds.length === 0 || !data[workerIds[0]] || data[workerIds[0]].length === 0) {{
+                workerChart.data.labels = [];
+                workerChart.data.datasets = [];
+                workerChart.update('none');
+                return;
+            }}
+            
+            const firstWorkerBuckets = data[workerIds[0]];
+            const labels = firstWorkerBuckets.map(bucket => formatChartTimestamp(bucket.timestamp));
+            
+            const datasets = workerIds.map((workerId, index) => {{
+                const workerBuckets = data[workerId] || []; // Handle if a worker has no data yet
+                const totalActivity = workerBuckets.map(bucket => 
+                    (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
+                );
+                
+                return {{
+                    label: workerId.replace('worker_', 'Worker '),
+                    data: totalActivity,
+                    borderColor: workerColors[index % workerColors.length],
+                    backgroundColor: workerColors[index % workerColors.length] + '33', // Lighter fill
+                    fill: true, // Changed to area chart
+                    borderWidth: 1.5
+                }};
+            }});
+            
+            workerChart.data.labels = labels;
+            workerChart.data.datasets = datasets;
+            workerChart.update('none'); // 'none' for no animation to avoid flicker on frequent updates
+        }}
 
-        function updateSystemChart(data) {{ // JS function block
-            if (!systemChart || !Array.isArray(data) || data.length === 0) return;
+        function updateSystemChart(data) {{
+            if (!data || data.length === 0) {{
+                systemChart.data.labels = [];
+                systemChart.data.datasets.forEach(ds => ds.data = []);
+                systemChart.update('none');
+                return;
+            }}
+            
             const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
             const cpuData = data.map(metric => metric.cpu_percent);
             const memoryData = data.map(metric => metric.memory_percent);
-            const gpuData = data.map(metric => metric.gpu_utilization || 0); 
+            const gpuData = data.map(metric => metric.gpu_utilization);
+            
             systemChart.data.labels = labels;
-            systemChart.data.datasets[0].data = cpuData; systemChart.data.datasets[1].data = memoryData; systemChart.data.datasets[2].data = gpuData;
-            systemChart.update('none'); 
-        }} // End updateSystemChart
+            systemChart.data.datasets[0].data = cpuData;
+            systemChart.data.datasets[1].data = memoryData;
+            systemChart.data.datasets[2].data = gpuData;
+            systemChart.update('none');
+        }}
 
-        document.addEventListener('DOMContentLoaded', function() {{ // JS function block
+        // Initialize everything when page loads
+        document.addEventListener('DOMContentLoaded', function() {{
             initCharts();
-            updateCharts(); 
-            // This {MONITORING_SAMPLE_INTERVAL} is a Python f-string interpolation, so single braces are correct here
-            const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; 
-            setInterval(updateCharts, chartUpdateInterval);
-        }}); // End addEventListener
+            updateCharts(); // Initial fetch
+            
+            // Update charts every N seconds (e.g., 5 seconds for more responsiveness)
+            setInterval(updateCharts, {MONITORING_SAMPLE_INTERVAL * 1000}); // Use config from Python
+        }});
 
-        function refreshPage() {{ // JS function block
-            if (document.visibilityState === 'visible') {{ // JS if block
-                 fetch('/')
-                    .then(response => response.text())
-                    .then(html => {{ // JS arrow function block
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(html, 'text/html');
-                        const newStatsGrid = doc.querySelector('.stats-grid');
-                        const currentStatsGrid = document.querySelector('.stats-grid');
-                        if (newStatsGrid && currentStatsGrid) {{ currentStatsGrid.innerHTML = newStatsGrid.innerHTML; }} // JS if block
-                        
-                        const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
-                        let newRecentJobsDisplay = null;
-                        if (newRecentJobsContainer) {{ newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; }} // JS if block
-
-                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; 
-                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{ // JS if block (note the single closing brace was likely the culprit here)
-                            let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
-                             if (newRecentJobsDisplay && currentJobsDisplay) {{ currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML; }} // JS if block
-                        }} // JS if block end
-                        
-                        const lastUpdatedP = document.getElementById('last-updated-paragraph'); 
-                        if(lastUpdatedP) {{ // JS if block
-                            const now = new Date();
-                            const year = now.getFullYear();
-                            const month = (now.getMonth() + 1).toString().padStart(2, '0'); 
-                            const day = now.getDate().toString().padStart(2, '0');
-                            const hours = now.getHours().toString().padStart(2, '0');
-                            const minutes = now.getMinutes().toString().padStart(2, '0');
-                            const seconds = now.getSeconds().toString().padStart(2, '0');
-                            // For JS template literals inside Python f-string, use ${{...}}
-                            const timeString = `${{year}}-${{month}}-${{day}} ${{hours}}:${{minutes}}:${{seconds}}`;
-                            lastUpdatedP.innerHTML = `Page data refreshed: ${{timeString}} | Auto-refresh active`;
-                        }} // JS if block end
-                    }}) // End then
-                    .catch(err => console.error("Error refreshing page content:", err));
-            }} // JS if block end
-        }} // End refreshPage
-        
-        setInterval(refreshPage, 30000); 
+        // Page refresh function (optional, charts update live)
+        // function refreshPage() {{
+        //     location.reload();
+        // }}
+        // Auto refresh every 30 seconds (can be removed if live chart updates are sufficient)
+        // setTimeout(refreshPage, 30000);
     </script>
-    </body></html>"""
-
+</body>
+</html>
+    """)
 
 
 if __name__ == "__main__":
