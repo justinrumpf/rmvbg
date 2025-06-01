@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X3---
+# --- CREATE DIRECTORIES AT THE VERY TOP X4---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -688,19 +688,426 @@ async def root():
             recent_jobs_html += f"""<tr style="cursor:pointer;" onclick="window.location.href='{job_link}'"><td>{format_timestamp(job['timestamp'])}</td><td style='font-family:monospace;font-size:10px;'><a href="{job_link}" style="text-decoration:none;color:#007bff;">{job['job_id'][:8]}...</a></td><td style='color:{status_color};font-weight:bold;'>{job['status'].upper()}</td><td>{job['total_time']:.2f}s</td><td>{format_size(job['input_size'])}</td><td>{format_size(job['output_size']) if job['output_size']>0 else 'N/A'}</td><td>{job['model']}</td><td>{job['source_type']}</td></tr>"""
         recent_jobs_html += "</table>"
     else: recent_jobs_html += "<p>No jobs processed yet.</p>"
-    # HTML content (main part, abbreviated for brevity)
-    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title><script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1400px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.stats-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.stat-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;text-align:center;}}.stat-value{{font-size:24px;font-weight:bold;color:#007bff;margin-bottom:5px;}}.stat-label{{font-size:14px;color:#6c757d;text-transform:uppercase;}}.monitoring-section{{margin:30px 0;}}.charts-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin:20px 0;}}.chart-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:8px;padding:20px;}}.chart-title{{font-size:18px;font-weight:bold;margin-bottom:15px;color:#495057;}}.chart-container{{position:relative;height:300px;}}table{{font-size:14px;}}th{{background-color:#f0f0f0!important;}}tr:hover{{background-color:#f8f9fa;cursor:pointer;}}.job-link{{color:#007bff;text-decoration:none;}}.job-link:hover{{text-decoration:underline;}}li{{margin-bottom:5px;}}.status-good{{color:#28a745;}}.status-warning{{color:#ffc107;}}.status-error{{color:#dc3545;}}.system-metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px;margin:20px 0;}}.metric-card{{background:#e7f3ff;border:1px solid #b3d9ff;border-radius:6px;padding:15px;}}.metric-value{{font-size:20px;font-weight:bold;margin-bottom:5px;}}.metric-label{{font-size:12px;color:#6c757d;text-transform:uppercase;}}@media (max-width:1200px){{.charts-container{{grid-template-columns:1fr;}}}}</style></head>
-    <body><div class="container"><h1>🚀 Threaded Image Processing API Dashboard</h1><p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
-    <div class="stats-grid"><div class="stat-card"><div class="stat-value">{uptime_str}</div><div class="stat-label">Uptime</div></div><div class="stat-card"><div class="stat-value">{stats['queue_size']}</div><div class="stat-label">Queue Size</div></div><div class="stat-card"><div class="stat-value">{stats['active_jobs']}</div><div class="stat-label">Active Jobs</div></div><div class="stat-card"><div class="stat-value status-good">{stats['total_completed']}</div><div class="stat-label">Completed</div></div><div class="stat-card"><div class="stat-value status-error">{stats['total_failed']}</div><div class="stat-label">Failed</div></div><div class="stat-card"><div class="stat-value">{stats['avg_processing_time']:.2f}s</div><div class="stat-label">Avg Process Time</div></div></div>
-    <div class="monitoring-section"><h2>📊 Real-time Monitoring</h2><div class="system-metrics"><div class="metric-card"><div class="metric-value" style="color:#dc3545;">{current_metrics['cpu_percent']:.1f}%</div><div class="metric-label">CPU Usage</div></div><div class="metric-card"><div class="metric-value" style="color:#fd7e14;">{current_metrics['memory_percent']:.1f}%</div><div class="metric-label">Memory Usage ({current_metrics['memory_used_gb']:.1f}GB / {current_metrics['memory_total_gb']:.1f}GB)</div></div><div class="metric-card"><div class="metric-value" style="color:#6f42c1;">{current_metrics['gpu_utilization']:.0f}%</div><div class="metric-label">GPU Usage ({current_metrics['gpu_used_mb']:.0f}MB / {current_metrics['gpu_total_mb']:.0f}MB)</div></div></div><div class="charts-container"><div class="chart-card"><div class="chart-title">🔧 Worker Thread Activity</div><div class="chart-container"><canvas id="workerChart"></canvas></div></div><div class="chart-card"><div class="chart-title">💻 System Resources</div><div class="chart-container"><canvas id="systemChart"></canvas></div></div></div></div>
-    <h3>Configuration</h3><ul><li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li><li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li><li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li><li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li><li><strong>Logo Watermarking:</strong> {logo_status}</li><li><strong>Rembg GPU Attempt:</strong> {'Enabled' if REMBG_USE_GPU else 'Disabled'}</li><li><strong>Rembg Providers:</strong> {str(active_rembg_providers)}</li><li><strong>GPU Monitoring (pynvml):</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml)'}</li></ul>
-    <div style="margin:20px 0;padding:15px;background:#f8f9fa;border-radius:6px;"><h4>🔧 Debug Info</h4><p><strong>GPU Debug:</strong> <a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status</a></p><p><strong>Worker Activity:</strong> <a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p><p><strong>System Metrics:</strong> <a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p></div>
-    {recent_jobs_html}<p style="margin-top:30px;font-size:12px;color:#6c757d;">Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}</p></div>
-    <script>const workerColors=['#FF6384','#36A2EB','#FFCE56','#4BC0C0','#9966FF','#FF9F40','#FF6384','#C9CBCF'];let workerChart,systemChart;function initCharts(){{const workerCtx=document.getElementById('workerChart').getContext('2d');workerChart=new Chart(workerCtx,{{type:'line',data:{{labels:[],datasets:[]}},options:{{responsive:!0,maintainAspectRatio:!1,plugins:{{legend:{{position:'bottom',labels:{{boxWidth:12,fontSize:10}}}}}},scales:{{y:{{beginAtZero:!0,title:{{display:!0,text:'Activity Count'}}}},x:{{title:{{display:!0,text:'Time'}}}}}},elements:{{line:{{tension:.4}},point:{{radius:2}}}}}});const systemCtx=document.getElementById('systemChart').getContext('2d');systemChart=new Chart(systemCtx,{{type:'line',data:{{labels:[],datasets:[{{label:'CPU %',data:[],borderColor:'#dc3545',backgroundColor:'rgba(220,53,69,0.1)',fill:!1}},{{label:'Memory %',data:[],borderColor:'#fd7e14',backgroundColor:'rgba(253,126,20,0.1)',fill:!1}},{{label:'GPU %',data:[],borderColor:'#6f42c1',backgroundColor:'rgba(111,66,193,0.1)',fill:!1}}]}},options:{{responsive:!0,maintainAspectRatio:!1,plugins:{{legend:{{position:'bottom'}}}},scales:{{y:{{beginAtZero:!0,max:100,title:{{display:!0,text:'Usage %'}}}},x:{{title:{{display:!0,text:'Time'}}}}}},elements:{{line:{{tension:.4}},point:{{radius:1}}}}}})}}
-    async function updateCharts(){{try{{const workerResponse=await fetch('/api/monitoring/workers');const workerData=await workerResponse.json();const systemResponse=await fetch('/api/monitoring/system');const systemData=await systemResponse.json();updateWorkerChart(workerData);updateSystemChart(systemData)}}catch(error){{console.error('Error updating charts:',error)}}}}
-    function updateWorkerChart(data){{const workerIds=Object.keys(data).sort();if(workerIds.length===0)return;const firstWorker=data[workerIds[0]];const labels=firstWorker.map(bucket=>{{const date=new Date(bucket.timestamp*1000);return date.toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}})}});const datasets=workerIds.map((workerId,index)=>{{const workerBuckets=data[workerId];const totalActivity=workerBuckets.map(bucket=>bucket.fetching+bucket.rembg+bucket.pil+bucket.saving);return{{label:workerId.replace('worker_','Worker '),data:totalActivity,borderColor:workerColors[index%workerColors.length],backgroundColor:workerColors[index%workerColors.length]+'20',fill:!1}}}});workerChart.data.labels=labels;workerChart.data.datasets=datasets;workerChart.update('none')}}
-    function updateSystemChart(data){{if(data.length===0)return;const labels=data.map(metric=>{{const date=new Date(metric.timestamp*1000);return date.toLocaleTimeString([],{{hour:'2-digit',minute:'2-digit'}})}});const cpuData=data.map(metric=>metric.cpu_percent);const memoryData=data.map(metric=>metric.memory_percent);const gpuData=data.map(metric=>metric.gpu_utilization);systemChart.data.labels=labels;systemChart.data.datasets[0].data=cpuData;systemChart.data.datasets[1].data=memoryData;systemChart.data.datasets[2].data=gpuData;systemChart.update('none')}}
-    document.addEventListener('DOMContentLoaded',function(){{initCharts();updateCharts();setInterval(updateCharts,10000)}});function refreshPage(){{location.reload()}}setTimeout(refreshPage,30000);</script></body></html>"""
+    
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+    <style>
+        body{{font-family:sans-serif;margin:20px; background-color: #f9f9f9;}} 
+        .container{{max-width: 1400px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);}}
+        .stats-grid{{display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0;}}
+        .stat-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 15px; text-align: center;}}
+        .stat-value{{font-size: 24px; font-weight: bold; color: #007bff; margin-bottom: 5px;}}
+        .stat-label{{font-size: 14px; color: #6c757d; text-transform: uppercase;}}
+        .monitoring-section{{margin: 30px 0;}}
+        .charts-container{{display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0;}}
+        .chart-card{{background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px;}}
+        .chart-title{{font-size: 18px; font-weight: bold; margin-bottom: 15px; color: #495057;}}
+        .chart-container{{position: relative; height: 300px;}}
+        table{{font-size: 14px;}} 
+        th{{background-color: #f0f0f0 !important;}}
+        tr:hover{{background-color: #f8f9fa; cursor: pointer;}}
+        .job-link{{color: #007bff; text-decoration: none;}}
+        .job-link:hover{{text-decoration: underline;}}
+        li{{margin-bottom: 5px;}}
+        .status-good{{color: #28a745;}}
+        .status-warning{{color: #ffc107;}}
+        .status-error{{color: #dc3545;}}
+        .system-metrics{{display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin: 20px 0;}}
+        .metric-card{{background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 6px; padding: 15px;}}
+        .metric-value{{font-size: 20px; font-weight: bold; margin-bottom: 5px;}}
+        .metric-label{{font-size: 12px; color: #6c757d; text-transform: uppercase;}}
+        @media (max-width: 1200px) {{
+            .charts-container {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+    </head>
+    <body>
+    <div class="container">
+        <h1>🚀 Threaded Image Processing API Dashboard</h1>
+        <p><strong>Status:</strong> <span class="status-good">RUNNING</span> | Background removal uses true async processing with thread pools for CPU-bound operations.</p>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">{uptime_str}</div>
+                <div class="stat-label">Uptime</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['queue_size']}</div>
+                <div class="stat-label">Queue Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['active_jobs']}</div>
+                <div class="stat-label">Active Jobs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-good">{stats['total_completed']}</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value status-error">{stats['total_failed']}</div>
+                <div class="stat-label">Failed</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
+                <div class="stat-label">Avg Process Time</div>
+            </div>
+        </div>
+
+        <div class="monitoring-section">
+            <h2>📊 Real-time Monitoring</h2>
+            
+            <div class="system-metrics">
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #dc3545;">{current_metrics['cpu_percent']:.1f}%</div>
+                    <div class="metric-label">CPU Usage</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #fd7e14;">{current_metrics['memory_percent']:.1f}%</div>
+                    <div class="metric-label">Memory Usage ({current_metrics['memory_used_gb']:.1f}GB / {current_metrics['memory_total_gb']:.1f}GB)</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value" style="color: #6f42c1;">{current_metrics['gpu_utilization']:.0f}%</div>
+                    <div class="metric-label">GPU Usage ({current_metrics['gpu_used_mb']:.0f}MB / {current_metrics['gpu_total_mb']:.0f}MB)</div>
+                </div>
+            </div>
+            
+            <div class="charts-container">
+                <div class="chart-card">
+                    <div class="chart-title">🔧 Worker Thread Activity</div>
+                    <div class="chart-container">
+                        <canvas id="workerChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-title">💻 System Resources</div>
+                    <div class="chart-container">
+                        <canvas id="systemChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h3>Configuration</h3>
+        <ul>
+            <li><strong>Async Workers:</strong> {MAX_CONCURRENT_TASKS}</li>
+            <li><strong>CPU Thread Pool:</strong> {CPU_THREAD_POOL_SIZE}</li>
+            <li><strong>PIL Thread Pool:</strong> {PIL_THREAD_POOL_SIZE}</li>
+            <li><strong>Queue Capacity:</strong> {MAX_QUEUE_SIZE}</li>
+            <li><strong>Logo Watermarking:</strong> {logo_status}</li>
+            <li><strong>Rembg GPU Attempt:</strong> {'Enabled' if REMBG_USE_GPU else 'Disabled'}</li>
+            <li><strong>Rembg Providers:</strong> {str(active_rembg_providers)}</li>
+            <li><strong>GPU Monitoring (pynvml):</strong> {current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml)'}</li>
+        </ul>
+        
+        <div style="margin: 20px 0; padding: 15px; background: #f8f9fa; border-radius: 6px;">
+            <h4>🔧 Debug Info</h4>
+            <p><strong>GPU Debug:</strong> <a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status</a></p>
+            <p><strong>Worker Activity:</strong> <a href="/api/monitoring/workers" target="_blank">View Raw Worker Data</a></p>
+            <p><strong>System Metrics:</strong> <a href="/api/monitoring/system" target="_blank">View Raw System Data</a></p>
+        </div>
+
+        {recent_jobs_html}
+        
+        <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
+            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+        </p>
+    </div>
+    
+    <script>
+        // Chart colors for workers
+        const workerColors = [
+            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', 
+            '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF' // Re-used some for more than 6 workers
+        ];
+        
+        let workerChart, systemChart;
+
+        // Initialize charts
+        function initCharts() {{
+            // Worker Activity Chart
+            const workerCtx = document.getElementById('workerChart').getContext('2d');
+            workerChart = new Chart(workerCtx, {{
+                type: 'line',
+                data: {{
+                    labels: [],
+                    datasets: []
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            position: 'bottom',
+                            labels: {{
+                                boxWidth: 12,
+                                // fontSize: 10 // Chart.js v3 uses `font.size`
+                            }}
+                        }},
+                        tooltip: {{
+                            mode: 'index',
+                            intersect: false
+                        }}
+                    }},
+                    scales: {{
+                        y: {{
+                            beginAtZero: true,
+                            stacked: true, // Good for showing composition of worker activity
+                            title: {{
+                                display: true,
+                                text: 'Active Workers / Activity Count'
+                            }}
+                        }},
+                        x: {{
+                            title: {{
+                                display: true,
+                                text: 'Time'
+                            }},
+                            ticks: {{
+                                autoSkip: true,
+                                maxTicksLimit: 15 // Adjust for readability
+                            }}
+                        }}
+                    }},
+                    elements: {{
+                        line: {{
+                            tension: 0.4 // Smoother lines
+                        }},
+                        point: {{
+                            radius: 2
+                        }}
+                    }}
+                }}
+            }});
+
+            // System Resources Chart
+            const systemCtx = document.getElementById('systemChart').getContext('2d');
+            systemChart = new Chart(systemCtx, {{
+                type: 'line',
+                data: {{
+                    labels: [],
+                    datasets: [
+                        {{
+                            label: 'CPU %',
+                            data: [],
+                            borderColor: '#dc3545', // Red
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                            fill: false,
+                            yAxisID: 'yPercent' // Assign to a Y-axis
+                        }},
+                        {{
+                            label: 'Memory %',
+                            data: [],
+                            borderColor: '#fd7e14', // Orange
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+                            fill: false,
+                            yAxisID: 'yPercent' // Assign to the same Y-axis
+                        }},
+                        {{
+                            label: 'GPU %',
+                            data: [],
+                            borderColor: '#6f42c1', // Purple
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+                            fill: false,
+                            yAxisID: 'yPercent' // Assign to the same Y-axis
+                        }}
+                    ]
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {{
+                        legend: {{
+                            position: 'bottom'
+                        }},
+                        tooltip: {{
+                            mode: 'index',
+                            intersect: false
+                        }}
+                    }},
+                    scales: {{
+                        yPercent: {{ // Define the Y-axis for percentages
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            beginAtZero: true,
+                            max: 100,
+                            title: {{
+                                display: true,
+                                text: 'Usage %'
+                            }}
+                        }},
+                        x: {{
+                            title: {{
+                                display: true,
+                                text: 'Time'
+                            }},
+                            ticks: {{
+                                autoSkip: true,
+                                maxTicksLimit: 15 // Adjust for readability
+                            }}
+                        }}
+                    }},
+                    elements: {{
+                        line: {{
+                            tension: 0.4 // Smoother lines
+                        }},
+                        point: {{
+                            radius: 1
+                        }}
+                    }}
+                }}
+            }});
+        }}
+
+        // Update charts with new data
+        async function updateCharts() {{
+            try {{
+                // Fetch worker data
+                const workerResponse = await fetch('/api/monitoring/workers');
+                if (!workerResponse.ok) {{
+                    console.error("Failed to fetch worker data:", workerResponse.status);
+                    return;
+                }}
+                const workerData = await workerResponse.json();
+                
+                // Fetch system data
+                const systemResponse = await fetch('/api/monitoring/system');
+                 if (!systemResponse.ok) {{
+                    console.error("Failed to fetch system data:", systemResponse.status);
+                    return;
+                }}
+                const systemData = await systemResponse.json();
+                
+                // Update worker chart
+                updateWorkerChart(workerData);
+                
+                // Update system chart
+                updateSystemChart(systemData);
+                
+            }} catch (error) {{
+                console.error('Error updating charts:', error);
+            }}
+        }}
+
+        function formatChartTimestamp(unixTimestamp) {{
+            const date = new Date(unixTimestamp * 1000);
+            return date.toLocaleTimeString([], {{hour: '2-digit', minute: '2-digit', second: '2-digit'}});
+        }}
+
+        function updateWorkerChart(data) {{
+            if (!workerChart || typeof data !== 'object' || Object.keys(data).length === 0) {{
+                // console.warn("Worker chart not ready or data is invalid/empty.");
+                return;
+            }}
+            
+            const workerIds = Object.keys(data).sort();
+            const firstWorkerData = data[workerIds[0]];
+
+            if (!Array.isArray(firstWorkerData) || firstWorkerData.length === 0) {{
+                // console.warn("First worker data is invalid or empty for labels.");
+                 workerChart.data.labels = [];
+                 workerChart.data.datasets = [];
+                 workerChart.update('none');
+                return;
+            }}
+            
+            const labels = firstWorkerData.map(bucket => formatChartTimestamp(bucket.timestamp));
+            
+            const datasets = workerIds.map((workerId, index) => {{
+                const workerBuckets = data[workerId] || []; // Ensure it's an array
+                // Summing up activities for simplicity, could be stacked bars for details
+                const totalActivity = workerBuckets.map(bucket => 
+                    (bucket.fetching || 0) + (bucket.rembg || 0) + (bucket.pil || 0) + (bucket.saving || 0)
+                );
+                
+                return {{
+                    label: workerId.replace('worker_', 'Worker '),
+                    data: totalActivity,
+                    borderColor: workerColors[index % workerColors.length],
+                    backgroundColor: workerColors[index % workerColors.length] + '33', // More transparent fill
+                    fill: true, // Can set to true for area chart style
+                    tension: 0.4
+                }};
+            }});
+            
+            workerChart.data.labels = labels;
+            workerChart.data.datasets = datasets;
+            workerChart.update('none'); // 'none' for no animation, quicker updates
+        }}
+
+        function updateSystemChart(data) {{
+            if (!systemChart || !Array.isArray(data) || data.length === 0) {{
+                // console.warn("System chart not ready or data is invalid/empty.");
+                return;
+            }}
+            
+            const labels = data.map(metric => formatChartTimestamp(metric.timestamp));
+            
+            const cpuData = data.map(metric => metric.cpu_percent);
+            const memoryData = data.map(metric => metric.memory_percent);
+            const gpuData = data.map(metric => metric.gpu_utilization || 0); // Default to 0 if undefined
+            
+            systemChart.data.labels = labels;
+            systemChart.data.datasets[0].data = cpuData;
+            systemChart.data.datasets[1].data = memoryData;
+            systemChart.data.datasets[2].data = gpuData;
+            systemChart.update('none'); // 'none' for no animation
+        }}
+
+        // Initialize everything when page loads
+        document.addEventListener('DOMContentLoaded', function() {{
+            initCharts();
+            updateCharts(); // Initial fetch
+            
+            // Update charts every 10 seconds
+            setInterval(updateCharts, {MONITORING_SAMPLE_INTERVAL * 2 * 1000}); // Update slightly less frequently than data collection
+        }});
+
+        // Page refresh function
+        function refreshPage() {{
+            // Only refresh if the page is visible to avoid unnecessary reloads
+            if (document.visibilityState === 'visible') {{
+                // console.log("Refreshing page content...");
+                // Instead of full reload, one could fetch stats and update specific DOM elements
+                // For now, keep it simple with a full reload if desired
+                // location.reload(); 
+                
+                // Or, to just re-fetch and update stats without full page reload:
+                 fetch('/')
+                    .then(response => response.text())
+                    .then(html => {{
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        // Update specific parts, e.g., stats grid, recent jobs table
+                        const newStatsGrid = doc.querySelector('.stats-grid');
+                        const currentStatsGrid = document.querySelector('.stats-grid');
+                        if (newStatsGrid && currentStatsGrid) {{
+                            currentStatsGrid.innerHTML = newStatsGrid.innerHTML;
+                        }}
+                        // Add similar updates for other dynamic parts like recent_jobs_html
+                        const newRecentJobs = doc.querySelector('.monitoring-section + h3 + table, .monitoring-section + h3 + p');
+                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; //h3
+                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){ //table or p
+                            let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
+                             if (newRecentJobs && currentJobsDisplay) {{
+                                currentJobsDisplay.outerHTML = newRecentJobs.outerHTML;
+                            }}
+                        }
+                        
+                        // Update "Last updated" timestamp
+                        const lastUpdatedP = document.querySelector('p[style*="font-size: 12px"]');
+                        if(lastUpdatedP) {{
+                             lastUpdatedP.innerHTML = `Page data refreshed: {format_timestamp(time.time())} | Auto-refresh active`;
+                        }}
+                    }})
+                    .catch(err => console.error("Error refreshing page content:", err));
+            }}
+        }}
+        
+        // Auto refresh page content (not full reload) every 30 seconds
+        setInterval(refreshPage, 30000); 
+    </script>
+    </body></html>"""
 
 
 if __name__ == "__main__":
