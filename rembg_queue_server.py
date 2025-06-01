@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X5---
+# --- CREATE DIRECTORIES AT THE VERY TOP X6---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -689,6 +689,10 @@ async def root():
         recent_jobs_html += "</table>"
     else: recent_jobs_html += "<p>No jobs processed yet.</p>"
     
+    # This is the string that will be evaluated by Python first
+    initial_last_updated_text = f"Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}"
+
+
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Image API Dashboard</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>
@@ -809,7 +813,7 @@ async def root():
         {recent_jobs_html}
         
         <p style="margin-top: 30px; font-size: 12px; color: #6c757d;">
-            Page auto-refreshes every 30 seconds | Last updated: {format_timestamp(time.time())}
+            {initial_last_updated_text}
         </p>
     </div>
     
@@ -1059,45 +1063,47 @@ async def root():
             initCharts();
             updateCharts(); // Initial fetch
             
-            // Update charts every 10 seconds
-            setInterval(updateCharts, {MONITORING_SAMPLE_INTERVAL * 2 * 1000}); // Update slightly less frequently than data collection
+            // Update charts every N seconds (make N a bit more than MONITORING_SAMPLE_INTERVAL)
+            // MONITORING_SAMPLE_INTERVAL is defined in Python, so we need to pass it or hardcode a similar value
+            const chartUpdateInterval = ({MONITORING_SAMPLE_INTERVAL} + 2) * 1000; // e.g., if 5s, update charts every 7s
+            setInterval(updateCharts, chartUpdateInterval);
         }});
 
-        // Page refresh function
+        // Page refresh function (partial content update)
         function refreshPage() {{
-            // Only refresh if the page is visible to avoid unnecessary reloads
             if (document.visibilityState === 'visible') {{
-                // console.log("Refreshing page content...");
-                // Instead of full reload, one could fetch stats and update specific DOM elements
-                // For now, keep it simple with a full reload if desired
-                // location.reload(); 
-                
-                // Or, to just re-fetch and update stats without full page reload:
                  fetch('/')
                     .then(response => response.text())
                     .then(html => {{
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
-                        // Update specific parts, e.g., stats grid, recent jobs table
+                        
                         const newStatsGrid = doc.querySelector('.stats-grid');
                         const currentStatsGrid = document.querySelector('.stats-grid');
                         if (newStatsGrid && currentStatsGrid) {{
                             currentStatsGrid.innerHTML = newStatsGrid.innerHTML;
                         }}
-                        // Add similar updates for other dynamic parts like recent_jobs_html
-                        const newRecentJobs = doc.querySelector('.monitoring-section + h3 + table, .monitoring-section + h3 + p');
-                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; //h3
-                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){
-                            let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
-                             if (newRecentJobs && currentJobsDisplay) {{
-                                currentJobsDisplay.outerHTML = newRecentJobs.outerHTML;
-                            }}
-                        }
                         
-                        // Update "Last updated" timestamp
+                        const newRecentJobsContainer = doc.querySelector('.monitoring-section + h3');
+                        let newRecentJobsDisplay = null;
+                        if (newRecentJobsContainer) {{
+                            newRecentJobsDisplay = newRecentJobsContainer.nextElementSibling; // Could be table or p
+                        }}
+
+                        const currentRecentJobsContainer = document.querySelector('.monitoring-section').nextElementSibling; //h3
+                        if(currentRecentJobsContainer && currentRecentJobsContainer.nextElementSibling){{
+                            let currentJobsDisplay = currentRecentJobsContainer.nextElementSibling;
+                             if (newRecentJobsDisplay && currentJobsDisplay) {{
+                                currentJobsDisplay.outerHTML = newRecentJobsDisplay.outerHTML;
+                            }}
+                        }}
+                        
                         const lastUpdatedP = document.querySelector('p[style*="font-size: 12px"]');
                         if(lastUpdatedP) {{
-                             lastUpdatedP.innerHTML = `Page data refreshed: {format_timestamp(time.time())} | Auto-refresh active`;
+                            // Use JavaScript to format the current time for the "Last updated" message
+                            const now = new Date();
+                            const timeString = now.toLocaleTimeString([], {{ year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+                            lastUpdatedP.innerHTML = `Page data refreshed: ${timeString} | Auto-refresh active`;
                         }}
                     }})
                     .catch(err => console.error("Error refreshing page content:", err));
