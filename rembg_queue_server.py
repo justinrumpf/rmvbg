@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X2---
+# --- CREATE DIRECTORIES AT THE VERY TOP X3---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -367,11 +367,15 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
         logger.error(f"Error saving upload {saved_fn} for job {job_id}: {e}"); raise HTTPException(status_code=500, detail=f"Save failed: {e}")
     finally: await image_file.close()
     file_uri = f"file://{original_path}"
-    try: queue.put_nowait((job_id, file_uri, model, True))
+    try:
+        queue.put_nowait((job_id, file_uri, model, True))
     except asyncio.QueueFull:
         logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}).")
-        if os.path.exists(original_path): try: os.remove(original_path)
-        except OSError as e_clean: logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
+        if os.path.exists(original_path):
+            try:
+                os.remove(original_path)
+            except OSError as e_clean:
+                logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": f"(form_upload: {original_fn})",
@@ -603,19 +607,24 @@ async def startup_event():
             for provider_name in REMBG_PREFERRED_GPU_PROVIDERS:
                 if provider_name in available_ort_providers:
                     if provider_name not in chosen_providers: chosen_providers.append(provider_name)
-            if 'CPUExecutionProvider' in chosen_providers: chosen_providers.remove('CPUExecutionProvider')
-            if 'CPUExecutionProvider' in available_ort_providers: chosen_providers.append('CPUExecutionProvider')
+            if 'CPUExecutionProvider' in chosen_providers: chosen_providers.remove('CPUExecutionProvider') # remove if added by mistake
+            
+            # Ensure CPUExecutionProvider is always at the end as a fallback
+            if 'CPUExecutionProvider' in available_ort_providers:
+                 if 'CPUExecutionProvider' not in chosen_providers: # Add if not already there
+                    chosen_providers.append('CPUExecutionProvider')
             else: logger.error("'CPUExecutionProvider' not found in ONNX available_providers. This is unusual.")
 
-            if not chosen_providers:
-                logger.warning(f"Could not form valid ONNX provider list. Falling back to CPU-only default. Configured Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}")
+            if not chosen_providers or (len(chosen_providers) == 1 and 'CPUExecutionProvider' in chosen_providers and not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in chosen_providers)):
+                logger.warning(f"Could not form valid ONNX provider list with preferred GPU providers. Falling back to CPU-only default. Configured Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}, Chosen: {chosen_providers}")
                 active_rembg_providers = list(REMBG_CPU_PROVIDERS)
             else:
                 active_rembg_providers = chosen_providers
             
             has_gpu_in_final = any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in active_rembg_providers if p != 'CPUExecutionProvider')
-            if not has_gpu_in_final:
-                logger.warning(f"REMBG_USE_GPU is True, but no preferred GPU providers were selected. Final: {active_rembg_providers}. Check onnxruntime-gpu/drivers. Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}.")
+            if not has_gpu_in_final and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in chosen_providers): # If GPU was available but not selected or CPU is the only one
+                 logger.warning(f"REMBG_USE_GPU is True, but no preferred GPU providers were ultimately selected or only CPU remains. Final: {active_rembg_providers}. Check onnxruntime-gpu/drivers. Preferred: {REMBG_PREFERRED_GPU_PROVIDERS}, Available: {available_ort_providers}.")
+
         except ImportError: logger.warning("onnxruntime module not found. Rembg will use CPU. Install onnxruntime or onnxruntime-gpu."); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
         except Exception as e: logger.error(f"Error detecting ONNX providers: {e}. Defaulting to CPU.", exc_info=True); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
     else: logger.info("REMBG_USE_GPU is False. Using CPU providers for rembg."); active_rembg_providers = list(REMBG_CPU_PROVIDERS)
