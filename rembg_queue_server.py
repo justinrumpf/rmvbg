@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X992---
+# --- CREATE DIRECTORIES AT THE VERY TOP X993---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -980,133 +980,133 @@ async def image_processing_worker(worker_id: int):
                 logger.error(f"Worker {worker_id}: Job {job_id} (from queue) not found in 'results' dict. Skipping.")
                 fair_queue.job_completed(client_ip, False, 0, 0)
                 continue
-        
-        input_bytes_for_rembg: bytes | None = None
-        input_fetch_time, rembg_time, pil_time, save_time = 0.0, 0.0, 0.0, 0.0
-        input_size_bytes, output_size_bytes = 0, 0
-        original_fn_for_history = image_source_str.split('/')[-1]
-        source_type_for_history = "url" if image_source_str.startswith(("http:", "https:")) else "upload"
+            
+            input_bytes_for_rembg: bytes | None = None
+            input_fetch_time, rembg_time, pil_time, save_time = 0.0, 0.0, 0.0, 0.0
+            input_size_bytes, output_size_bytes = 0, 0
+            original_fn_for_history = image_source_str.split('/')[-1]
+            source_type_for_history = "url" if image_source_str.startswith(("http:", "https:")) else "upload"
 
-        try:
-            results[job_id]["status"] = "fetching_input"
-            log_worker_activity(worker_id, WORKER_FETCHING)
-            t_input_fetch_start = time.perf_counter()
-            
-            if image_source_str.startswith("file://"):
-                results[job_id]["status"] = "loading_file"
-                local_path = image_source_str[len("file://"):]
-                if not os.path.exists(local_path): 
-                    raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path}")
-                async with aiofiles.open(local_path, 'rb') as f: 
-                    input_bytes_for_rembg = await f.read()
-                input_size_bytes = len(input_bytes_for_rembg)
-                original_fn_for_history = os.path.basename(local_path)
-                logger.info(f"Job {job_id} (W{worker_id}): Loaded local file '{original_fn_for_history}' ({format_size(input_size_bytes)})")
-            
-            elif image_source_str.startswith(("http://", "https://")):
-                results[job_id]["status"] = "downloading"
-                logger.info(f"Job {job_id} (W{worker_id}): Downloading from {image_source_str}...")
-                async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
-                    img_response = await client.get(image_source_str)
-                    img_response.raise_for_status()
-                input_bytes_for_rembg = await img_response.aread()
-                input_size_bytes = len(input_bytes_for_rembg)
-                logger.info(f"Job {job_id} (W{worker_id}): Downloaded {format_size(input_size_bytes)}")
+            try:
+                results[job_id]["status"] = "fetching_input"
+                log_worker_activity(worker_id, WORKER_FETCHING)
+                t_input_fetch_start = time.perf_counter()
                 
-                # Save downloaded original for record-keeping
-                content_type = img_response.headers.get("content-type", "unknown").lower()
-                parsed_url_path = urllib.parse.urlparse(image_source_str).path
-                _, url_ext = os.path.splitext(parsed_url_path)
-                extension = MIME_TO_EXT.get(content_type, url_ext if url_ext else ".bin")
+                if image_source_str.startswith("file://"):
+                    results[job_id]["status"] = "loading_file"
+                    local_path = image_source_str[len("file://"):]
+                    if not os.path.exists(local_path): 
+                        raise FileNotFoundError(f"Local file for job {job_id} not found: {local_path}")
+                    async with aiofiles.open(local_path, 'rb') as f: 
+                        input_bytes_for_rembg = await f.read()
+                    input_size_bytes = len(input_bytes_for_rembg)
+                    original_fn_for_history = os.path.basename(local_path)
+                    logger.info(f"Job {job_id} (W{worker_id}): Loaded local file '{original_fn_for_history}' ({format_size(input_size_bytes)})")
                 
-                dl_original_fn = f"{job_id}_original_downloaded{extension}"
-                dl_original_path = os.path.join(UPLOADS_DIR, dl_original_fn)
-                results[job_id]["original_local_path"] = dl_original_path
-                async with aiofiles.open(dl_original_path, 'wb') as out_file: 
-                    await out_file.write(input_bytes_for_rembg)
-                original_fn_for_history = dl_original_fn
-                logger.info(f"Job {job_id} (W{worker_id}): Saved downloaded original as '{dl_original_fn}'")
-            else: 
-                raise ValueError(f"Unsupported image source format: {image_source_str}")
-            
-            if input_bytes_for_rembg is None: 
-                raise ValueError(f"Image content is None for job {job_id} after fetch attempt.")
-            input_fetch_time = time.perf_counter() - t_input_fetch_start
+                elif image_source_str.startswith(("http://", "https://")):
+                    results[job_id]["status"] = "downloading"
+                    logger.info(f"Job {job_id} (W{worker_id}): Downloading from {image_source_str}...")
+                    async with httpx.AsyncClient(timeout=HTTP_CLIENT_TIMEOUT) as client:
+                        img_response = await client.get(image_source_str)
+                        img_response.raise_for_status()
+                    input_bytes_for_rembg = await img_response.aread()
+                    input_size_bytes = len(input_bytes_for_rembg)
+                    logger.info(f"Job {job_id} (W{worker_id}): Downloaded {format_size(input_size_bytes)}")
+                    
+                    # Save downloaded original for record-keeping
+                    content_type = img_response.headers.get("content-type", "unknown").lower()
+                    parsed_url_path = urllib.parse.urlparse(image_source_str).path
+                    _, url_ext = os.path.splitext(parsed_url_path)
+                    extension = MIME_TO_EXT.get(content_type, url_ext if url_ext else ".bin")
+                    
+                    dl_original_fn = f"{job_id}_original_downloaded{extension}"
+                    dl_original_path = os.path.join(UPLOADS_DIR, dl_original_fn)
+                    results[job_id]["original_local_path"] = dl_original_path
+                    async with aiofiles.open(dl_original_path, 'wb') as out_file: 
+                        await out_file.write(input_bytes_for_rembg)
+                    original_fn_for_history = dl_original_fn
+                    logger.info(f"Job {job_id} (W{worker_id}): Saved downloaded original as '{dl_original_fn}'")
+                else: 
+                    raise ValueError(f"Unsupported image source format: {image_source_str}")
+                
+                if input_bytes_for_rembg is None: 
+                    raise ValueError(f"Image content is None for job {job_id} after fetch attempt.")
+                input_fetch_time = time.perf_counter() - t_input_fetch_start
 
-            log_worker_activity(worker_id, WORKER_PROCESSING_REMBG)
-            results[job_id]["status"] = "processing_rembg"
-            logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
-            t_rembg_start = time.perf_counter()
-            loop = asyncio.get_event_loop()
-            output_bytes_with_alpha = await loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
-            rembg_time = time.perf_counter() - t_rembg_start
-            logger.info(f"Job {job_id} (W{worker_id}): Rembg done in {rembg_time:.4f}s")
+                log_worker_activity(worker_id, WORKER_PROCESSING_REMBG)
+                results[job_id]["status"] = "processing_rembg"
+                logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
+                t_rembg_start = time.perf_counter()
+                loop = asyncio.get_event_loop()
+                output_bytes_with_alpha = await loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
+                rembg_time = time.perf_counter() - t_rembg_start
+                logger.info(f"Job {job_id} (W{worker_id}): Rembg done in {rembg_time:.4f}s")
 
-            log_worker_activity(worker_id, WORKER_PROCESSING_PIL)
-            results[job_id]["status"] = "processing_image"
-            logger.info(f"Job {job_id} (W{worker_id}): Starting PIL processing...")
-            t_pil_start = time.perf_counter()
-            processed_image_bytes = await loop.run_in_executor(pil_executor, process_pil_sync, output_bytes_with_alpha, TARGET_SIZE, prepared_logo_image, ENABLE_LOGO_WATERMARK, LOGO_MARGIN)
-            pil_time = time.perf_counter() - t_pil_start
-            logger.info(f"Job {job_id} (W{worker_id}): PIL done in {pil_time:.4f}s")
+                log_worker_activity(worker_id, WORKER_PROCESSING_PIL)
+                results[job_id]["status"] = "processing_image"
+                logger.info(f"Job {job_id} (W{worker_id}): Starting PIL processing...")
+                t_pil_start = time.perf_counter()
+                processed_image_bytes = await loop.run_in_executor(pil_executor, process_pil_sync, output_bytes_with_alpha, TARGET_SIZE, prepared_logo_image, ENABLE_LOGO_WATERMARK, LOGO_MARGIN)
+                pil_time = time.perf_counter() - t_pil_start
+                logger.info(f"Job {job_id} (W{worker_id}): PIL done in {pil_time:.4f}s")
 
-            log_worker_activity(worker_id, WORKER_SAVING)
-            results[job_id]["status"] = "saving"
-            processed_fn = f"{job_id}.webp"
-            processed_path = os.path.join(PROCESSED_DIR, processed_fn)
-            t_save_start = time.perf_counter()
-            async with aiofiles.open(processed_path, 'wb') as out_file: 
-                await out_file.write(processed_image_bytes)
-            save_time = time.perf_counter() - t_save_start
-            output_size_bytes = len(processed_image_bytes)
+                log_worker_activity(worker_id, WORKER_SAVING)
+                results[job_id]["status"] = "saving"
+                processed_fn = f"{job_id}.webp"
+                processed_path = os.path.join(PROCESSED_DIR, processed_fn)
+                t_save_start = time.perf_counter()
+                async with aiofiles.open(processed_path, 'wb') as out_file: 
+                    await out_file.write(processed_image_bytes)
+                save_time = time.perf_counter() - t_save_start
+                output_size_bytes = len(processed_image_bytes)
 
-            results[job_id]["status"] = "done"
-            results[job_id]["processed_path"] = processed_path
-            total_job_time = time.perf_counter() - t_job_start
-            
-            # Update fair queue stats
-            fair_queue.job_completed(client_ip, True, total_job_time, input_size_bytes + output_size_bytes)
-            
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history, client_ip)
-            results[job_id]["completion_time"] = time.time()
-            logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
-        
-        except FileNotFoundError as e: 
-            logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"File not found: {e}"
-        except httpx.HTTPStatusError as e: 
-            logger.error(f"Job {job_id} (W{worker_id}) Error: HTTPStatusError downloading {image_source_str}: {e.response.status_code}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} for {image_source_str}"
-        except httpx.RequestError as e:
-            logger.error(f"Job {job_id} (W{worker_id}) Error: httpx.RequestError downloading {image_source_str}: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Network error during download: {type(e).__name__}"
-        except (ValueError, IOError, OSError) as e:
-            logger.error(f"Job {job_id} (W{worker_id}) Error: Data/file processing error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Processing error: {e}"
-        except RuntimeError as e:
-            logger.critical(f"Job {job_id} (W{worker_id}) CRITICAL RuntimeError: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Critical runtime error: {e}"
-        except Exception as e: 
-            logger.critical(f"Job {job_id} (W{worker_id}) UNHANDLED CRITICAL Error: {e}", exc_info=True)
-            results[job_id]["status"] = "error"
-            results[job_id]["error_message"] = f"Unexpected critical error: {e}"
-        finally:
-            if results.get(job_id, {}).get("status") == "error":
-                total_job_time_error = time.perf_counter() - t_job_start
-                fair_queue.job_completed(client_ip, False, total_job_time_error, input_size_bytes)
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history, client_ip)
+                results[job_id]["status"] = "done"
+                results[job_id]["processed_path"] = processed_path
+                total_job_time = time.perf_counter() - t_job_start
+                
+                # Update fair queue stats
+                fair_queue.job_completed(client_ip, True, total_job_time, input_size_bytes + output_size_bytes)
+                
+                add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history, client_ip)
                 results[job_id]["completion_time"] = time.time()
-                logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
+                logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
             
-            log_worker_activity(worker_id, WORKER_IDLE)
+            except FileNotFoundError as e: 
+                logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"File not found: {e}"
+            except httpx.HTTPStatusError as e: 
+                logger.error(f"Job {job_id} (W{worker_id}) Error: HTTPStatusError downloading {image_source_str}: {e.response.status_code}", exc_info=True)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"Download failed: HTTP {e.response.status_code} for {image_source_str}"
+            except httpx.RequestError as e:
+                logger.error(f"Job {job_id} (W{worker_id}) Error: httpx.RequestError downloading {image_source_str}: {e}", exc_info=True)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"Network error during download: {type(e).__name__}"
+            except (ValueError, IOError, OSError) as e:
+                logger.error(f"Job {job_id} (W{worker_id}) Error: Data/file processing error: {e}", exc_info=True)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"Processing error: {e}"
+            except RuntimeError as e:
+                logger.critical(f"Job {job_id} (W{worker_id}) CRITICAL RuntimeError: {e}", exc_info=True)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"Critical runtime error: {e}"
+            except Exception as e: 
+                logger.critical(f"Job {job_id} (W{worker_id}) UNHANDLED CRITICAL Error: {e}", exc_info=True)
+                results[job_id]["status"] = "error"
+                results[job_id]["error_message"] = f"Unexpected critical error: {e}"
+            finally:
+                if results.get(job_id, {}).get("status") == "error":
+                    total_job_time_error = time.perf_counter() - t_job_start
+                    fair_queue.job_completed(client_ip, False, total_job_time_error, input_size_bytes)
+                    add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history, client_ip)
+                    results[job_id]["completion_time"] = time.time()
+                    logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
+                
+                log_worker_activity(worker_id, WORKER_IDLE)
         
         except Exception as e:
-            logger.error(f"Worker {worker_id} encountered an error: {e}", exc_info=True)
+            logger.error(f"Worker {worker_id} encountered an error in main loop: {e}", exc_info=True)
             await asyncio.sleep(1)  # Brief pause before retrying
 
 @app.on_event("startup")
