@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X99---
+# --- CREATE DIRECTORIES AT THE VERY TOP X991---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
