@@ -121,7 +121,15 @@ class FairQueue:
         self.lock = threading.Lock()
         self.max_concurrent_tasks = max_concurrent_tasks
         self.next_ip_index = 0
+        # Add asyncio Event for worker coordination
+        self._job_available = asyncio.Event()
+        self._loop = None
         
+    def set_event_loop(self, loop):
+        """Set the asyncio event loop for coordination"""
+        self._loop = loop
+        self._job_available = asyncio.Event()
+    
     def can_add_job(self, ip: str) -> bool:
         """Check if IP can add more jobs to queue"""
         with self.lock:
@@ -137,6 +145,11 @@ class FairQueue:
             self.ip_stats[ip]['total_jobs'] += 1
             self.ip_stats[ip]['current_queue_size'] = len(self.ip_queues[ip])
             self.ip_stats[ip]['last_seen'] = time.time()
+            
+            # Notify workers that a job is available
+            if self._loop and not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(self._job_available.set)
+            
             return True
     
     def get_next_job(self) -> Optional[Tuple[str, tuple]]:
@@ -162,9 +175,23 @@ class FairQueue:
                     
                     # Update next IP index for fair rotation
                     self.next_ip_index = (ip_index + 1) % len(ips_with_jobs)
+                    
+                    # Check if more jobs available, if not clear the event
+                    if self.get_total_queue_size_unsafe() == 0:
+                        if self._loop and not self._loop.is_closed():
+                            self._loop.call_soon_threadsafe(self._job_available.clear)
+                    
                     return ip, job_data
             
             return None
+    
+    def get_total_queue_size_unsafe(self) -> int:
+        """Get total jobs across all IPs (must be called with lock held)"""
+        return sum(len(q) for q in self.ip_queues.values())
+    
+    async def wait_for_job(self):
+        """Wait for a job to become available"""
+        await self._job_available.wait()
     
     def job_completed(self, ip: str, success: bool, processing_time: float, bytes_processed: int):
         """Update stats when job completes"""
@@ -939,10 +966,13 @@ async def image_processing_worker(worker_id: int):
     global prepared_logo_image
     
     while True:
-        # Get next job from fair queue
+        # Wait for a job to become available
+        await fair_queue.wait_for_job()
+        
+        # Try to get next job from fair queue
         job_result = fair_queue.get_next_job()
         if job_result is None:
-            await asyncio.sleep(0.1)  # Brief sleep when no jobs available
+            # No job available, continue waiting
             continue
             
         client_ip, (job_id, image_source_str, model_name, _, _) = job_result
@@ -1083,6 +1113,11 @@ async def image_processing_worker(worker_id: int):
 async def startup_event():
     global prepared_logo_image, cpu_executor, pil_executor, active_rembg_providers
     logger.info("Application startup...")
+    
+    # Set the event loop for the fair queue
+    loop = asyncio.get_event_loop()
+    fair_queue.set_event_loop(loop)
+    
     cpu_executor = ThreadPoolExecutor(max_workers=CPU_THREAD_POOL_SIZE, thread_name_prefix="RembgCPU")
     pil_executor = ThreadPoolExecutor(max_workers=PIL_THREAD_POOL_SIZE, thread_name_prefix="PILCPU")
     logger.info(f"Thread pools initialized: RembgCPU Bound={CPU_THREAD_POOL_SIZE}, PILCPU Bound={PIL_THREAD_POOL_SIZE}")
