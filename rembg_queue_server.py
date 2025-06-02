@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X991---
+# --- CREATE DIRECTORIES AT THE VERY TOP X992---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -119,17 +119,10 @@ class FairQueue:
         })
         self.ip_active_jobs: Dict[str, int] = defaultdict(int)
         self.lock = threading.Lock()
+        self.condition = threading.Condition(self.lock)  # Use condition variable instead
         self.max_concurrent_tasks = max_concurrent_tasks
         self.next_ip_index = 0
-        # Add asyncio Event for worker coordination
-        self._job_available = asyncio.Event()
-        self._loop = None
         
-    def set_event_loop(self, loop):
-        """Set the asyncio event loop for coordination"""
-        self._loop = loop
-        self._job_available = asyncio.Event()
-    
     def can_add_job(self, ip: str) -> bool:
         """Check if IP can add more jobs to queue"""
         with self.lock:
@@ -137,7 +130,7 @@ class FairQueue:
     
     def add_job(self, ip: str, job_data: tuple) -> bool:
         """Add job to IP's queue if under limit"""
-        with self.lock:
+        with self.condition:
             if not self.can_add_job(ip):
                 return False
             
@@ -146,15 +139,20 @@ class FairQueue:
             self.ip_stats[ip]['current_queue_size'] = len(self.ip_queues[ip])
             self.ip_stats[ip]['last_seen'] = time.time()
             
-            # Notify workers that a job is available
-            if self._loop and not self._loop.is_closed():
-                self._loop.call_soon_threadsafe(self._job_available.set)
+            # Notify all waiting workers
+            self.condition.notify_all()
+            logger.debug(f"Added job for IP {ip}, notified workers. Queue size now: {self.get_total_queue_size_unsafe()}")
             
             return True
     
     def get_next_job(self) -> Optional[Tuple[str, tuple]]:
         """Round-robin selection of jobs from different IPs"""
-        with self.lock:
+        with self.condition:
+            # Wait for jobs to become available
+            while self.get_total_queue_size_unsafe() == 0:
+                logger.debug("Worker waiting for jobs...")
+                self.condition.wait()  # This will release the lock and wait
+            
             # Get list of IPs that have jobs
             ips_with_jobs = [ip for ip in self.ip_queues.keys() if self.ip_queues[ip]]
             
@@ -176,11 +174,7 @@ class FairQueue:
                     # Update next IP index for fair rotation
                     self.next_ip_index = (ip_index + 1) % len(ips_with_jobs)
                     
-                    # Check if more jobs available, if not clear the event
-                    if self.get_total_queue_size_unsafe() == 0:
-                        if self._loop and not self._loop.is_closed():
-                            self._loop.call_soon_threadsafe(self._job_available.clear)
-                    
+                    logger.debug(f"Worker got job for IP {ip}. Remaining queue size: {self.get_total_queue_size_unsafe()}")
                     return ip, job_data
             
             return None
@@ -189,9 +183,10 @@ class FairQueue:
         """Get total jobs across all IPs (must be called with lock held)"""
         return sum(len(q) for q in self.ip_queues.values())
     
-    async def wait_for_job(self):
-        """Wait for a job to become available"""
-        await self._job_available.wait()
+    def get_total_queue_size(self) -> int:
+        """Get total jobs across all IPs (thread-safe)"""
+        with self.lock:
+            return self.get_total_queue_size_unsafe()
     
     def job_completed(self, ip: str, success: bool, processing_time: float, bytes_processed: int):
         """Update stats when job completes"""
@@ -206,9 +201,9 @@ class FairQueue:
             self.ip_stats[ip]['last_seen'] = time.time()
     
     def get_total_queue_size(self) -> int:
-        """Get total jobs across all IPs"""
+        """Get total jobs across all IPs (thread-safe)"""
         with self.lock:
-            return sum(len(q) for q in self.ip_queues.values())
+            return self.get_total_queue_size_unsafe()
     
     def get_ip_stats(self) -> Dict[str, dict]:
         """Get current stats for all IPs"""
@@ -966,24 +961,25 @@ async def image_processing_worker(worker_id: int):
     global prepared_logo_image
     
     while True:
-        # Wait for a job to become available
-        await fair_queue.wait_for_job()
-        
-        # Try to get next job from fair queue
-        job_result = fair_queue.get_next_job()
-        if job_result is None:
-            # No job available, continue waiting
-            continue
+        try:
+            # Run the blocking get_next_job in an executor to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            job_result = await loop.run_in_executor(None, fair_queue.get_next_job)
             
-        client_ip, (job_id, image_source_str, model_name, _, _) = job_result
-        t_job_start = time.perf_counter()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}. Client IP: {client_ip}")
-        log_worker_activity(worker_id, WORKER_IDLE)
-        
-        if job_id not in results:
-            logger.error(f"Worker {worker_id}: Job {job_id} (from queue) not found in 'results' dict. Skipping.")
-            fair_queue.job_completed(client_ip, False, 0, 0)
-            continue
+            if job_result is None:
+                # This shouldn't happen with the new implementation, but just in case
+                await asyncio.sleep(0.1)
+                continue
+                
+            client_ip, (job_id, image_source_str, model_name, _, _) = job_result
+            t_job_start = time.perf_counter()
+            logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}. Client IP: {client_ip}")
+            log_worker_activity(worker_id, WORKER_IDLE)
+            
+            if job_id not in results:
+                logger.error(f"Worker {worker_id}: Job {job_id} (from queue) not found in 'results' dict. Skipping.")
+                fair_queue.job_completed(client_ip, False, 0, 0)
+                continue
         
         input_bytes_for_rembg: bytes | None = None
         input_fetch_time, rembg_time, pil_time, save_time = 0.0, 0.0, 0.0, 0.0
@@ -1108,15 +1104,15 @@ async def image_processing_worker(worker_id: int):
                 logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
             
             log_worker_activity(worker_id, WORKER_IDLE)
+        
+        except Exception as e:
+            logger.error(f"Worker {worker_id} encountered an error: {e}", exc_info=True)
+            await asyncio.sleep(1)  # Brief pause before retrying
 
 @app.on_event("startup")
 async def startup_event():
     global prepared_logo_image, cpu_executor, pil_executor, active_rembg_providers
     logger.info("Application startup...")
-    
-    # Set the event loop for the fair queue
-    loop = asyncio.get_event_loop()
-    fair_queue.set_event_loop(loop)
     
     cpu_executor = ThreadPoolExecutor(max_workers=CPU_THREAD_POOL_SIZE, thread_name_prefix="RembgCPU")
     pil_executor = ThreadPoolExecutor(max_workers=PIL_THREAD_POOL_SIZE, thread_name_prefix="PILCPU")
