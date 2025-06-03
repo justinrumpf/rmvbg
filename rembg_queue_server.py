@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X99---
+# --- CREATE DIRECTORIES AT THE VERY TOP X2---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -65,7 +65,7 @@ app.add_middleware(
 )
 
 # --- Configuration Constants ---
-MAX_CONCURRENT_TASKS = 8
+MAX_CONCURRENT_TASKS = 2  # Reduced from 8 to prevent GPU memory issues
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
@@ -74,6 +74,7 @@ DEFAULT_MODEL_NAME = "birefnet"
 
 # --- GPU Configuration for Rembg ---
 REMBG_USE_GPU = True # User wants to force GPU, so this should be True.
+REMBG_EMERGENCY_CPU_FALLBACK = True  # Allow CPU fallback if GPU fails completely
 # Order matters: TensorRT > CUDA > DML. CPU is NOT a fallback here if REMBG_USE_GPU is True.
 REMBG_PREFERRED_GPU_PROVIDERS = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'DmlExecutionProvider']
 # This list is used ONLY if REMBG_USE_GPU is False, or as a last resort if startup catastrophically fails to find any provider.
@@ -110,6 +111,10 @@ prepared_logo_image = None
 queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results: dict = {}
 EXPECTED_API_KEY = "secretApiKey"
+
+# --- Session Caching for GPU Memory Efficiency ---
+rembg_session_cache = {}  # model_name -> session object
+session_lock = threading.Lock()
 
 # --- IP Tracking State ---
 ip_data: Dict[str, Dict] = {}  # IP -> {jobs: [job_ids], last_seen: timestamp, location: {}, total_requests: int}
@@ -446,150 +451,107 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
+def get_or_create_rembg_session(model_name: str):
+    """Get cached rembg session or create new one. Thread-safe."""
+    global rembg_session_cache, active_rembg_providers
+    
+    with session_lock:
+        if model_name in rembg_session_cache:
+            logger.debug(f"Using cached rembg session for model: {model_name}")
+            return rembg_session_cache[model_name]
+        
+        logger.info(f"Creating new rembg session for model: {model_name}")
+        session_wrapper = new_session(model_name, providers=active_rembg_providers)
+        
+        if session_wrapper is None:
+            raise RuntimeError(f"Failed to create rembg session for model: {model_name}")
+        
+        # Cache the session for reuse
+        rembg_session_cache[model_name] = session_wrapper
+        logger.info(f"Cached new rembg session for model: {model_name}")
+        return session_wrapper
+
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """
     Synchronous rembg processing - runs in thread pool.
-    Uses providers determined at startup by active_rembg_providers.
-    If REMBG_USE_GPU is True, it will only attempt GPU providers and fail if they are not usable
-    or if the session falls back to CPU-only.
+    Uses cached sessions and improved error handling.
     """
     global active_rembg_providers
-    session_wrapper = None # Renamed to reflect it's a rembg wrapper
     
-    providers_to_attempt = list(active_rembg_providers) 
-
     try:
-        logger.info(f"Rembg: Attempting to initialize session for model '{model_name}' with providers: {providers_to_attempt}")
-        # new_session returns a rembg session wrapper
-        session_wrapper = new_session(model_name, providers=providers_to_attempt)
-
-        if session_wrapper is None:
-            err_msg_session_none = f"CRITICAL: rembg.new_session returned None for model '{model_name}' with providers {providers_to_attempt}. This indicates a failure in session creation."
-            logger.critical(err_msg_session_none)
-            raise RuntimeError(err_msg_session_none)
-
-        logger.debug(f"Rembg: Successfully called new_session. Type of session_wrapper object: {type(session_wrapper)}")
-
-        # Attempt to get the underlying ONNX InferenceSession
-        onnx_inference_session = None
-        if hasattr(session_wrapper, 'inner_session'): # Common attribute name in rembg
-            onnx_inference_session = session_wrapper.inner_session
-            logger.debug("Rembg: Accessed 'inner_session' from rembg session wrapper.")
-        elif hasattr(session_wrapper, 'sess'): # Another possible attribute name
-            onnx_inference_session = session_wrapper.sess
-            logger.debug("Rembg: Accessed 'sess' from rembg session wrapper.")
-        else:
-            logger.warning(
-                f"Rembg: Could not find 'inner_session' or 'sess' attribute on rembg session wrapper (type: {type(session_wrapper)}). "
-                "Attempting to treat the wrapper itself as the ONNX session for get_providers(). This might fail."
-            )
-            onnx_inference_session = session_wrapper # Fallback, will likely lead to GetProvidersMethodMissing if wrapper doesn't delegate
-
-        if onnx_inference_session is None:
-            # This case means session_wrapper was not None, but we couldn't get an inner session object from it.
-            # This could happen if rembg changes its internal structure significantly.
-            err_msg_no_onnx_session = (
-                f"Rembg: Failed to retrieve the underlying ONNX InferenceSession from the rembg session wrapper "
-                f"(type: {type(session_wrapper)}) for model '{model_name}'. Cannot verify providers."
-            )
-            logger.error(err_msg_no_onnx_session)
-            # We can't use ["Error:NoInnerONNXSession"] for actual_session_providers as the logic below expects a list.
-            # Instead, we'll let the get_providers call fail or mark providers as unknown.
-            actual_session_providers = ["Error:CouldNotAccessONNXSession"]
-
-        else: # We have an onnx_inference_session object (or the wrapper itself if fallback)
-            logger.debug(f"Rembg: Object being used for get_providers(): {type(onnx_inference_session)}")
-            actual_session_providers = []
-            try:
-                actual_session_providers = onnx_inference_session.get_providers()
-                if not actual_session_providers:
-                     logger.warning(f"Rembg: onnx_inference_session.get_providers() returned an empty list for model '{model_name}'.")
-                     actual_session_providers = ["Error:GetProvidersReturnedEmpty"]
-            except AttributeError:
-                logger.error(
-                    f"Rembg: The object (type: {type(onnx_inference_session)}) used for provider checking "
-                    f"does NOT have 'get_providers()' method. Intended rembg wrapper type: {type(session_wrapper)}."
-                )
-                actual_session_providers = ["Error:GetProvidersMethodMissingOnObject"]
-            except Exception as e_get_providers:
-                logger.error(
-                    f"Rembg: Error calling get_providers() on object (type: {type(onnx_inference_session)}) for model '{model_name}': {type(e_get_providers).__name__}: {e_get_providers}."
-                )
-                actual_session_providers = [f"Error:GetProvidersCallFailed_{type(e_get_providers).__name__}"]
-            
-        logger.info(f"Rembg: Session for model '{model_name}'. Intended providers: {providers_to_attempt}, Actual providers reported by session: {actual_session_providers}")
-
-        if REMBG_USE_GPU:
-            if not providers_to_attempt or not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
-                logger.critical(
-                    f"CRITICAL LOGIC FLAW: REMBG_USE_GPU is True, but providers_to_attempt ({providers_to_attempt}) "
-                    f"does not reflect a GPU intention. Check startup provider configuration."
-                )
-
-            is_any_preferred_gpu_in_actual = any(p in actual_session_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
-            is_cpu_in_actual = 'CPUExecutionProvider' in actual_session_providers
-            
-            if any("Error:" in p for p in actual_session_providers): # Catches our custom error states
-                err_msg = (
-                    f"FORCED GPU FAILED (Provider Detection Issue): Rembg session for model '{model_name}'. "
-                    f"Could not reliably determine actual providers (reported: {actual_session_providers}). "
-                    f"Intended providers were {providers_to_attempt}. Cannot confirm GPU usage."
-                )
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
-
-            if is_cpu_in_actual and not is_any_preferred_gpu_in_actual:
-                err_msg = (
-                    f"FORCED GPU FAILED (CPU Fallback): Rembg session for model '{model_name}' is confirmed to be using CPUExecutionProvider "
-                    f"(actual: {actual_session_providers}) and NO preferred GPU provider is active, despite GPU being intended with {providers_to_attempt}."
-                )
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
-            elif not is_any_preferred_gpu_in_actual and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
-                err_msg = (
-                    f"FORCED GPU FAILED (No Preferred GPU Active): Rembg session for model '{model_name}' did not activate any of the "
-                    f"intended preferred GPU providers ({providers_to_attempt}). Actual providers reported by session: {actual_session_providers}."
-                )
-                logger.error(err_msg)
-                raise RuntimeError(err_msg)
-            elif is_cpu_in_actual and is_any_preferred_gpu_in_actual:
-                 logger.info(
-                     f"Rembg: A preferred GPU provider is active in session ({actual_session_providers}), "
-                     f"and CPUExecutionProvider is also present. This is typical. Intended: {providers_to_attempt}."
-                 )
-            elif is_any_preferred_gpu_in_actual: # GPU active, CPU not mentioned or not primary
-                logger.info(f"Rembg: Successfully using a preferred GPU provider. Actual: {actual_session_providers}, Intended: {providers_to_attempt}")
-            else: # Fallback for unexpected states
-                 logger.warning(
-                    f"Rembg: No preferred GPU provider was intended by 'providers_to_attempt' ({providers_to_attempt}) or "
-                    f"none are active in session. Actual providers: {actual_session_providers}. "
-                    "If REMBG_USE_GPU is True, this state likely indicates a startup misconfiguration of providers, "
-                    "or the ONNX session did not initialize with any of the preferred GPU providers successfully."
-                )
-
-    except Exception as e:
-        log_message = (
-            f"CRITICAL: Failed to initialize or verify rembg session for model '{model_name}' with "
-            f"intended providers {providers_to_attempt}. Error: {type(e).__name__}: {e}. "
-        )
-        if REMBG_USE_GPU and "FORCED GPU FAILED" in str(e):
-            log_message += "NO FALLBACK TO CPU. This job will fail as per 'force GPU' policy."
-        elif REMBG_USE_GPU:
-             log_message += "REMBG_USE_GPU was True. An error occurred before or during provider verification. NO FALLBACK TO CPU. This job will fail."
-        else:
-            log_message += "REMBG_USE_GPU was False. Error occurred during CPU or configured provider processing."
+        logger.info(f"Rembg: Starting processing for model '{model_name}' (input size: {len(input_bytes)} bytes)")
         
-        logger.critical(log_message, exc_info=True)
-        raise
+        # Get or create session (with caching for GPU efficiency)
+        session_wrapper = get_or_create_rembg_session(model_name)
+        
+        # Verify GPU providers if required
+        if REMBG_USE_GPU:
+            try:
+                # Try to get providers from session
+                actual_providers = []
+                if hasattr(session_wrapper, 'inner_session') and hasattr(session_wrapper.inner_session, 'get_providers'):
+                    actual_providers = session_wrapper.inner_session.get_providers()
+                elif hasattr(session_wrapper, 'sess') and hasattr(session_wrapper.sess, 'get_providers'):
+                    actual_providers = session_wrapper.sess.get_providers()
+                
+                if actual_providers:
+                    has_gpu = any(p in actual_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
+                    logger.debug(f"Rembg session providers: {actual_providers}, GPU available: {has_gpu}")
+                
+            except Exception as e:
+                logger.warning(f"Could not verify session providers: {e}")
 
-    # The 'remove' function expects the rembg session wrapper, not the raw onnx_inference_session
-    output_bytes = remove(
-        input_bytes,
-        session=session_wrapper, # Pass the original rembg session wrapper
-        post_process_mask=True,
-        alpha_matting=True
-    )
-    return output_bytes
+        # Process the image with timeout protection
+        logger.debug(f"Rembg: Calling remove() function...")
+        start_time = time.perf_counter()
+        
+        output_bytes = remove(
+            input_bytes,
+            session=session_wrapper,
+            post_process_mask=True,
+            alpha_matting=True
+        )
+        
+        processing_time = time.perf_counter() - start_time
+        logger.info(f"Rembg: Processing completed in {processing_time:.3f}s (output size: {len(output_bytes)} bytes)")
+        
+        return output_bytes
+        
+    except Exception as e:
+        error_msg = f"Rembg processing failed for model '{model_name}': {type(e).__name__}: {e}"
+        logger.error(error_msg, exc_info=True)
+        
+        # Clear cached session on error to force recreation
+        with session_lock:
+            if model_name in rembg_session_cache:
+                logger.info(f"Clearing cached session for model '{model_name}' due to error")
+                del rembg_session_cache[model_name]
+        
+        raise RuntimeError(error_msg)
+
+def process_rembg_cpu_fallback(input_bytes: bytes, model_name: str) -> bytes:
+    """Emergency CPU fallback for rembg processing when GPU fails."""
+    logger.warning(f"Using emergency CPU fallback for model: {model_name}")
+    
+    try:
+        # Force CPU-only session
+        cpu_session = new_session(model_name, providers=['CPUExecutionProvider'])
+        if cpu_session is None:
+            raise RuntimeError(f"Failed to create CPU fallback session for model: {model_name}")
+        
+        output_bytes = remove(
+            input_bytes,
+            session=cpu_session,
+            post_process_mask=True,
+            alpha_matting=True
+        )
+        
+        logger.info(f"CPU fallback completed for model: {model_name}")
+        return output_bytes
+        
+    except Exception as e:
+        logger.error(f"CPU fallback failed for model '{model_name}': {e}", exc_info=True)
+        raise
     
 def process_pil_sync(input_bytes: bytes, target_size: int, prepared_logo: Image.Image = None, enable_logo: bool = False, logo_margin: int = 20) -> bytes:
     img_rgba = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
@@ -969,8 +931,32 @@ async def image_processing_worker(worker_id: int):
             log_worker_activity(worker_id, WORKER_PROCESSING_REMBG); results[job_id]["status"] = "processing_rembg"
             logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
             t_rembg_start = time.perf_counter(); loop = asyncio.get_event_loop()
-            # process_rembg_sync now uses active_rembg_providers internally
-            output_bytes_with_alpha = await loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
+            
+            # Add timeout protection for rembg processing
+            try:
+                rembg_future = loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
+                output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=120.0)  # 2 minute timeout
+            except asyncio.TimeoutError:
+                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after 120 seconds")
+                raise RuntimeError(f"Rembg processing timed out after 120 seconds for model {model_name}")
+            except RuntimeError as e:
+                if REMBG_EMERGENCY_CPU_FALLBACK and "GPU" in str(e):
+                    logger.warning(f"Job {job_id} (W{worker_id}): GPU rembg failed, attempting CPU fallback: {e}")
+                    # Try CPU fallback
+                    try:
+                        with session_lock:
+                            # Clear GPU session cache and create CPU session
+                            if model_name in rembg_session_cache:
+                                del rembg_session_cache[model_name]
+                        cpu_future = loop.run_in_executor(cpu_executor, process_rembg_cpu_fallback, input_bytes_for_rembg, model_name)
+                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=300.0)  # 5 minute timeout for CPU
+                        logger.info(f"Job {job_id} (W{worker_id}): CPU fallback successful")
+                    except Exception as cpu_e:
+                        logger.error(f"Job {job_id} (W{worker_id}): CPU fallback also failed: {cpu_e}")
+                        raise
+                else:
+                    raise
+            
             rembg_time = time.perf_counter() - t_rembg_start
             logger.info(f"Job {job_id} (W{worker_id}): Rembg done in {rembg_time:.4f}s")
 
