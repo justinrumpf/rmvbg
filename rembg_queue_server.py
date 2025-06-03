@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X5---
+# --- CREATE DIRECTORIES AT THE VERY TOP X6---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -93,8 +93,8 @@ MONITORING_SAMPLE_INTERVAL = 5
 MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
 
 # Thread pool configuration - Make them daemon threads for proper shutdown
-CPU_THREAD_POOL_SIZE = 2  # Reduced further
-PIL_THREAD_POOL_SIZE = 2  # Reduced further
+CPU_THREAD_POOL_SIZE = 1  # Single thread to prevent deadlocks
+PIL_THREAD_POOL_SIZE = 1  # Single thread to prevent deadlocks
 
 ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
@@ -578,8 +578,12 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """
     global active_rembg_providers
     
+    # Get current thread info for debugging
+    import threading
+    thread_name = threading.current_thread().name
+    
     try:
-        logger.info(f"Rembg: Starting processing for model '{model_name}' (input size: {len(input_bytes)} bytes)")
+        logger.info(f"Rembg: Starting processing for model '{model_name}' (input size: {len(input_bytes)} bytes) on thread {thread_name}")
         
         # Check memory pressure before processing
         if check_gpu_memory_pressure():
@@ -610,18 +614,40 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
                 logger.warning(f"Could not verify session providers: {e}")
 
         # Process the image with timeout protection
-        logger.debug(f"Rembg: Calling remove() function...")
+        logger.debug(f"Rembg: Calling remove() function on thread {thread_name}...")
         start_time = time.perf_counter()
         
-        output_bytes = remove(
-            input_bytes,
-            session=session_wrapper,
-            post_process_mask=True,
-            alpha_matting=True
-        )
+        # Set thread-local timeout to prevent hanging
+        import signal
+        def timeout_handler(signum, frame):
+            logger.error(f"Rembg processing timed out on thread {thread_name}")
+            raise TimeoutError("Rembg processing timed out")
+        
+        # Only set alarm on main thread or if signal is available
+        timeout_set = False
+        try:
+            if threading.current_thread() is threading.main_thread():
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(45)  # 45 second timeout
+                timeout_set = True
+        except (ValueError, AttributeError):
+            # signal.alarm not available on all platforms or threads
+            pass
+        
+        try:
+            output_bytes = remove(
+                input_bytes,
+                session=session_wrapper,
+                post_process_mask=True,
+                alpha_matting=True
+            )
+        finally:
+            # Clear the alarm
+            if timeout_set:
+                signal.alarm(0)
         
         processing_time = time.perf_counter() - start_time
-        logger.info(f"Rembg: Processing completed in {processing_time:.3f}s (output size: {len(output_bytes)} bytes)")
+        logger.info(f"Rembg: Processing completed in {processing_time:.3f}s (output size: {len(output_bytes)} bytes) on thread {thread_name}")
         
         # Clear GPU memory after processing to prevent fragmentation
         clear_gpu_memory()
@@ -629,7 +655,7 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
         return output_bytes
         
     except Exception as e:
-        error_msg = f"Rembg processing failed for model '{model_name}': {type(e).__name__}: {e}"
+        error_msg = f"Rembg processing failed for model '{model_name}' on thread {thread_name}: {type(e).__name__}: {e}"
         logger.error(error_msg, exc_info=True)
         
         # Clear cached session on error to force recreation
@@ -643,6 +669,9 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
                 except:
                     pass
                 del rembg_session_cache[model_name]
+        
+        # Force GPU cleanup on error
+        clear_gpu_memory()
         
         raise RuntimeError(error_msg)
 
@@ -1051,23 +1080,46 @@ async def image_processing_worker(worker_id: int):
             
             # Add timeout protection for rembg processing (shorter timeout)
             try:
+                logger.info(f"Job {job_id} (W{worker_id}): Submitting to thread pool...")
                 rembg_future = loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
-                output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=60.0)  # Reduced to 60 seconds
-            except asyncio.TimeoutError:
-                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after 60 seconds")
-                # Force cleanup on timeout
+                
+                # Add periodic progress logging
+                done = False
+                start_wait = time.perf_counter()
+                while not done:
+                    try:
+                        output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=10.0)  # 10 second check intervals
+                        done = True
+                    except asyncio.TimeoutError:
+                        elapsed = time.perf_counter() - start_wait
+                        if elapsed > 45.0:  # Total timeout of 45 seconds
+                            logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after {elapsed:.1f} seconds")
+                            # Force cleanup on timeout
+                            cleanup_rembg_sessions()
+                            clear_gpu_memory()
+                            
+                            # Cancel the future
+                            rembg_future.cancel()
+                            
+                            raise RuntimeError(f"Rembg processing timed out after {elapsed:.1f} seconds for model {model_name}")
+                        else:
+                            logger.info(f"Job {job_id} (W{worker_id}): Still processing rembg... ({elapsed:.1f}s elapsed)")
+                            
+            except asyncio.CancelledError:
+                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing was cancelled")
                 cleanup_rembg_sessions()
                 clear_gpu_memory()
-                raise RuntimeError(f"Rembg processing timed out after 60 seconds for model {model_name}")
+                raise RuntimeError("Rembg processing was cancelled")
             except RuntimeError as e:
-                if REMBG_EMERGENCY_CPU_FALLBACK and "GPU" in str(e):
+                if REMBG_EMERGENCY_CPU_FALLBACK and ("GPU" in str(e) or "timeout" in str(e).lower()):
                     logger.warning(f"Job {job_id} (W{worker_id}): GPU rembg failed, attempting CPU fallback: {e}")
                     # Try CPU fallback
                     try:
                         cleanup_rembg_sessions()  # Clear all GPU sessions
                         clear_gpu_memory()
+                        logger.info(f"Job {job_id} (W{worker_id}): Starting CPU fallback...")
                         cpu_future = loop.run_in_executor(cpu_executor, process_rembg_cpu_fallback, input_bytes_for_rembg, model_name)
-                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=180.0)  # 3 minute timeout for CPU
+                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=120.0)  # 2 minute timeout for CPU
                         logger.info(f"Job {job_id} (W{worker_id}): CPU fallback successful")
                     except Exception as cpu_e:
                         logger.error(f"Job {job_id} (W{worker_id}): CPU fallback also failed: {cpu_e}")
@@ -1126,8 +1178,18 @@ async def image_processing_worker(worker_id: int):
                 remove_job_from_ip_tracking(client_ip, job_id)
                 logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
             
+            # Force cleanup after each job to prevent accumulation
+            clear_gpu_memory()
+            import gc
+            gc.collect()
+            
             log_worker_activity(worker_id, WORKER_IDLE) # Ensure worker state is reset
+            
+            # Add small delay to prevent rapid-fire processing that can cause deadlocks
+            await asyncio.sleep(0.1)
+            
             queue.task_done()
+            logger.info(f"Worker {worker_id}: Job {job_id} completed, ready for next job")
 
 @app.on_event("startup")
 async def startup_event():
@@ -1145,9 +1207,13 @@ async def startup_event():
     )
     
     # Make threads daemon threads for clean shutdown
-    for executor in [cpu_executor, pil_executor]:
-        for thread in executor._threads:
-            thread.daemon = True
+    try:
+        for executor in [cpu_executor, pil_executor]:
+            if hasattr(executor, '_threads'):
+                for thread in executor._threads:
+                    thread.daemon = True
+    except Exception as e:
+        logger.warning(f"Could not set daemon threads: {e}")
     
     logger.info(f"Thread pools initialized: RembgCPU Bound={CPU_THREAD_POOL_SIZE}, PILCPU Bound={PIL_THREAD_POOL_SIZE}")
 
