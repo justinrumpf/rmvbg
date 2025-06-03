@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X99---
+# --- CREATE DIRECTORIES AT THE VERY TOP X5---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -390,6 +390,32 @@ async def gpu_memory_monitor():
                 
         except Exception as e:
             logger.error(f"Error in GPU memory monitor: {e}")
+
+async def system_monitor():
+    while True:
+        try:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            memory = psutil.virtual_memory()
+            memory_percent = memory.percent
+            memory_used_gb = memory.used / (1024**3)
+            memory_total_gb = memory.total / (1024**3)
+            
+            gpu_info = get_gpu_info() # pynvml.nvmlInit is called inside
+            
+            timestamp = time.time()
+            metrics = {
+                "timestamp": timestamp,
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory_percent,
+                "memory_used_gb": memory_used_gb,
+                "memory_total_gb": memory_total_gb,
+                **gpu_info
+            }
+            system_metrics.append(metrics)
+            
+        except Exception as e:
+            logger.error(f"Error collecting system metrics: {e}")
+        await asyncio.sleep(MONITORING_SAMPLE_INTERVAL)
 
     while True:
         try:
