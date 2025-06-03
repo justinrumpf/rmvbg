@@ -14,6 +14,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
+from typing import Dict, List
 
 # --- CREATE DIRECTORIES AT THE VERY TOP X99---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
@@ -78,6 +79,12 @@ REMBG_PREFERRED_GPU_PROVIDERS = ['TensorrtExecutionProvider', 'CUDAExecutionProv
 # This list is used ONLY if REMBG_USE_GPU is False, or as a last resort if startup catastrophically fails to find any provider.
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
+# --- IP Tracking Configuration ---
+IP_TRACKING_ENABLED = True
+IP_CLEANUP_INTERVAL = 300  # Clean up old IP data every 5 minutes
+IP_INACTIVE_THRESHOLD = 3600  # Consider IP inactive after 1 hour of no activity
+MAX_REQUESTS_PER_IP_PER_HOUR = 100  # Rate limiting (optional)
+ENABLE_GEOLOCATION = True  # Set to False to disable geolocation features
 
 # --- Monitoring Configuration ---
 MONITORING_HISTORY_MINUTES = 60
@@ -104,6 +111,10 @@ queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results: dict = {}
 EXPECTED_API_KEY = "secretApiKey"
 
+# --- IP Tracking State ---
+ip_data: Dict[str, Dict] = {}  # IP -> {jobs: [job_ids], last_seen: timestamp, location: {}, total_requests: int}
+ip_lock = threading.Lock()
+
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
 # active_rembg_providers will be determined at startup.
@@ -126,6 +137,186 @@ WORKER_FETCHING = "fetching"
 WORKER_PROCESSING_REMBG = "rembg"
 WORKER_PROCESSING_PIL = "pil"
 WORKER_SAVING = "saving"
+
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request, handling proxies."""
+    # Check for forwarded IP headers (common with reverse proxies)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # X-Forwarded-For can contain multiple IPs, take the first one
+        return forwarded_for.split(",")[0].strip()
+    
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    
+    # Fallback to direct client IP
+    if hasattr(request.client, 'host'):
+        return request.client.host
+    
+    return "unknown"
+
+def update_ip_tracking(ip_address: str, job_id: str = None):
+    """Update IP tracking data."""
+    if not IP_TRACKING_ENABLED:
+        return
+    
+    current_time = time.time()
+    
+    with ip_lock:
+        if ip_address not in ip_data:
+            ip_data[ip_address] = {
+                "jobs": [],
+                "last_seen": current_time,
+                "location": {},
+                "total_requests": 0,
+                "first_seen": current_time
+            }
+        
+        ip_info = ip_data[ip_address]
+        ip_info["last_seen"] = current_time
+        ip_info["total_requests"] += 1
+        
+        if job_id:
+            ip_info["jobs"].append(job_id)
+            # Keep only recent jobs (last 100)
+            if len(ip_info["jobs"]) > 100:
+                ip_info["jobs"] = ip_info["jobs"][-100:]
+
+def remove_job_from_ip_tracking(ip_address: str, job_id: str):
+    """Remove a completed/failed job from IP tracking."""
+    if not IP_TRACKING_ENABLED:
+        return
+    
+    with ip_lock:
+        if ip_address in ip_data and job_id in ip_data[ip_address]["jobs"]:
+            ip_data[ip_address]["jobs"].remove(job_id)
+
+def get_active_jobs_by_ip(ip_address: str) -> List[str]:
+    """Get list of active job IDs for an IP."""
+    if not IP_TRACKING_ENABLED:
+        return []
+    
+    with ip_lock:
+        if ip_address not in ip_data:
+            return []
+        
+        # Filter jobs that are still active in the results dict
+        active_jobs = []
+        for job_id in ip_data[ip_address]["jobs"]:
+            if job_id in results and results[job_id].get("status") not in ["done", "error"]:
+                active_jobs.append(job_id)
+        
+        # Update the stored jobs list to remove completed ones
+        ip_data[ip_address]["jobs"] = active_jobs
+        return active_jobs
+
+def get_ip_stats():
+    """Get comprehensive IP statistics."""
+    if not IP_TRACKING_ENABLED:
+        return {"active_ips": 0, "total_ips": 0, "ips": []}
+    
+    current_time = time.time()
+    active_ips = []
+    total_ips = 0
+    
+    with ip_lock:
+        for ip, data in ip_data.items():
+            total_ips += 1
+            active_jobs = get_active_jobs_by_ip(ip)
+            
+            # Consider IP active if it has jobs or was seen recently
+            is_active = (len(active_jobs) > 0 or 
+                        (current_time - data["last_seen"]) < IP_INACTIVE_THRESHOLD)
+            
+            if is_active:
+                ip_info = {
+                    "ip": ip,
+                    "active_jobs": len(active_jobs),
+                    "total_requests": data["total_requests"],
+                    "last_seen": data["last_seen"],
+                    "first_seen": data["first_seen"],
+                    "location": data.get("location", {}),
+                    "job_ids": active_jobs[:10]  # Show only first 10 job IDs
+                }
+                active_ips.append(ip_info)
+    
+    # Sort by number of active jobs (descending), then by last seen
+    active_ips.sort(key=lambda x: (x["active_jobs"], x["last_seen"]), reverse=True)
+    
+    return {
+        "active_ips": len(active_ips),
+        "total_ips": total_ips,
+        "ips": active_ips
+    }
+
+async def cleanup_ip_tracking():
+    """Background task to clean up old IP tracking data."""
+    while True:
+        try:
+            if IP_TRACKING_ENABLED:
+                current_time = time.time()
+                cleanup_threshold = current_time - (IP_INACTIVE_THRESHOLD * 2)  # Keep data longer than inactive threshold
+                
+                with ip_lock:
+                    ips_to_remove = []
+                    for ip, data in ip_data.items():
+                        # Remove IPs with no active jobs and not seen recently
+                        active_jobs = get_active_jobs_by_ip(ip)
+                        if (len(active_jobs) == 0 and 
+                            data["last_seen"] < cleanup_threshold):
+                            ips_to_remove.append(ip)
+                    
+                    for ip in ips_to_remove:
+                        logger.info(f"Cleaning up IP tracking data for inactive IP: {ip}")
+                        del ip_data[ip]
+                    
+                    if ips_to_remove:
+                        logger.info(f"Cleaned up {len(ips_to_remove)} inactive IP entries")
+        
+        except Exception as e:
+            logger.error(f"Error in IP tracking cleanup: {e}", exc_info=True)
+        
+        await asyncio.sleep(IP_CLEANUP_INTERVAL)
+
+async def fetch_ip_geolocation(ip_address: str) -> Dict:
+    """Fetch geolocation data for an IP address using a free service."""
+    if not ENABLE_GEOLOCATION or ip_address in ["unknown", "127.0.0.1", "localhost"]:
+        return {}
+    
+    try:
+        # Using ipapi.co as it's free and doesn't require API key
+        # Alternative: ip-api.com, ipinfo.io, etc.
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"https://ipapi.co/{ip_address}/json/")
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Extract relevant location data
+                location = {
+                    "country": data.get("country_name", ""),
+                    "country_code": data.get("country", ""),
+                    "region": data.get("region", ""),
+                    "city": data.get("city", ""),
+                    "latitude": data.get("latitude"),
+                    "longitude": data.get("longitude"),
+                    "timezone": data.get("timezone", ""),
+                    "org": data.get("org", ""),
+                    "fetched_at": time.time()
+                }
+                
+                # Store in IP data
+                with ip_lock:
+                    if ip_address in ip_data:
+                        ip_data[ip_address]["location"] = location
+                
+                logger.info(f"Fetched geolocation for {ip_address}: {location.get('city', '')}, {location.get('country', '')}")
+                return location
+                
+    except Exception as e:
+        logger.warning(f"Failed to fetch geolocation for {ip_address}: {e}")
+    
+    return {}
 
 def log_worker_activity(worker_id: int, activity: str):
     with worker_lock:
@@ -216,11 +407,11 @@ def format_size(num_bytes: int) -> str:
     elif num_bytes < 1024**2: return f"{num_bytes/1024:.2f} KB"
     else: return f"{num_bytes/1024**2:.2f} MB"
 
-def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown", original_filename: str = ""):
+def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown", original_filename: str = "", ip_address: str = "unknown"):
     global job_history, total_jobs_completed, total_jobs_failed, total_processing_time
     job_record = {"job_id": job_id, "timestamp": time.time(), "status": status, "total_time": total_time,
                   "input_size": input_size, "output_size": output_size, "model": model,
-                  "source_type": source_type, "original_filename": original_filename}
+                  "source_type": source_type, "original_filename": original_filename, "ip_address": ip_address}
     job_history.insert(0, job_record)
     if len(job_history) > MAX_HISTORY_ITEMS: job_history.pop()
     if status == "completed": total_jobs_completed += 1; total_processing_time += total_time
@@ -432,18 +623,33 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
     if body.key != EXPECTED_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
+    
+    # Get client IP and update tracking
+    client_ip = get_client_ip(request)
+    update_ip_tracking(client_ip)
+    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     model_to_use = body.model if body.model else DEFAULT_MODEL_NAME
-    try: queue.put_nowait((job_id, str(body.image), model_to_use, True))
+    
+    try: 
+        queue.put_nowait((job_id, str(body.image), model_to_use, True, client_ip))
+        update_ip_tracking(client_ip, job_id)
     except asyncio.QueueFull:
-        logger.warning(f"Queue full. Rejecting JSON request for {body.image}.")
+        logger.warning(f"Queue full. Rejecting JSON request for {body.image} from IP {client_ip}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
+    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": str(body.image), "original_local_path": None,
-                       "processed_path": None, "error_message": None, "status_check_url": status_check_url}
+                       "processed_path": None, "error_message": None, "status_check_url": status_check_url,
+                       "client_ip": client_ip}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (JSON URL: {body.image}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    logger.info(f"Job {job_id} (JSON URL: {body.image}, Model: {model_to_use}, IP: {client_ip}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    
+    # Trigger geolocation fetch in background (fire and forget)
+    if ENABLE_GEOLOCATION:
+        asyncio.create_task(fetch_ip_geolocation(client_ip))
+    
     return {"status": "processing", "job_id": job_id, "image_links": [f"{public_url_base}/images/{job_id}.webp"],
             "eta": eta_seconds, "status_check_url": status_check_url}
 
@@ -454,6 +660,11 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     if not image_file.content_type or not image_file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Upload an image.")
+    
+    # Get client IP and update tracking
+    client_ip = get_client_ip(request)
+    update_ip_tracking(client_ip)
+    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     original_fn = image_file.filename if image_file.filename else "upload"
@@ -467,7 +678,7 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     try:
         async with aiofiles.open(original_path, 'wb') as out_file:
             content = await image_file.read(); await out_file.write(content)
-        logger.info(f"📝 Job {job_id} (Form: {original_fn}) Original saved: {original_path} ({format_size(len(content))})")
+        logger.info(f"📝 Job {job_id} (Form: {original_fn}, IP: {client_ip}) Original saved: {original_path} ({format_size(len(content))})")
     except Exception as e:
         logger.error(f"Error saving upload {saved_fn} for job {job_id}: {e}"); raise HTTPException(status_code=500, detail=f"Save failed: {e}")
     finally: await image_file.close()
@@ -475,9 +686,10 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     model_to_use = model if model else DEFAULT_MODEL_NAME
 
     try:
-        queue.put_nowait((job_id, file_uri, model_to_use, True))
+        queue.put_nowait((job_id, file_uri, model_to_use, True, client_ip))
+        update_ip_tracking(client_ip, job_id)
     except asyncio.QueueFull:
-        logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}).")
+        logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}) from IP {client_ip}.")
         if os.path.exists(original_path):
             try: os.remove(original_path)
             except OSError as e_clean: logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
@@ -485,9 +697,15 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": f"(form_upload: {original_fn})",
                        "original_local_path": original_path, "processed_path": None,
-                       "error_message": None, "status_check_url": status_check_url}
+                       "error_message": None, "status_check_url": status_check_url,
+                       "client_ip": client_ip}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}, IP: {client_ip}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
+    
+    # Trigger geolocation fetch in background (fire and forget)
+    if ENABLE_GEOLOCATION:
+        asyncio.create_task(fetch_ip_geolocation(client_ip))
+    
     return {"status": "processing", "job_id": job_id, "original_image_url": f"{public_url_base}/originals/{saved_fn}",
             "image_links": [f"{public_url_base}/images/{job_id}.webp"], "eta": eta_seconds, "status_check_url": status_check_url}
 
@@ -496,6 +714,11 @@ async def get_worker_monitoring_data(): return get_worker_activity_data()
 
 @app.get("/api/monitoring/system")
 async def get_system_monitoring_data(): return get_system_metrics_data()
+
+@app.get("/api/monitoring/ips")
+async def get_ip_monitoring_data():
+    """Get IP tracking statistics."""
+    return get_ip_stats()
 
 @app.get("/api/debug/gpu")
 async def debug_gpu_status():
@@ -585,7 +808,8 @@ async def job_details(request: Request, job_id: str):
             "status": result_details.get("status", "unknown"),
             "total_time": 0, "input_size": 0, "output_size": 0, 
             "model": "N/A (active)", "source_type": "N/A (active)", 
-            "original_filename": result_details.get("input_image_url", "N/A (active)").split('/')[-1]
+            "original_filename": result_details.get("input_image_url", "N/A (active)").split('/')[-1],
+            "ip_address": result_details.get("client_ip", "unknown")
         }
     else:
         raise HTTPException(status_code=404, detail="Job not found in active results or history")
@@ -619,6 +843,18 @@ async def job_details(request: Request, job_id: str):
     elif result_details.get("processed_path"): # From active job
         processed_image_url = f"{public_url_base}/images/{os.path.basename(result_details['processed_path'])}"
 
+    # Get IP location info if available
+    ip_location_info = ""
+    client_ip = display_job_info.get("ip_address", "unknown")
+    if IP_TRACKING_ENABLED and client_ip in ip_data:
+        location = ip_data[client_ip].get("location", {})
+        if location:
+            location_parts = []
+            if location.get("city"): location_parts.append(location["city"])
+            if location.get("region"): location_parts.append(location["region"])
+            if location.get("country"): location_parts.append(location["country"])
+            if location_parts:
+                ip_location_info = f" ({', '.join(location_parts)})"
 
     return HTMLResponse(content=f"""<!DOCTYPE html><html lang="en">
     <head><meta charset="UTF-8"><title>Job Details - {job_id[:8]}</title><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1200px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}}.status-badge{{padding:5px 10px;border-radius:15px;font-weight:bold;text-transform:uppercase;}}.status-completed{{background-color:#d4edda;color:#155724;}}.status-failed,.status-error{{background-color:#f8d7da;color:#721c24;}}.status-active,.status-queued,.status-processing_rembg,.status-processing_image,.status-saving,.status-loading_file,.status-downloading{{background-color:#d1ecf1;color:#0c5460;}}.details-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.detail-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;}}.detail-label{{font-size:12px;color:#6c757d;text-transform:uppercase;margin-bottom:5px;}}.detail-value{{font-size:18px;font-weight:bold;color:#495057;}}.images-section{{margin-top:30px;}}.images-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}}.image-card{{border:1px solid #dee2e6;border-radius:8px;padding:15px;background:white;}}.image-card h3{{margin-top:0;color:#495057;}}.image-card img{{max-width:100%;height:auto;border-radius:4px;border:1px solid #dee2e6;}}.no-image{{color:#6c757d;font-style:italic;text-align:center;padding:40px;background:#f8f9fa;border-radius:4px;}}.back-link{{color:#007bff;text-decoration:none;}}.back-link:hover{{text-decoration:underline;}}@media (max-width:768px){{.images-container{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}</style></head>
@@ -631,6 +867,7 @@ async def job_details(request: Request, job_id: str):
         <div class="detail-card"><div class="detail-label">Source Type</div><div class="detail-value">{str(display_job_info['source_type']).title()}</div></div>
         <div class="detail-card"><div class="detail-label">Input Size</div><div class="detail-value">{format_size(display_job_info['input_size'])}</div></div>
         <div class="detail-card"><div class="detail-label">Output Size</div><div class="detail-value">{format_size(display_job_info['output_size']) if display_job_info['output_size']>0 else 'N/A'}</div></div>
+        <div class="detail-card"><div class="detail-label">Client IP</div><div class="detail-value">{client_ip}{ip_location_info}</div></div>
     </div>
     {f"<div class='detail-card' style='grid-column: span / auto;'><div class='detail-label'>Original Filename/URL</div><div class='detail-value' style='word-break:break-all;'>{display_job_info.get('original_filename', result_details.get('input_image_url','N/A'))}</div></div>" if display_job_info.get('original_filename') or result_details.get('input_image_url') else ''}
     <div class="images-section"><h2>Before & After Images</h2><div class="images-container"><div class="image-card"><h3>🔍 Original Image</h3>{f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available or not yet processed</div>'}</div><div class="image-card"><h3>✨ Processed Image</h3>{f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available or job failed/pending</div>'}</div></div></div>
@@ -655,6 +892,11 @@ async def cleanup_old_results():
             
             for job_id in expired_jobs:
                 logger.info(f"Cleaning up old job from active results: {job_id}")
+                # Also remove from IP tracking
+                job_data = results[job_id]
+                client_ip = job_data.get("client_ip")
+                if client_ip:
+                    remove_job_from_ip_tracking(client_ip, job_id)
                 del results[job_id]
             if expired_jobs:
                 logger.info(f"Cleaned up {len(expired_jobs)} old jobs from active results dict")
@@ -669,9 +911,9 @@ async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
     while True:
-        job_id, image_source_str, model_name, _ = await queue.get()
+        job_id, image_source_str, model_name, _, client_ip = await queue.get()
         t_job_start = time.perf_counter()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}, IP: {client_ip}")
         log_worker_activity(worker_id, WORKER_IDLE) # Initial state before fetch
         
         if job_id not in results: # Should not happen if enqueuing adds to results first
@@ -748,8 +990,12 @@ async def image_processing_worker(worker_id: int):
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_path
             total_job_time = time.perf_counter() - t_job_start
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history)
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history, client_ip)
             results[job_id]["completion_time"] = time.time() # For cleanup task
+            
+            # Remove completed job from IP tracking
+            remove_job_from_ip_tracking(client_ip, job_id)
+            
             logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
         
         except FileNotFoundError as e: 
@@ -767,8 +1013,10 @@ async def image_processing_worker(worker_id: int):
         finally:
             if results.get(job_id, {}).get("status") == "error":
                 total_job_time_error = time.perf_counter() - t_job_start
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history)
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history, client_ip)
                 results[job_id]["completion_time"] = time.time() # For cleanup task
+                # Remove failed job from IP tracking
+                remove_job_from_ip_tracking(client_ip, job_id)
                 logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
             
             log_worker_activity(worker_id, WORKER_IDLE) # Ensure worker state is reset
@@ -852,6 +1100,11 @@ async def startup_event():
     asyncio.create_task(cleanup_old_results()); logger.info("Background cleanup task for old job results started.")
     asyncio.create_task(system_monitor()); logger.info("System monitoring task started.")
     
+    # Start IP tracking cleanup task
+    if IP_TRACKING_ENABLED:
+        asyncio.create_task(cleanup_ip_tracking())
+        logger.info("IP tracking cleanup task started.")
+    
     # Initialize pynvml once at startup for get_gpu_info to use if needed without re-init/shutdown cycles
     try:
         import pynvml
@@ -894,6 +1147,7 @@ app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_image
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     stats = get_server_stats()
+    ip_stats = get_ip_stats() if IP_TRACKING_ENABLED else {"active_ips": 0, "total_ips": 0, "ips": []}
     
     logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
     if ENABLE_LOGO_WATERMARK and prepared_logo_image:
@@ -918,6 +1172,64 @@ async def root():
         "memory_total_gb": 0, "gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0
     }
     
+    # Generate IP tracking section
+    ip_tracking_html = ""
+    if IP_TRACKING_ENABLED and ip_stats["ips"]:
+        ip_tracking_html = """
+        <h2 class="section-title">🌍 Active IP Addresses</h2>
+        <div class="table-responsive">
+            <table class="styled-table">
+                <thead>
+                    <tr>
+                        <th>IP Address</th>
+                        <th>Location</th>
+                        <th>Active Jobs</th>
+                        <th>Total Requests</th>
+                        <th>Last Seen</th>
+                        <th>Active Job IDs</th>
+                    </tr>
+                </thead>
+                <tbody>"""
+        
+        for ip_info in ip_stats["ips"][:20]:  # Show top 20 IPs
+            location = ip_info.get("location", {})
+            location_str = "Unknown"
+            if location:
+                location_parts = []
+                if location.get("city"): location_parts.append(location["city"])
+                if location.get("region"): location_parts.append(location["region"])
+                if location.get("country"): location_parts.append(location["country"])
+                if location_parts:
+                    location_str = ", ".join(location_parts)
+                elif location.get("country_code"):
+                    location_str = location["country_code"]
+            
+            # Format job IDs
+            job_ids_display = ", ".join([job_id[:8] + "..." for job_id in ip_info["job_ids"][:3]])
+            if len(ip_info["job_ids"]) > 3:
+                job_ids_display += f" (+{len(ip_info['job_ids']) - 3} more)"
+            
+            last_seen_str = format_timestamp(ip_info["last_seen"])
+            
+            ip_tracking_html += f"""
+                    <tr>
+                        <td><code>{ip_info['ip']}</code></td>
+                        <td>{location_str}</td>
+                        <td><span class="badge active-jobs">{ip_info['active_jobs']}</span></td>
+                        <td>{ip_info['total_requests']}</td>
+                        <td>{last_seen_str}</td>
+                        <td class="job-ids">{job_ids_display if job_ids_display else 'None'}</td>
+                    </tr>"""
+        
+        ip_tracking_html += """
+                </tbody>
+            </table>
+        </div>"""
+    elif IP_TRACKING_ENABLED:
+        ip_tracking_html = """
+        <h2 class="section-title">🌍 Active IP Addresses</h2>
+        <p>No active IP addresses currently.</p>"""
+    
     recent_jobs_html = "<h3>Recent Jobs</h3>"
     if stats["recent_jobs"]:
         recent_jobs_html += """
@@ -933,6 +1245,7 @@ async def root():
                         <th>Output</th>
                         <th>Model</th>
                         <th>Source</th>
+                        <th>IP Address</th>
                         <th>Filename</th>
                     </tr>
                 </thead>
@@ -942,8 +1255,12 @@ async def root():
             status_class = "status-completed" if job["status"] == "completed" else "status-failed"
             job_link = f"/job/{job['job_id']}"
             orig_fn_display = job.get('original_filename', '')
-            if len(orig_fn_display) > 30: # Truncate long filenames
-                orig_fn_display = orig_fn_display[:15] + "..." + orig_fn_display[-12:]
+            if len(orig_fn_display) > 25: # Truncate long filenames
+                orig_fn_display = orig_fn_display[:12] + "..." + orig_fn_display[-10:]
+            
+            ip_display = job.get('ip_address', 'unknown')
+            if len(ip_display) > 15:  # Truncate long IPs if needed
+                ip_display = ip_display[:12] + "..."
 
             recent_jobs_html += f"""
                     <tr onclick="window.location.href='{job_link}'" style="cursor:pointer;">
@@ -955,6 +1272,7 @@ async def root():
                         <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
                         <td>{job['model']}</td>
                         <td>{job['source_type']}</td>
+                        <td><code class="ip-code">{ip_display}</code></td>
                         <td title="{job.get('original_filename', '')}">{orig_fn_display}</td>
                     </tr>"""
         recent_jobs_html += """
@@ -1034,13 +1352,13 @@ async def root():
             box-shadow: 0 4px 8px rgba(0,0,0,0.08);
         }}
         .stat-value, .metric-value {{
-            font-size: 1.8em; /* Slightly reduced for better fit */
+            font-size: 1.8em;
             font-weight: 700;
             margin-bottom: 8px;
             color: #007bff;
         }}
         .stat-label, .metric-label {{
-            font-size: 0.90em; /* Slightly reduced */
+            font-size: 0.90em;
             color: #6c757d;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -1049,7 +1367,6 @@ async def root():
         .metric-card .cpu {{ color: #dc3545; }}
         .metric-card .memory {{ color: #fd7e14; }}
         .metric-card .gpu {{ color: #6f42c1; }}
-
 
         .charts-container {{
             display: grid;
@@ -1086,23 +1403,22 @@ async def root():
             font-size: 0.95em;
         }}
         .config-list li {{
-            padding: 10px 0; /* Increased padding */
+            padding: 10px 0;
             border-bottom: 1px solid #e9ecef;
-            display: flex; /* For alignment */
-            justify-content: space-between; /* For alignment */
+            display: flex;
+            justify-content: space-between;
         }}
         .config-list li:last-child {{
             border-bottom: none;
         }}
         .config-list strong {{
             color: #0056b3;
-            margin-right: 10px; /* Spacing */
+            margin-right: 10px;
         }}
-        .config-list span {{ /* Value part */
+        .config-list span {{
             text-align: right;
-            word-break: break-all; /* For long provider lists */
+            word-break: break-all;
         }}
-
 
         .debug-info {{
             background: #e9ecef;
@@ -1141,10 +1457,10 @@ async def root():
         .styled-table th, .styled-table td {{
             padding: 12px 15px;
             border-bottom: 1px solid #dddddd;
-            white-space: nowrap; /* Prevent text wrapping in cells */
+            white-space: nowrap;
         }}
-         .styled-table td:nth-child(9) {{ /* Last column (Filename) */
-            white-space: normal; /* Allow filename to wrap if very long */
+         .styled-table td:nth-last-child(1) {{
+            white-space: normal;
             word-break: break-all;
         }}
         .styled-table tbody tr {{
@@ -1175,7 +1491,7 @@ async def root():
             font-weight: bold;
             text-transform: uppercase;
             color: white;
-            display: inline-block; /* Ensures proper padding */
+            display: inline-block;
         }}
         .status-badge.status-completed {{ background-color: #28a745; }}
         .status-badge.status-failed {{ background-color: #dc3545; }}
@@ -1186,6 +1502,32 @@ async def root():
         .status-badge.status-saving, .status-badge.status-loading_file, 
         .status-badge.status-downloading, .status-badge.status-fetching_input {{ background-color: #ffc107; color: #212529;}} 
 
+        .badge {{
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+            display: inline-block;
+        }}
+        .badge.active-jobs {{
+            background-color: #007bff;
+            color: white;
+        }}
+        
+        .ip-code {{
+            font-family: monospace;
+            font-size: 0.9em;
+            background-color: #f8f9fa;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }}
+        
+        .job-ids {{
+            font-family: monospace;
+            font-size: 0.85em;
+            max-width: 200px;
+            word-break: break-all;
+        }}
 
         .footer {{
             text-align: center;
@@ -1205,7 +1547,7 @@ async def root():
         }}
         @media (max-width: 768px) {{
             .stats-grid, .system-metrics {{
-                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); /* Adjusted minmax */
+                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             }}
             .stat-value, .metric-value {{ font-size: 1.5em; }}
             .container {{ padding: 15px; margin: 15px; }}
@@ -1246,6 +1588,14 @@ async def root():
                 <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
                 <div class="stat-label">Avg Process Time</div>
             </div>
+            <div class="stat-card">
+                <div class="stat-value">{ip_stats['active_ips']}</div>
+                <div class="stat-label">Active IPs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{ip_stats['total_ips']}</div>
+                <div class="stat-label">Total IPs Seen</div>
+            </div>
         </div>
 
         <h2 class="section-title">📊 Real-time Monitoring</h2>
@@ -1280,6 +1630,8 @@ async def root():
             </div>
         </div>
 
+        {ip_tracking_html}
+
         <h2 class="section-title">⚙️ Configuration & Debug</h2>
         <ul class="config-list">
             <li><strong>Async Workers:</strong> <span>{MAX_CONCURRENT_TASKS}</span></li>
@@ -1291,6 +1643,8 @@ async def root():
             <li><strong>Preferred GPU Providers (Config):</strong> <span>{str(REMBG_PREFERRED_GPU_PROVIDERS)}</span></li>
             <li><strong>Active Rembg Providers (Runtime):</strong> <span style="font-weight:bold;">{str(active_rembg_providers)}</span></li>
             <li><strong>GPU Monitoring (pynvml):</strong> <span>{current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml required)'}</span></li>
+            <li><strong>IP Tracking:</strong> <span style="font-weight:bold; color: { 'green' if IP_TRACKING_ENABLED else 'orange' };">{'Enabled' if IP_TRACKING_ENABLED else 'Disabled'}</span></li>
+            <li><strong>Geolocation Lookup:</strong> <span style="font-weight:bold; color: { 'green' if ENABLE_GEOLOCATION else 'orange' };">{'Enabled' if ENABLE_GEOLOCATION else 'Disabled'}</span></li>
         </ul>
         
         <div class="debug-info">
@@ -1298,6 +1652,7 @@ async def root():
             <p><a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status & Rembg Provider Config</a></p>
             <p><a href="/api/monitoring/workers" target="_blank">View Raw Worker Data (JSON)</a></p>
             <p><a href="/api/monitoring/system" target="_blank">View Raw System Data (JSON)</a></p>
+            <p><a href="/api/monitoring/ips" target="_blank">View Raw IP Tracking Data (JSON)</a></p>
         </div>
 
         <h2 class="section-title">📋 Job History (Last {MAX_HISTORY_ITEMS})</h2>
