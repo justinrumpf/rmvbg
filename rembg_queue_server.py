@@ -263,6 +263,35 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
+def get_requester_ip(request: Request) -> str:
+    """
+    Retrieves the client's IP address.
+    Prioritizes X-Forwarded-For header if present, assuming the first IP in the list
+    is the original client. Falls back to request.client.host.
+
+    Note: For robust proxy handling, configure Uvicorn's `forwarded_allow_ips`
+    with the IP(s) of your trusted reverse proxy/proxies (e.g., '127.0.0.1' if proxy is on localhost).
+    If `forwarded_allow_ips` is correctly configured, `request.client.host`
+    should already reflect the true client IP parsed from X-Forwarded-For.
+    This function provides an additional application-level check which is common.
+    """
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        # X-Forwarded-For can be a comma-separated list of IPs (client, proxy1, proxy2, ...).
+        # The first one is generally the original client.
+        client_ip = x_forwarded_for.split(',')[0].strip()
+        # It's good practice to log which IP source is being used, especially during setup.
+        logger.debug(f"Derived client IP from X-Forwarded-For: {client_ip} (Full header: '{x_forwarded_for}')")
+        return client_ip
+    
+    if request.client and request.client.host:
+        client_ip = request.client.host
+        logger.debug(f"Using client IP from request.client.host: {client_ip}")
+        return client_ip
+        
+    logger.warning("Could not determine client IP from X-Forwarded-For or request.client.host. Using 'unknown_client'.")
+    return "unknown_client"
+    
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     global active_rembg_providers
     session_wrapper = None 
@@ -406,19 +435,13 @@ def process_pil_sync(input_bytes: bytes, target_size: int, prepared_logo: Image.
     output_buffer = io.BytesIO()
     final_image.save(output_buffer, 'WEBP', quality=90, background=(255, 255, 255))
     return output_buffer.getvalue()
-
 @app.post("/submit")
 async def submit_json_image_for_processing(request: Request, body: SubmitJsonBody):
     if body.key != EXPECTED_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     
-    requester_ip = request.client.host if request.client else "unknown_client"
-    # For setups behind a proxy, ensure Uvicorn is configured with `forwarded_allow_ips`
-    # or parse `X-Forwarded-For` header carefully:
-    # x_forwarded_for = request.headers.get("x-forwarded-for")
-    # if x_forwarded_for:
-    #     requester_ip = x_forwarded_for.split(',')[0].strip()
+    requester_ip = get_requester_ip(request) # MODIFIED
 
     with ip_traffic_lock:
         ip_traffic_stats[requester_ip]["requests"] += 1
@@ -429,7 +452,7 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
     public_url_base = get_proxy_url(request)
     model_to_use = body.model if body.model else DEFAULT_MODEL_NAME
     try: 
-        queue.put_nowait((job_id, str(body.image), model_to_use, True, requester_ip)) # Added requester_ip
+        queue.put_nowait((job_id, str(body.image), model_to_use, True, requester_ip)) 
     except asyncio.QueueFull:
         logger.warning(f"Queue full for IP {requester_ip}. Rejecting JSON request for {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
@@ -450,10 +473,7 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     if not image_file.content_type or not image_file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Upload an image.")
 
-    requester_ip = request.client.host if request.client else "unknown_client"
-    # x_forwarded_for = request.headers.get("x-forwarded-for")
-    # if x_forwarded_for:
-    #     requester_ip = x_forwarded_for.split(',')[0].strip()
+    requester_ip = get_requester_ip(request) # MODIFIED
 
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
@@ -468,7 +488,7 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     saved_fn = f"{job_id}_original{extension}"; original_path = os.path.join(UPLOADS_DIR, saved_fn)
     file_content_length = 0
     try:
-        content = await image_file.read() # Read content first
+        content = await image_file.read() 
         file_content_length = len(content)
         async with aiofiles.open(original_path, 'wb') as out_file:
             await out_file.write(content)
@@ -487,7 +507,7 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     model_to_use = model if model else DEFAULT_MODEL_NAME
 
     try:
-        queue.put_nowait((job_id, file_uri, model_to_use, True, requester_ip)) # Added requester_ip
+        queue.put_nowait((job_id, file_uri, model_to_use, True, requester_ip)) 
     except asyncio.QueueFull:
         logger.warning(f"Queue full for IP {requester_ip}. Rejecting form request for {original_fn} (job {job_id}).")
         if os.path.exists(original_path):
