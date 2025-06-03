@@ -1,62 +1,4 @@
-@app.on_event("shutdown")
-async def shutdown_event():
-    global cpu_executor, pil_executor
-    logger.info("Application shutdown sequence initiated...")
-    
-    # First, clean up GPU sessions to free resources 7
-    cleanup_rembg_sessions()
-    clear_gpu_memory()
-    
-    # Force shutdown thread pools with immediate termination
-    shutdown_timeout = 3  # Very short timeout
-    
-    if cpu_executor: 
-        logger.info("Shutting down RembgCPU thread pool...")
-        cpu_executor.shutdown(wait=False)  # Don't wait
-        
-        # Force terminate threads if they don't shutdown
-        if hasattr(cpu_executor, '_threads'):
-            import time
-            start_time = time.time()
-            while cpu_executor._threads and (time.time() - start_time) < shutdown_timeout:
-                time.sleep(0.1)
-            
-            # Force kill remaining threads
-            if cpu_executor._threads:
-                logger.warning(f"Force terminating {len(cpu_executor._threads)} hanging CPU threads")
-                for thread in list(cpu_executor._threads):
-                    if thread.is_alive():
-                        # This is aggressive but necessary for hanging threads
-                        import ctypes
-                        thread_id = thread.ident
-                        if thread_id:
-                            try:
-                                ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, ctypes.py_object(SystemExit))
-                                logger.info(f"Force terminated thread {thread.name}")
-                            except:
-                                pass
-        logger.info("RembgCPU thread pool shut down.")
-        
-    if pil_executor: 
-        logger.info("Shutting down PILCPU thread pool...")
-        pil_executor.shutdown(wait=False)  # Don't wait
-        
-        # Force terminate threads if they don't shutdown
-        if hasattr(pil_executor, '_threads'):
-            start_time = time.time()
-            while pil_executor._threads and (time.time() - start_time) < shutdown_timeout:
-                time.sleep(0.1)
-            
-            # Force kill remaining threads
-            if pil_executor._threads:
-                logger.warning(f"Force terminating {len(pil_executor._threads)} hanging PIL threads")
-                for thread in list(pil_executor._threads):
-                    if thread.is_alive():
-                        import ctypes
-                        thread_id = thread.ident
-                        if thread_id:
-                            try:
-                                ctimport asyncio
+import asyncio
 import uuid
 import io
 import os
@@ -72,7 +14,6 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from datetime import datetime, timedelta
-from typing import Dict, List
 
 # --- CREATE DIRECTORIES AT THE VERY TOP X99---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
@@ -123,7 +64,7 @@ app.add_middleware(
 )
 
 # --- Configuration Constants ---
-MAX_CONCURRENT_TASKS = 1  # Force single worker to prevent GPU conflicts
+MAX_CONCURRENT_TASKS = 8
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
@@ -132,27 +73,20 @@ DEFAULT_MODEL_NAME = "birefnet"
 
 # --- GPU Configuration for Rembg ---
 REMBG_USE_GPU = True # User wants to force GPU, so this should be True.
-REMBG_EMERGENCY_CPU_FALLBACK = True  # Allow CPU fallback if GPU fails completely
 # Order matters: TensorRT > CUDA > DML. CPU is NOT a fallback here if REMBG_USE_GPU is True.
 REMBG_PREFERRED_GPU_PROVIDERS = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'DmlExecutionProvider']
 # This list is used ONLY if REMBG_USE_GPU is False, or as a last resort if startup catastrophically fails to find any provider.
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
-# --- IP Tracking Configuration ---
-IP_TRACKING_ENABLED = True
-IP_CLEANUP_INTERVAL = 300  # Clean up old IP data every 5 minutes
-IP_INACTIVE_THRESHOLD = 3600  # Consider IP inactive after 1 hour of no activity
-MAX_REQUESTS_PER_IP_PER_HOUR = 100  # Rate limiting (optional)
-ENABLE_GEOLOCATION = True  # Set to False to disable geolocation features
 
 # --- Monitoring Configuration ---
 MONITORING_HISTORY_MINUTES = 60
 MONITORING_SAMPLE_INTERVAL = 5
 MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
 
-# Thread pool configuration - Make them daemon threads for proper shutdown
-CPU_THREAD_POOL_SIZE = 1  # Single thread to prevent deadlocks
-PIL_THREAD_POOL_SIZE = 1  # Single thread to prevent deadlocks
+# Thread pool configuration
+CPU_THREAD_POOL_SIZE = 4
+PIL_THREAD_POOL_SIZE = 4
 
 ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
@@ -169,14 +103,6 @@ prepared_logo_image = None
 queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
 results: dict = {}
 EXPECTED_API_KEY = "secretApiKey"
-
-# --- Session Caching for GPU Memory Efficiency ---
-rembg_session_cache = {}  # model_name -> session object
-session_lock = threading.Lock()
-
-# --- IP Tracking State ---
-ip_data: Dict[str, Dict] = {}  # IP -> {jobs: [job_ids], last_seen: timestamp, location: {}, total_requests: int}
-ip_lock = threading.Lock()
 
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
@@ -200,186 +126,6 @@ WORKER_FETCHING = "fetching"
 WORKER_PROCESSING_REMBG = "rembg"
 WORKER_PROCESSING_PIL = "pil"
 WORKER_SAVING = "saving"
-
-def get_client_ip(request: Request) -> str:
-    """Extract client IP from request, handling proxies."""
-    # Check for forwarded IP headers (common with reverse proxies)
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        # X-Forwarded-For can contain multiple IPs, take the first one
-        return forwarded_for.split(",")[0].strip()
-    
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
-        return real_ip.strip()
-    
-    # Fallback to direct client IP
-    if hasattr(request.client, 'host'):
-        return request.client.host
-    
-    return "unknown"
-
-def update_ip_tracking(ip_address: str, job_id: str = None):
-    """Update IP tracking data."""
-    if not IP_TRACKING_ENABLED:
-        return
-    
-    current_time = time.time()
-    
-    with ip_lock:
-        if ip_address not in ip_data:
-            ip_data[ip_address] = {
-                "jobs": [],
-                "last_seen": current_time,
-                "location": {},
-                "total_requests": 0,
-                "first_seen": current_time
-            }
-        
-        ip_info = ip_data[ip_address]
-        ip_info["last_seen"] = current_time
-        ip_info["total_requests"] += 1
-        
-        if job_id:
-            ip_info["jobs"].append(job_id)
-            # Keep only recent jobs (last 100)
-            if len(ip_info["jobs"]) > 100:
-                ip_info["jobs"] = ip_info["jobs"][-100:]
-
-def remove_job_from_ip_tracking(ip_address: str, job_id: str):
-    """Remove a completed/failed job from IP tracking."""
-    if not IP_TRACKING_ENABLED:
-        return
-    
-    with ip_lock:
-        if ip_address in ip_data and job_id in ip_data[ip_address]["jobs"]:
-            ip_data[ip_address]["jobs"].remove(job_id)
-
-def get_active_jobs_by_ip(ip_address: str) -> List[str]:
-    """Get list of active job IDs for an IP."""
-    if not IP_TRACKING_ENABLED:
-        return []
-    
-    with ip_lock:
-        if ip_address not in ip_data:
-            return []
-        
-        # Filter jobs that are still active in the results dict
-        active_jobs = []
-        for job_id in ip_data[ip_address]["jobs"]:
-            if job_id in results and results[job_id].get("status") not in ["done", "error"]:
-                active_jobs.append(job_id)
-        
-        # Update the stored jobs list to remove completed ones
-        ip_data[ip_address]["jobs"] = active_jobs
-        return active_jobs
-
-def get_ip_stats():
-    """Get comprehensive IP statistics."""
-    if not IP_TRACKING_ENABLED:
-        return {"active_ips": 0, "total_ips": 0, "ips": []}
-    
-    current_time = time.time()
-    active_ips = []
-    total_ips = 0
-    
-    with ip_lock:
-        for ip, data in ip_data.items():
-            total_ips += 1
-            active_jobs = get_active_jobs_by_ip(ip)
-            
-            # Consider IP active if it has jobs or was seen recently
-            is_active = (len(active_jobs) > 0 or 
-                        (current_time - data["last_seen"]) < IP_INACTIVE_THRESHOLD)
-            
-            if is_active:
-                ip_info = {
-                    "ip": ip,
-                    "active_jobs": len(active_jobs),
-                    "total_requests": data["total_requests"],
-                    "last_seen": data["last_seen"],
-                    "first_seen": data["first_seen"],
-                    "location": data.get("location", {}),
-                    "job_ids": active_jobs[:10]  # Show only first 10 job IDs
-                }
-                active_ips.append(ip_info)
-    
-    # Sort by number of active jobs (descending), then by last seen
-    active_ips.sort(key=lambda x: (x["active_jobs"], x["last_seen"]), reverse=True)
-    
-    return {
-        "active_ips": len(active_ips),
-        "total_ips": total_ips,
-        "ips": active_ips
-    }
-
-async def cleanup_ip_tracking():
-    """Background task to clean up old IP tracking data."""
-    while True:
-        try:
-            if IP_TRACKING_ENABLED:
-                current_time = time.time()
-                cleanup_threshold = current_time - (IP_INACTIVE_THRESHOLD * 2)  # Keep data longer than inactive threshold
-                
-                with ip_lock:
-                    ips_to_remove = []
-                    for ip, data in ip_data.items():
-                        # Remove IPs with no active jobs and not seen recently
-                        active_jobs = get_active_jobs_by_ip(ip)
-                        if (len(active_jobs) == 0 and 
-                            data["last_seen"] < cleanup_threshold):
-                            ips_to_remove.append(ip)
-                    
-                    for ip in ips_to_remove:
-                        logger.info(f"Cleaning up IP tracking data for inactive IP: {ip}")
-                        del ip_data[ip]
-                    
-                    if ips_to_remove:
-                        logger.info(f"Cleaned up {len(ips_to_remove)} inactive IP entries")
-        
-        except Exception as e:
-            logger.error(f"Error in IP tracking cleanup: {e}", exc_info=True)
-        
-        await asyncio.sleep(IP_CLEANUP_INTERVAL)
-
-async def fetch_ip_geolocation(ip_address: str) -> Dict:
-    """Fetch geolocation data for an IP address using a free service."""
-    if not ENABLE_GEOLOCATION or ip_address in ["unknown", "127.0.0.1", "localhost"]:
-        return {}
-    
-    try:
-        # Using ipapi.co as it's free and doesn't require API key
-        # Alternative: ip-api.com, ipinfo.io, etc.
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"https://ipapi.co/{ip_address}/json/")
-            if response.status_code == 200:
-                data = response.json()
-                
-                # Extract relevant location data
-                location = {
-                    "country": data.get("country_name", ""),
-                    "country_code": data.get("country", ""),
-                    "region": data.get("region", ""),
-                    "city": data.get("city", ""),
-                    "latitude": data.get("latitude"),
-                    "longitude": data.get("longitude"),
-                    "timezone": data.get("timezone", ""),
-                    "org": data.get("org", ""),
-                    "fetched_at": time.time()
-                }
-                
-                # Store in IP data
-                with ip_lock:
-                    if ip_address in ip_data:
-                        ip_data[ip_address]["location"] = location
-                
-                logger.info(f"Fetched geolocation for {ip_address}: {location.get('city', '')}, {location.get('country', '')}")
-                return location
-                
-    except Exception as e:
-        logger.warning(f"Failed to fetch geolocation for {ip_address}: {e}")
-    
-    return {}
 
 def log_worker_activity(worker_id: int, activity: str):
     with worker_lock:
@@ -421,60 +167,7 @@ def get_gpu_info():
     return gpu_data
 
 
-async def gpu_memory_monitor():
-    """Monitor and cleanup GPU memory periodically."""
-    while True:
-        try:
-            # Check GPU memory every 30 seconds (more frequent)
-            await asyncio.sleep(30)
-            
-            gpu_info = get_gpu_info()
-            gpu_usage_percent = (gpu_info["gpu_used_mb"] / max(gpu_info["gpu_total_mb"], 1)) * 100
-            
-            # If GPU memory usage > 70%, cleanup sessions (lower threshold)
-            if gpu_usage_percent > 70:
-                logger.warning(f"High GPU memory usage: {gpu_usage_percent:.1f}%, cleaning up sessions")
-                cleanup_rembg_sessions()
-                clear_gpu_memory()
-                
-                # Force garbage collection
-                import gc
-                gc.collect()
-                
-                # Log after cleanup
-                gpu_info_after = get_gpu_info()
-                gpu_usage_after = (gpu_info_after["gpu_used_mb"] / max(gpu_info_after["gpu_total_mb"], 1)) * 100
-                logger.info(f"GPU memory after cleanup: {gpu_usage_after:.1f}%")
-                
-        except Exception as e:
-            logger.error(f"Error in GPU memory monitor: {e}")
-
 async def system_monitor():
-    while True:
-        try:
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory = psutil.virtual_memory()
-            memory_percent = memory.percent
-            memory_used_gb = memory.used / (1024**3)
-            memory_total_gb = memory.total / (1024**3)
-            
-            gpu_info = get_gpu_info() # pynvml.nvmlInit is called inside
-            
-            timestamp = time.time()
-            metrics = {
-                "timestamp": timestamp,
-                "cpu_percent": cpu_percent,
-                "memory_percent": memory_percent,
-                "memory_used_gb": memory_used_gb,
-                "memory_total_gb": memory_total_gb,
-                **gpu_info
-            }
-            system_metrics.append(metrics)
-            
-        except Exception as e:
-            logger.error(f"Error collecting system metrics: {e}")
-        await asyncio.sleep(MONITORING_SAMPLE_INTERVAL)
-
     while True:
         try:
             cpu_percent = psutil.cpu_percent(interval=1)
@@ -523,11 +216,11 @@ def format_size(num_bytes: int) -> str:
     elif num_bytes < 1024**2: return f"{num_bytes/1024:.2f} KB"
     else: return f"{num_bytes/1024**2:.2f} MB"
 
-def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown", original_filename: str = "", ip_address: str = "unknown"):
+def add_job_to_history(job_id: str, status: str, total_time: float, input_size: int, output_size: int, model: str, source_type: str = "unknown", original_filename: str = ""):
     global job_history, total_jobs_completed, total_jobs_failed, total_processing_time
     job_record = {"job_id": job_id, "timestamp": time.time(), "status": status, "total_time": total_time,
                   "input_size": input_size, "output_size": output_size, "model": model,
-                  "source_type": source_type, "original_filename": original_filename, "ip_address": ip_address}
+                  "source_type": source_type, "original_filename": original_filename}
     job_history.insert(0, job_record)
     if len(job_history) > MAX_HISTORY_ITEMS: job_history.pop()
     if status == "completed": total_jobs_completed += 1; total_processing_time += total_time
@@ -562,200 +255,150 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
-def cleanup_rembg_sessions():
-    """Clean up all cached rembg sessions to free GPU memory."""
-    global rembg_session_cache
-    with session_lock:
-        if rembg_session_cache:
-            logger.info(f"Cleaning up {len(rembg_session_cache)} cached rembg sessions")
-            for model_name in list(rembg_session_cache.keys()):
-                try:
-                    session = rembg_session_cache[model_name]
-                    # Try to explicitly cleanup session if it has cleanup methods
-                    if hasattr(session, 'close'):
-                        session.close()
-                    elif hasattr(session, '__del__'):
-                        session.__del__()
-                except Exception as e:
-                    logger.warning(f"Error cleaning up session for {model_name}: {e}")
-                finally:
-                    del rembg_session_cache[model_name]
-            rembg_session_cache.clear()
-            logger.info("All rembg sessions cleaned up")
-
-def get_or_create_rembg_session(model_name: str):
-    """Get cached rembg session or create new one. Thread-safe."""
-    global rembg_session_cache, active_rembg_providers
-    
-    with session_lock:
-        if model_name in rembg_session_cache:
-            logger.debug(f"Using cached rembg session for model: {model_name}")
-            return rembg_session_cache[model_name]
-        
-        logger.info(f"Creating new rembg session for model: {model_name}")
-        session_wrapper = new_session(model_name, providers=active_rembg_providers)
-        
-        if session_wrapper is None:
-            raise RuntimeError(f"Failed to create rembg session for model: {model_name}")
-        
-        # Cache the session for reuse
-        rembg_session_cache[model_name] = session_wrapper
-        logger.info(f"Cached new rembg session for model: {model_name}")
-        return session_wrapper
-
-def clear_gpu_memory():
-    """Force clear GPU memory cache."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            logger.debug("GPU memory cache cleared")
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.warning(f"Error clearing GPU memory: {e}")
-
-def check_gpu_memory_pressure() -> bool:
-    """Check if GPU memory usage is too high."""
-    try:
-        gpu_info = get_gpu_info()
-        if gpu_info["gpu_total_mb"] > 0:
-            usage_percent = (gpu_info["gpu_used_mb"] / gpu_info["gpu_total_mb"]) * 100
-            if usage_percent > 85:  # If >85% memory used
-                logger.warning(f"High GPU memory pressure: {usage_percent:.1f}%")
-                return True
-    except Exception as e:
-        logger.warning(f"Error checking GPU memory pressure: {e}")
-    return False
-
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """
     Synchronous rembg processing - runs in thread pool.
-    Uses cached sessions and improved error handling.
+    Uses providers determined at startup by active_rembg_providers.
+    If REMBG_USE_GPU is True, it will only attempt GPU providers and fail if they are not usable
+    or if the session falls back to CPU-only.
     """
     global active_rembg_providers
+    session_wrapper = None # Renamed to reflect it's a rembg wrapper
     
-    # Get current thread info for debugging
-    import threading
-    thread_name = threading.current_thread().name
-    
-    try:
-        logger.info(f"Rembg: Starting processing for model '{model_name}' (input size: {len(input_bytes)} bytes) on thread {thread_name}")
-        
-        # Check memory pressure before processing
-        if check_gpu_memory_pressure():
-            logger.warning("High GPU memory pressure detected, clearing cache...")
-            cleanup_rembg_sessions()
-            clear_gpu_memory()
-            import gc
-            gc.collect()
-        
-        # Get or create session (with caching for GPU efficiency)
-        session_wrapper = get_or_create_rembg_session(model_name)
-        
-        # Verify GPU providers if required
-        if REMBG_USE_GPU:
-            try:
-                # Try to get providers from session
-                actual_providers = []
-                if hasattr(session_wrapper, 'inner_session') and hasattr(session_wrapper.inner_session, 'get_providers'):
-                    actual_providers = session_wrapper.inner_session.get_providers()
-                elif hasattr(session_wrapper, 'sess') and hasattr(session_wrapper.sess, 'get_providers'):
-                    actual_providers = session_wrapper.sess.get_providers()
-                
-                if actual_providers:
-                    has_gpu = any(p in actual_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
-                    logger.debug(f"Rembg session providers: {actual_providers}, GPU available: {has_gpu}")
-                
-            except Exception as e:
-                logger.warning(f"Could not verify session providers: {e}")
+    providers_to_attempt = list(active_rembg_providers) 
 
-        # Process the image with timeout protection
-        logger.debug(f"Rembg: Calling remove() function on thread {thread_name}...")
-        start_time = time.perf_counter()
-        
-        # Set thread-local timeout to prevent hanging
-        import signal
-        def timeout_handler(signum, frame):
-            logger.error(f"Rembg processing timed out on thread {thread_name}")
-            raise TimeoutError("Rembg processing timed out")
-        
-        # Only set alarm on main thread or if signal is available
-        timeout_set = False
-        try:
-            if threading.current_thread() is threading.main_thread():
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(45)  # 45 second timeout
-                timeout_set = True
-        except (ValueError, AttributeError):
-            # signal.alarm not available on all platforms or threads
-            pass
-        
-        try:
-            output_bytes = remove(
-                input_bytes,
-                session=session_wrapper,
-                post_process_mask=True,
-                alpha_matting=True
+    try:
+        logger.info(f"Rembg: Attempting to initialize session for model '{model_name}' with providers: {providers_to_attempt}")
+        # new_session returns a rembg session wrapper
+        session_wrapper = new_session(model_name, providers=providers_to_attempt)
+
+        if session_wrapper is None:
+            err_msg_session_none = f"CRITICAL: rembg.new_session returned None for model '{model_name}' with providers {providers_to_attempt}. This indicates a failure in session creation."
+            logger.critical(err_msg_session_none)
+            raise RuntimeError(err_msg_session_none)
+
+        logger.debug(f"Rembg: Successfully called new_session. Type of session_wrapper object: {type(session_wrapper)}")
+
+        # Attempt to get the underlying ONNX InferenceSession
+        onnx_inference_session = None
+        if hasattr(session_wrapper, 'inner_session'): # Common attribute name in rembg
+            onnx_inference_session = session_wrapper.inner_session
+            logger.debug("Rembg: Accessed 'inner_session' from rembg session wrapper.")
+        elif hasattr(session_wrapper, 'sess'): # Another possible attribute name
+            onnx_inference_session = session_wrapper.sess
+            logger.debug("Rembg: Accessed 'sess' from rembg session wrapper.")
+        else:
+            logger.warning(
+                f"Rembg: Could not find 'inner_session' or 'sess' attribute on rembg session wrapper (type: {type(session_wrapper)}). "
+                "Attempting to treat the wrapper itself as the ONNX session for get_providers(). This might fail."
             )
-        finally:
-            # Clear the alarm
-            if timeout_set:
-                signal.alarm(0)
-        
-        processing_time = time.perf_counter() - start_time
-        logger.info(f"Rembg: Processing completed in {processing_time:.3f}s (output size: {len(output_bytes)} bytes) on thread {thread_name}")
-        
-        # Clear GPU memory after processing to prevent fragmentation
-        clear_gpu_memory()
-        
-        return output_bytes
-        
-    except Exception as e:
-        error_msg = f"Rembg processing failed for model '{model_name}' on thread {thread_name}: {type(e).__name__}: {e}"
-        logger.error(error_msg, exc_info=True)
-        
-        # Clear cached session on error to force recreation
-        with session_lock:
-            if model_name in rembg_session_cache:
-                logger.info(f"Clearing cached session for model '{model_name}' due to error")
-                try:
-                    session = rembg_session_cache[model_name]
-                    if hasattr(session, 'close'):
-                        session.close()
-                except:
-                    pass
-                del rembg_session_cache[model_name]
-        
-        # Force GPU cleanup on error
-        clear_gpu_memory()
-        
-        raise RuntimeError(error_msg)
+            onnx_inference_session = session_wrapper # Fallback, will likely lead to GetProvidersMethodMissing if wrapper doesn't delegate
 
-def process_rembg_cpu_fallback(input_bytes: bytes, model_name: str) -> bytes:
-    """Emergency CPU fallback for rembg processing when GPU fails."""
-    logger.warning(f"Using emergency CPU fallback for model: {model_name}")
-    
-    try:
-        # Force CPU-only session
-        cpu_session = new_session(model_name, providers=['CPUExecutionProvider'])
-        if cpu_session is None:
-            raise RuntimeError(f"Failed to create CPU fallback session for model: {model_name}")
-        
-        output_bytes = remove(
-            input_bytes,
-            session=cpu_session,
-            post_process_mask=True,
-            alpha_matting=True
-        )
-        
-        logger.info(f"CPU fallback completed for model: {model_name}")
-        return output_bytes
-        
+        if onnx_inference_session is None:
+            # This case means session_wrapper was not None, but we couldn't get an inner session object from it.
+            # This could happen if rembg changes its internal structure significantly.
+            err_msg_no_onnx_session = (
+                f"Rembg: Failed to retrieve the underlying ONNX InferenceSession from the rembg session wrapper "
+                f"(type: {type(session_wrapper)}) for model '{model_name}'. Cannot verify providers."
+            )
+            logger.error(err_msg_no_onnx_session)
+            # We can't use ["Error:NoInnerONNXSession"] for actual_session_providers as the logic below expects a list.
+            # Instead, we'll let the get_providers call fail or mark providers as unknown.
+            actual_session_providers = ["Error:CouldNotAccessONNXSession"]
+
+        else: # We have an onnx_inference_session object (or the wrapper itself if fallback)
+            logger.debug(f"Rembg: Object being used for get_providers(): {type(onnx_inference_session)}")
+            actual_session_providers = []
+            try:
+                actual_session_providers = onnx_inference_session.get_providers()
+                if not actual_session_providers:
+                     logger.warning(f"Rembg: onnx_inference_session.get_providers() returned an empty list for model '{model_name}'.")
+                     actual_session_providers = ["Error:GetProvidersReturnedEmpty"]
+            except AttributeError:
+                logger.error(
+                    f"Rembg: The object (type: {type(onnx_inference_session)}) used for provider checking "
+                    f"does NOT have 'get_providers()' method. Intended rembg wrapper type: {type(session_wrapper)}."
+                )
+                actual_session_providers = ["Error:GetProvidersMethodMissingOnObject"]
+            except Exception as e_get_providers:
+                logger.error(
+                    f"Rembg: Error calling get_providers() on object (type: {type(onnx_inference_session)}) for model '{model_name}': {type(e_get_providers).__name__}: {e_get_providers}."
+                )
+                actual_session_providers = [f"Error:GetProvidersCallFailed_{type(e_get_providers).__name__}"]
+            
+        logger.info(f"Rembg: Session for model '{model_name}'. Intended providers: {providers_to_attempt}, Actual providers reported by session: {actual_session_providers}")
+
+        if REMBG_USE_GPU:
+            if not providers_to_attempt or not any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                logger.critical(
+                    f"CRITICAL LOGIC FLAW: REMBG_USE_GPU is True, but providers_to_attempt ({providers_to_attempt}) "
+                    f"does not reflect a GPU intention. Check startup provider configuration."
+                )
+
+            is_any_preferred_gpu_in_actual = any(p in actual_session_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
+            is_cpu_in_actual = 'CPUExecutionProvider' in actual_session_providers
+            
+            if any("Error:" in p for p in actual_session_providers): # Catches our custom error states
+                err_msg = (
+                    f"FORCED GPU FAILED (Provider Detection Issue): Rembg session for model '{model_name}'. "
+                    f"Could not reliably determine actual providers (reported: {actual_session_providers}). "
+                    f"Intended providers were {providers_to_attempt}. Cannot confirm GPU usage."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
+
+            if is_cpu_in_actual and not is_any_preferred_gpu_in_actual:
+                err_msg = (
+                    f"FORCED GPU FAILED (CPU Fallback): Rembg session for model '{model_name}' is confirmed to be using CPUExecutionProvider "
+                    f"(actual: {actual_session_providers}) and NO preferred GPU provider is active, despite GPU being intended with {providers_to_attempt}."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
+            elif not is_any_preferred_gpu_in_actual and any(p in REMBG_PREFERRED_GPU_PROVIDERS for p in providers_to_attempt):
+                err_msg = (
+                    f"FORCED GPU FAILED (No Preferred GPU Active): Rembg session for model '{model_name}' did not activate any of the "
+                    f"intended preferred GPU providers ({providers_to_attempt}). Actual providers reported by session: {actual_session_providers}."
+                )
+                logger.error(err_msg)
+                raise RuntimeError(err_msg)
+            elif is_cpu_in_actual and is_any_preferred_gpu_in_actual:
+                 logger.info(
+                     f"Rembg: A preferred GPU provider is active in session ({actual_session_providers}), "
+                     f"and CPUExecutionProvider is also present. This is typical. Intended: {providers_to_attempt}."
+                 )
+            elif is_any_preferred_gpu_in_actual: # GPU active, CPU not mentioned or not primary
+                logger.info(f"Rembg: Successfully using a preferred GPU provider. Actual: {actual_session_providers}, Intended: {providers_to_attempt}")
+            else: # Fallback for unexpected states
+                 logger.warning(
+                    f"Rembg: No preferred GPU provider was intended by 'providers_to_attempt' ({providers_to_attempt}) or "
+                    f"none are active in session. Actual providers: {actual_session_providers}. "
+                    "If REMBG_USE_GPU is True, this state likely indicates a startup misconfiguration of providers, "
+                    "or the ONNX session did not initialize with any of the preferred GPU providers successfully."
+                )
+
     except Exception as e:
-        logger.error(f"CPU fallback failed for model '{model_name}': {e}", exc_info=True)
+        log_message = (
+            f"CRITICAL: Failed to initialize or verify rembg session for model '{model_name}' with "
+            f"intended providers {providers_to_attempt}. Error: {type(e).__name__}: {e}. "
+        )
+        if REMBG_USE_GPU and "FORCED GPU FAILED" in str(e):
+            log_message += "NO FALLBACK TO CPU. This job will fail as per 'force GPU' policy."
+        elif REMBG_USE_GPU:
+             log_message += "REMBG_USE_GPU was True. An error occurred before or during provider verification. NO FALLBACK TO CPU. This job will fail."
+        else:
+            log_message += "REMBG_USE_GPU was False. Error occurred during CPU or configured provider processing."
+        
+        logger.critical(log_message, exc_info=True)
         raise
+
+    # The 'remove' function expects the rembg session wrapper, not the raw onnx_inference_session
+    output_bytes = remove(
+        input_bytes,
+        session=session_wrapper, # Pass the original rembg session wrapper
+        post_process_mask=True,
+        alpha_matting=True
+    )
+    return output_bytes
     
 def process_pil_sync(input_bytes: bytes, target_size: int, prepared_logo: Image.Image = None, enable_logo: bool = False, logo_margin: int = 20) -> bytes:
     img_rgba = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
@@ -789,33 +432,18 @@ async def submit_json_image_for_processing(request: Request, body: SubmitJsonBod
     if body.key != EXPECTED_API_KEY: raise HTTPException(status_code=401, detail="Unauthorized")
     if ENABLE_LOGO_WATERMARK and os.path.exists(LOGO_PATH) and not prepared_logo_image:
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
-    
-    # Get client IP and update tracking
-    client_ip = get_client_ip(request)
-    update_ip_tracking(client_ip)
-    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     model_to_use = body.model if body.model else DEFAULT_MODEL_NAME
-    
-    try: 
-        queue.put_nowait((job_id, str(body.image), model_to_use, True, client_ip))
-        update_ip_tracking(client_ip, job_id)
+    try: queue.put_nowait((job_id, str(body.image), model_to_use, True))
     except asyncio.QueueFull:
-        logger.warning(f"Queue full. Rejecting JSON request for {body.image} from IP {client_ip}.")
+        logger.warning(f"Queue full. Rejecting JSON request for {body.image}.")
         raise HTTPException(status_code=503, detail=f"Server overloaded. Max queue: {MAX_QUEUE_SIZE}")
-    
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": str(body.image), "original_local_path": None,
-                       "processed_path": None, "error_message": None, "status_check_url": status_check_url,
-                       "client_ip": client_ip}
+                       "processed_path": None, "error_message": None, "status_check_url": status_check_url}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (JSON URL: {body.image}, Model: {model_to_use}, IP: {client_ip}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
-    
-    # Trigger geolocation fetch in background (fire and forget)
-    if ENABLE_GEOLOCATION:
-        asyncio.create_task(fetch_ip_geolocation(client_ip))
-    
+    logger.info(f"Job {job_id} (JSON URL: {body.image}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {"status": "processing", "job_id": job_id, "image_links": [f"{public_url_base}/images/{job_id}.webp"],
             "eta": eta_seconds, "status_check_url": status_check_url}
 
@@ -826,11 +454,6 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
         logger.error("Logo watermarking enabled, logo file exists, but not loaded. Check startup.")
     if not image_file.content_type or not image_file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Upload an image.")
-    
-    # Get client IP and update tracking
-    client_ip = get_client_ip(request)
-    update_ip_tracking(client_ip)
-    
     job_id = str(uuid.uuid4())
     public_url_base = get_proxy_url(request)
     original_fn = image_file.filename if image_file.filename else "upload"
@@ -844,7 +467,7 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     try:
         async with aiofiles.open(original_path, 'wb') as out_file:
             content = await image_file.read(); await out_file.write(content)
-        logger.info(f"📝 Job {job_id} (Form: {original_fn}, IP: {client_ip}) Original saved: {original_path} ({format_size(len(content))})")
+        logger.info(f"📝 Job {job_id} (Form: {original_fn}) Original saved: {original_path} ({format_size(len(content))})")
     except Exception as e:
         logger.error(f"Error saving upload {saved_fn} for job {job_id}: {e}"); raise HTTPException(status_code=500, detail=f"Save failed: {e}")
     finally: await image_file.close()
@@ -852,10 +475,9 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     model_to_use = model if model else DEFAULT_MODEL_NAME
 
     try:
-        queue.put_nowait((job_id, file_uri, model_to_use, True, client_ip))
-        update_ip_tracking(client_ip, job_id)
+        queue.put_nowait((job_id, file_uri, model_to_use, True))
     except asyncio.QueueFull:
-        logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}) from IP {client_ip}.")
+        logger.warning(f"Queue full. Rejecting form request for {original_fn} (job {job_id}).")
         if os.path.exists(original_path):
             try: os.remove(original_path)
             except OSError as e_clean: logger.error(f"Error cleaning {original_path} (queue full): {e_clean}")
@@ -863,15 +485,9 @@ async def submit_form_image_for_processing(request: Request, image_file: UploadF
     status_check_url = f"{public_url_base}/status/{job_id}"
     results[job_id] = {"status": "queued", "input_image_url": f"(form_upload: {original_fn})",
                        "original_local_path": original_path, "processed_path": None,
-                       "error_message": None, "status_check_url": status_check_url,
-                       "client_ip": client_ip}
+                       "error_message": None, "status_check_url": status_check_url}
     eta_seconds = (queue.qsize()) * ESTIMATED_TIME_PER_JOB
-    logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}, IP: {client_ip}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
-    
-    # Trigger geolocation fetch in background (fire and forget)
-    if ENABLE_GEOLOCATION:
-        asyncio.create_task(fetch_ip_geolocation(client_ip))
-    
+    logger.info(f"Job {job_id} (Form: {original_fn}, Model: {model_to_use}) enqueued. Queue: {queue.qsize()}. ETA: {eta_seconds:.2f}s")
     return {"status": "processing", "job_id": job_id, "original_image_url": f"{public_url_base}/originals/{saved_fn}",
             "image_links": [f"{public_url_base}/images/{job_id}.webp"], "eta": eta_seconds, "status_check_url": status_check_url}
 
@@ -880,11 +496,6 @@ async def get_worker_monitoring_data(): return get_worker_activity_data()
 
 @app.get("/api/monitoring/system")
 async def get_system_monitoring_data(): return get_system_metrics_data()
-
-@app.get("/api/monitoring/ips")
-async def get_ip_monitoring_data():
-    """Get IP tracking statistics."""
-    return get_ip_stats()
 
 @app.get("/api/debug/gpu")
 async def debug_gpu_status():
@@ -974,8 +585,7 @@ async def job_details(request: Request, job_id: str):
             "status": result_details.get("status", "unknown"),
             "total_time": 0, "input_size": 0, "output_size": 0, 
             "model": "N/A (active)", "source_type": "N/A (active)", 
-            "original_filename": result_details.get("input_image_url", "N/A (active)").split('/')[-1],
-            "ip_address": result_details.get("client_ip", "unknown")
+            "original_filename": result_details.get("input_image_url", "N/A (active)").split('/')[-1]
         }
     else:
         raise HTTPException(status_code=404, detail="Job not found in active results or history")
@@ -1009,18 +619,6 @@ async def job_details(request: Request, job_id: str):
     elif result_details.get("processed_path"): # From active job
         processed_image_url = f"{public_url_base}/images/{os.path.basename(result_details['processed_path'])}"
 
-    # Get IP location info if available
-    ip_location_info = ""
-    client_ip = display_job_info.get("ip_address", "unknown")
-    if IP_TRACKING_ENABLED and client_ip in ip_data:
-        location = ip_data[client_ip].get("location", {})
-        if location:
-            location_parts = []
-            if location.get("city"): location_parts.append(location["city"])
-            if location.get("region"): location_parts.append(location["region"])
-            if location.get("country"): location_parts.append(location["country"])
-            if location_parts:
-                ip_location_info = f" ({', '.join(location_parts)})"
 
     return HTMLResponse(content=f"""<!DOCTYPE html><html lang="en">
     <head><meta charset="UTF-8"><title>Job Details - {job_id[:8]}</title><style>body{{font-family:sans-serif;margin:20px;background-color:#f9f9f9;}}.container{{max-width:1200px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}}.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;}}.status-badge{{padding:5px 10px;border-radius:15px;font-weight:bold;text-transform:uppercase;}}.status-completed{{background-color:#d4edda;color:#155724;}}.status-failed,.status-error{{background-color:#f8d7da;color:#721c24;}}.status-active,.status-queued,.status-processing_rembg,.status-processing_image,.status-saving,.status-loading_file,.status-downloading{{background-color:#d1ecf1;color:#0c5460;}}.details-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0;}}.detail-card{{background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:15px;}}.detail-label{{font-size:12px;color:#6c757d;text-transform:uppercase;margin-bottom:5px;}}.detail-value{{font-size:18px;font-weight:bold;color:#495057;}}.images-section{{margin-top:30px;}}.images-container{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;}}.image-card{{border:1px solid #dee2e6;border-radius:8px;padding:15px;background:white;}}.image-card h3{{margin-top:0;color:#495057;}}.image-card img{{max-width:100%;height:auto;border-radius:4px;border:1px solid #dee2e6;}}.no-image{{color:#6c757d;font-style:italic;text-align:center;padding:40px;background:#f8f9fa;border-radius:4px;}}.back-link{{color:#007bff;text-decoration:none;}}.back-link:hover{{text-decoration:underline;}}@media (max-width:768px){{.images-container{{grid-template-columns:1fr;}}.header{{flex-direction:column;align-items:flex-start;}}}}</style></head>
@@ -1033,7 +631,6 @@ async def job_details(request: Request, job_id: str):
         <div class="detail-card"><div class="detail-label">Source Type</div><div class="detail-value">{str(display_job_info['source_type']).title()}</div></div>
         <div class="detail-card"><div class="detail-label">Input Size</div><div class="detail-value">{format_size(display_job_info['input_size'])}</div></div>
         <div class="detail-card"><div class="detail-label">Output Size</div><div class="detail-value">{format_size(display_job_info['output_size']) if display_job_info['output_size']>0 else 'N/A'}</div></div>
-        <div class="detail-card"><div class="detail-label">Client IP</div><div class="detail-value">{client_ip}{ip_location_info}</div></div>
     </div>
     {f"<div class='detail-card' style='grid-column: span / auto;'><div class='detail-label'>Original Filename/URL</div><div class='detail-value' style='word-break:break-all;'>{display_job_info.get('original_filename', result_details.get('input_image_url','N/A'))}</div></div>" if display_job_info.get('original_filename') or result_details.get('input_image_url') else ''}
     <div class="images-section"><h2>Before & After Images</h2><div class="images-container"><div class="image-card"><h3>🔍 Original Image</h3>{f'<img src="{original_image_url}" alt="Original Image" loading="lazy">' if original_image_url else '<div class="no-image">Original image not available or not yet processed</div>'}</div><div class="image-card"><h3>✨ Processed Image</h3>{f'<img src="{processed_image_url}" alt="Processed Image" loading="lazy">' if processed_image_url else '<div class="no-image">Processed image not available or job failed/pending</div>'}</div></div></div>
@@ -1058,11 +655,6 @@ async def cleanup_old_results():
             
             for job_id in expired_jobs:
                 logger.info(f"Cleaning up old job from active results: {job_id}")
-                # Also remove from IP tracking
-                job_data = results[job_id]
-                client_ip = job_data.get("client_ip")
-                if client_ip:
-                    remove_job_from_ip_tracking(client_ip, job_id)
                 del results[job_id]
             if expired_jobs:
                 logger.info(f"Cleaned up {len(expired_jobs)} old jobs from active results dict")
@@ -1077,9 +669,9 @@ async def image_processing_worker(worker_id: int):
     logger.info(f"Worker {worker_id} started. Listening for jobs...")
     global prepared_logo_image
     while True:
-        job_id, image_source_str, model_name, _, client_ip = await queue.get()
+        job_id, image_source_str, model_name, _ = await queue.get()
         t_job_start = time.perf_counter()
-        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}, IP: {client_ip}")
+        logger.info(f"Worker {worker_id} picked up job {job_id} for source: {image_source_str}. Model: {model_name}")
         log_worker_activity(worker_id, WORKER_IDLE) # Initial state before fetch
         
         if job_id not in results: # Should not happen if enqueuing adds to results first
@@ -1135,59 +727,8 @@ async def image_processing_worker(worker_id: int):
             log_worker_activity(worker_id, WORKER_PROCESSING_REMBG); results[job_id]["status"] = "processing_rembg"
             logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
             t_rembg_start = time.perf_counter(); loop = asyncio.get_event_loop()
-            
-            # Add timeout protection for rembg processing (shorter timeout)
-            try:
-                logger.info(f"Job {job_id} (W{worker_id}): Submitting to thread pool...")
-                rembg_future = loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
-                
-                # Add periodic progress logging
-                done = False
-                start_wait = time.perf_counter()
-                while not done:
-                    try:
-                        output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=10.0)  # 10 second check intervals
-                        done = True
-                    except asyncio.TimeoutError:
-                        elapsed = time.perf_counter() - start_wait
-                        if elapsed > 45.0:  # Total timeout of 45 seconds
-                            logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after {elapsed:.1f} seconds")
-                            # Force cleanup on timeout
-                            cleanup_rembg_sessions()
-                            clear_gpu_memory()
-                            
-                            # Cancel the future
-                            rembg_future.cancel()
-                            
-                            raise RuntimeError(f"Rembg processing timed out after {elapsed:.1f} seconds for model {model_name}")
-                        else:
-                            logger.info(f"Job {job_id} (W{worker_id}): Still processing rembg... ({elapsed:.1f}s elapsed)")
-                            
-            except asyncio.CancelledError:
-                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing was cancelled")
-                cleanup_rembg_sessions()
-                clear_gpu_memory()
-                raise RuntimeError("Rembg processing was cancelled")
-            except RuntimeError as e:
-                if REMBG_EMERGENCY_CPU_FALLBACK and ("GPU" in str(e) or "timeout" in str(e).lower()):
-                    logger.warning(f"Job {job_id} (W{worker_id}): GPU rembg failed, attempting CPU fallback: {e}")
-                    # Try CPU fallback
-                    try:
-                        cleanup_rembg_sessions()  # Clear all GPU sessions
-                        clear_gpu_memory()
-                        logger.info(f"Job {job_id} (W{worker_id}): Starting CPU fallback...")
-                        cpu_future = loop.run_in_executor(cpu_executor, process_rembg_cpu_fallback, input_bytes_for_rembg, model_name)
-                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=120.0)  # 2 minute timeout for CPU
-                        logger.info(f"Job {job_id} (W{worker_id}): CPU fallback successful")
-                    except Exception as cpu_e:
-                        logger.error(f"Job {job_id} (W{worker_id}): CPU fallback also failed: {cpu_e}")
-                        raise
-                else:
-                    # For any other RuntimeError, clear sessions and re-raise
-                    cleanup_rembg_sessions()
-                    clear_gpu_memory()
-                    raise
-            
+            # process_rembg_sync now uses active_rembg_providers internally
+            output_bytes_with_alpha = await loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
             rembg_time = time.perf_counter() - t_rembg_start
             logger.info(f"Job {job_id} (W{worker_id}): Rembg done in {rembg_time:.4f}s")
 
@@ -1207,22 +748,9 @@ async def image_processing_worker(worker_id: int):
             results[job_id]["status"] = "done"
             results[job_id]["processed_path"] = processed_path
             total_job_time = time.perf_counter() - t_job_start
-            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history, client_ip)
+            add_job_to_history(job_id, "completed", total_job_time, input_size_bytes, output_size_bytes, model_name, source_type_for_history, original_fn_for_history)
             results[job_id]["completion_time"] = time.time() # For cleanup task
-            
-            # Remove completed job from IP tracking
-            remove_job_from_ip_tracking(client_ip, job_id)
-            
             logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
-            
-            # CRITICAL: Force cleanup and yield control after each job
-            cleanup_rembg_sessions()
-            clear_gpu_memory()
-            import gc
-            gc.collect()
-            
-            # Yield control back to event loop aggressively
-            await asyncio.sleep(0.5)  # Longer sleep to ensure event loop processes other requests
         
         except FileNotFoundError as e: 
             logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {e}"
@@ -1239,56 +767,19 @@ async def image_processing_worker(worker_id: int):
         finally:
             if results.get(job_id, {}).get("status") == "error":
                 total_job_time_error = time.perf_counter() - t_job_start
-                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history, client_ip)
+                add_job_to_history(job_id, "failed", total_job_time_error, input_size_bytes, 0, model_name, source_type_for_history, original_fn_for_history)
                 results[job_id]["completion_time"] = time.time() # For cleanup task
-                # Remove failed job from IP tracking
-                remove_job_from_ip_tracking(client_ip, job_id)
                 logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
             
-            # CRITICAL: Always force cleanup after each job (success or failure)
-            try:
-                cleanup_rembg_sessions()
-                clear_gpu_memory()
-                import gc
-                gc.collect()
-            except Exception as cleanup_error:
-                logger.error(f"Error during job cleanup: {cleanup_error}")
-            
             log_worker_activity(worker_id, WORKER_IDLE) # Ensure worker state is reset
-            
-            # Add longer delay to prevent event loop blocking
-            await asyncio.sleep(0.5)
-            
             queue.task_done()
-            logger.info(f"Worker {worker_id}: Job {job_id} completed, ready for next job")
-            
-            # Force yield control to event loop
-            await asyncio.sleep(0.1)
 
 @app.on_event("startup")
 async def startup_event():
     global prepared_logo_image, cpu_executor, pil_executor, active_rembg_providers
     logger.info("Application startup...")
-    
-    # Create thread pools with daemon threads for proper shutdown
-    cpu_executor = ThreadPoolExecutor(
-        max_workers=CPU_THREAD_POOL_SIZE, 
-        thread_name_prefix="RembgCPU"
-    )
-    pil_executor = ThreadPoolExecutor(
-        max_workers=PIL_THREAD_POOL_SIZE, 
-        thread_name_prefix="PILCPU"
-    )
-    
-    # Make threads daemon threads for clean shutdown
-    try:
-        for executor in [cpu_executor, pil_executor]:
-            if hasattr(executor, '_threads'):
-                for thread in executor._threads:
-                    thread.daemon = True
-    except Exception as e:
-        logger.warning(f"Could not set daemon threads: {e}")
-    
+    cpu_executor = ThreadPoolExecutor(max_workers=CPU_THREAD_POOL_SIZE, thread_name_prefix="RembgCPU")
+    pil_executor = ThreadPoolExecutor(max_workers=PIL_THREAD_POOL_SIZE, thread_name_prefix="PILCPU")
     logger.info(f"Thread pools initialized: RembgCPU Bound={CPU_THREAD_POOL_SIZE}, PILCPU Bound={PIL_THREAD_POOL_SIZE}")
 
     # Determine active_rembg_providers based on configuration
@@ -1361,15 +852,6 @@ async def startup_event():
     asyncio.create_task(cleanup_old_results()); logger.info("Background cleanup task for old job results started.")
     asyncio.create_task(system_monitor()); logger.info("System monitoring task started.")
     
-    # Start IP tracking cleanup task
-    if IP_TRACKING_ENABLED:
-        asyncio.create_task(cleanup_ip_tracking())
-        logger.info("IP tracking cleanup task started.")
-    
-    # Start GPU memory monitoring
-    asyncio.create_task(gpu_memory_monitor())
-    logger.info("GPU memory monitoring task started.")
-    
     # Initialize pynvml once at startup for get_gpu_info to use if needed without re-init/shutdown cycles
     try:
         import pynvml
@@ -1384,47 +866,25 @@ async def shutdown_event():
     global cpu_executor, pil_executor
     logger.info("Application shutdown sequence initiated...")
     
-    # First, clean up GPU sessions to free resources
-    cleanup_rembg_sessions()
-    clear_gpu_memory()
-    
-    # Force shutdown thread pools immediately
+    # Gracefully shutdown thread pools
     if cpu_executor: 
-        logger.info("Force shutting down RembgCPU thread pool...")
-        cpu_executor.shutdown(wait=False)
+        cpu_executor.shutdown(wait=True)
         logger.info("RembgCPU thread pool shut down.")
-        
     if pil_executor: 
-        logger.info("Force shutting down PILCPU thread pool...")
-        pil_executor.shutdown(wait=False)
+        pil_executor.shutdown(wait=True)
         logger.info("PILCPU thread pool shut down.")
-    
-    # Force GPU memory cleanup
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            logger.info("CUDA cache cleared")
-    except ImportError:
-        pass
-    except Exception as e:
-        logger.info(f"Error during CUDA cleanup: {e}")
     
     # Shutdown pynvml
     try:
         import pynvml
+        # Check if nvmlInit was called (e.g. by checking a flag or if a handle exists)
+        # For simplicity, just try to shut down. If not initialized, it might error or do nothing.
         pynvml.nvmlShutdown()
         logger.info("pynvml shutdown.")
     except ImportError:
         logger.info("pynvml not imported, no shutdown needed.")
-    except Exception as e:
+    except Exception as e: # Catches NVMLError if already shutdown or not init
         logger.info(f"Error during pynvml shutdown (may be benign): {e}")
-    
-    # Force garbage collection
-    import gc
-    gc.collect()
-    
     logger.info("Application shutdown complete.")
 
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
@@ -1434,7 +894,6 @@ app.mount("/originals", StaticFiles(directory=UPLOADS_DIR), name="original_image
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def root():
     stats = get_server_stats()
-    ip_stats = get_ip_stats() if IP_TRACKING_ENABLED else {"active_ips": 0, "total_ips": 0, "ips": []}
     
     logo_status = "Enabled" if ENABLE_LOGO_WATERMARK else "Disabled"
     if ENABLE_LOGO_WATERMARK and prepared_logo_image:
@@ -1459,64 +918,6 @@ async def root():
         "memory_total_gb": 0, "gpu_used_mb": 0, "gpu_total_mb": 0, "gpu_utilization": 0
     }
     
-    # Generate IP tracking section
-    ip_tracking_html = ""
-    if IP_TRACKING_ENABLED and ip_stats["ips"]:
-        ip_tracking_html = """
-        <h2 class="section-title">🌍 Active IP Addresses</h2>
-        <div class="table-responsive">
-            <table class="styled-table">
-                <thead>
-                    <tr>
-                        <th>IP Address</th>
-                        <th>Location</th>
-                        <th>Active Jobs</th>
-                        <th>Total Requests</th>
-                        <th>Last Seen</th>
-                        <th>Active Job IDs</th>
-                    </tr>
-                </thead>
-                <tbody>"""
-        
-        for ip_info in ip_stats["ips"][:20]:  # Show top 20 IPs
-            location = ip_info.get("location", {})
-            location_str = "Unknown"
-            if location:
-                location_parts = []
-                if location.get("city"): location_parts.append(location["city"])
-                if location.get("region"): location_parts.append(location["region"])
-                if location.get("country"): location_parts.append(location["country"])
-                if location_parts:
-                    location_str = ", ".join(location_parts)
-                elif location.get("country_code"):
-                    location_str = location["country_code"]
-            
-            # Format job IDs
-            job_ids_display = ", ".join([job_id[:8] + "..." for job_id in ip_info["job_ids"][:3]])
-            if len(ip_info["job_ids"]) > 3:
-                job_ids_display += f" (+{len(ip_info['job_ids']) - 3} more)"
-            
-            last_seen_str = format_timestamp(ip_info["last_seen"])
-            
-            ip_tracking_html += f"""
-                    <tr>
-                        <td><code>{ip_info['ip']}</code></td>
-                        <td>{location_str}</td>
-                        <td><span class="badge active-jobs">{ip_info['active_jobs']}</span></td>
-                        <td>{ip_info['total_requests']}</td>
-                        <td>{last_seen_str}</td>
-                        <td class="job-ids">{job_ids_display if job_ids_display else 'None'}</td>
-                    </tr>"""
-        
-        ip_tracking_html += """
-                </tbody>
-            </table>
-        </div>"""
-    elif IP_TRACKING_ENABLED:
-        ip_tracking_html = """
-        <h2 class="section-title">🌍 Active IP Addresses</h2>
-        <p>No active IP addresses currently.</p>"""
-    
     recent_jobs_html = "<h3>Recent Jobs</h3>"
     if stats["recent_jobs"]:
         recent_jobs_html += """
@@ -1532,7 +933,6 @@ async def root():
                         <th>Output</th>
                         <th>Model</th>
                         <th>Source</th>
-                        <th>IP Address</th>
                         <th>Filename</th>
                     </tr>
                 </thead>
@@ -1542,12 +942,8 @@ async def root():
             status_class = "status-completed" if job["status"] == "completed" else "status-failed"
             job_link = f"/job/{job['job_id']}"
             orig_fn_display = job.get('original_filename', '')
-            if len(orig_fn_display) > 25: # Truncate long filenames
-                orig_fn_display = orig_fn_display[:12] + "..." + orig_fn_display[-10:]
-            
-            ip_display = job.get('ip_address', 'unknown')
-            if len(ip_display) > 15:  # Truncate long IPs if needed
-                ip_display = ip_display[:12] + "..."
+            if len(orig_fn_display) > 30: # Truncate long filenames
+                orig_fn_display = orig_fn_display[:15] + "..." + orig_fn_display[-12:]
 
             recent_jobs_html += f"""
                     <tr onclick="window.location.href='{job_link}'" style="cursor:pointer;">
@@ -1559,7 +955,6 @@ async def root():
                         <td>{format_size(job['output_size']) if job['output_size'] > 0 else 'N/A'}</td>
                         <td>{job['model']}</td>
                         <td>{job['source_type']}</td>
-                        <td><code class="ip-code">{ip_display}</code></td>
                         <td title="{job.get('original_filename', '')}">{orig_fn_display}</td>
                     </tr>"""
         recent_jobs_html += """
@@ -1639,13 +1034,13 @@ async def root():
             box-shadow: 0 4px 8px rgba(0,0,0,0.08);
         }}
         .stat-value, .metric-value {{
-            font-size: 1.8em;
+            font-size: 1.8em; /* Slightly reduced for better fit */
             font-weight: 700;
             margin-bottom: 8px;
             color: #007bff;
         }}
         .stat-label, .metric-label {{
-            font-size: 0.90em;
+            font-size: 0.90em; /* Slightly reduced */
             color: #6c757d;
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -1654,6 +1049,7 @@ async def root():
         .metric-card .cpu {{ color: #dc3545; }}
         .metric-card .memory {{ color: #fd7e14; }}
         .metric-card .gpu {{ color: #6f42c1; }}
+
 
         .charts-container {{
             display: grid;
@@ -1690,22 +1086,23 @@ async def root():
             font-size: 0.95em;
         }}
         .config-list li {{
-            padding: 10px 0;
+            padding: 10px 0; /* Increased padding */
             border-bottom: 1px solid #e9ecef;
-            display: flex;
-            justify-content: space-between;
+            display: flex; /* For alignment */
+            justify-content: space-between; /* For alignment */
         }}
         .config-list li:last-child {{
             border-bottom: none;
         }}
         .config-list strong {{
             color: #0056b3;
-            margin-right: 10px;
+            margin-right: 10px; /* Spacing */
         }}
-        .config-list span {{
+        .config-list span {{ /* Value part */
             text-align: right;
-            word-break: break-all;
+            word-break: break-all; /* For long provider lists */
         }}
+
 
         .debug-info {{
             background: #e9ecef;
@@ -1744,10 +1141,10 @@ async def root():
         .styled-table th, .styled-table td {{
             padding: 12px 15px;
             border-bottom: 1px solid #dddddd;
-            white-space: nowrap;
+            white-space: nowrap; /* Prevent text wrapping in cells */
         }}
-         .styled-table td:nth-last-child(1) {{
-            white-space: normal;
+         .styled-table td:nth-child(9) {{ /* Last column (Filename) */
+            white-space: normal; /* Allow filename to wrap if very long */
             word-break: break-all;
         }}
         .styled-table tbody tr {{
@@ -1778,7 +1175,7 @@ async def root():
             font-weight: bold;
             text-transform: uppercase;
             color: white;
-            display: inline-block;
+            display: inline-block; /* Ensures proper padding */
         }}
         .status-badge.status-completed {{ background-color: #28a745; }}
         .status-badge.status-failed {{ background-color: #dc3545; }}
@@ -1789,32 +1186,6 @@ async def root():
         .status-badge.status-saving, .status-badge.status-loading_file, 
         .status-badge.status-downloading, .status-badge.status-fetching_input {{ background-color: #ffc107; color: #212529;}} 
 
-        .badge {{
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 0.8em;
-            font-weight: bold;
-            display: inline-block;
-        }}
-        .badge.active-jobs {{
-            background-color: #007bff;
-            color: white;
-        }}
-        
-        .ip-code {{
-            font-family: monospace;
-            font-size: 0.9em;
-            background-color: #f8f9fa;
-            padding: 2px 4px;
-            border-radius: 3px;
-        }}
-        
-        .job-ids {{
-            font-family: monospace;
-            font-size: 0.85em;
-            max-width: 200px;
-            word-break: break-all;
-        }}
 
         .footer {{
             text-align: center;
@@ -1834,7 +1205,7 @@ async def root():
         }}
         @media (max-width: 768px) {{
             .stats-grid, .system-metrics {{
-                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); /* Adjusted minmax */
             }}
             .stat-value, .metric-value {{ font-size: 1.5em; }}
             .container {{ padding: 15px; margin: 15px; }}
@@ -1875,14 +1246,6 @@ async def root():
                 <div class="stat-value">{stats['avg_processing_time']:.2f}s</div>
                 <div class="stat-label">Avg Process Time</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value">{ip_stats['active_ips']}</div>
-                <div class="stat-label">Active IPs</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value">{ip_stats['total_ips']}</div>
-                <div class="stat-label">Total IPs Seen</div>
-            </div>
         </div>
 
         <h2 class="section-title">📊 Real-time Monitoring</h2>
@@ -1917,8 +1280,6 @@ async def root():
             </div>
         </div>
 
-        {ip_tracking_html}
-
         <h2 class="section-title">⚙️ Configuration & Debug</h2>
         <ul class="config-list">
             <li><strong>Async Workers:</strong> <span>{MAX_CONCURRENT_TASKS}</span></li>
@@ -1930,8 +1291,6 @@ async def root():
             <li><strong>Preferred GPU Providers (Config):</strong> <span>{str(REMBG_PREFERRED_GPU_PROVIDERS)}</span></li>
             <li><strong>Active Rembg Providers (Runtime):</strong> <span style="font-weight:bold;">{str(active_rembg_providers)}</span></li>
             <li><strong>GPU Monitoring (pynvml):</strong> <span>{current_metrics['gpu_total_mb']} MB total {'(Active)' if current_metrics['gpu_total_mb'] > 0 else '(Not detected/NVIDIA pynvml required)'}</span></li>
-            <li><strong>IP Tracking:</strong> <span style="font-weight:bold; color: { 'green' if IP_TRACKING_ENABLED else 'orange' };">{'Enabled' if IP_TRACKING_ENABLED else 'Disabled'}</span></li>
-            <li><strong>Geolocation Lookup:</strong> <span style="font-weight:bold; color: { 'green' if ENABLE_GEOLOCATION else 'orange' };">{'Enabled' if ENABLE_GEOLOCATION else 'Disabled'}</span></li>
         </ul>
         
         <div class="debug-info">
@@ -1939,7 +1298,6 @@ async def root():
             <p><a href="/api/debug/gpu" target="_blank">Check GPU/ONNXRT Detection Status & Rembg Provider Config</a></p>
             <p><a href="/api/monitoring/workers" target="_blank">View Raw Worker Data (JSON)</a></p>
             <p><a href="/api/monitoring/system" target="_blank">View Raw System Data (JSON)</a></p>
-            <p><a href="/api/monitoring/ips" target="_blank">View Raw IP Tracking Data (JSON)</a></p>
         </div>
 
         <h2 class="section-title">📋 Job History (Last {MAX_HISTORY_ITEMS})</h2>
@@ -2053,46 +1411,7 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    import signal
-    import sys
-    import os
-    
-    def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, initiating immediate shutdown...")
-        cleanup_rembg_sessions()
-        clear_gpu_memory()
-        
-        # Force exit
-        logger.info("Force exiting...")
-        os._exit(0)
-    
-    # Register signal handlers for immediate shutdown
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
+    # Recommended: set UVICORN_LOG_LEVEL=warning or error for cleaner console in dev
+    # uvicorn.run("your_module_name:app", host="0.0.0.0", port=7000, reload=True) # if running with uvicorn CLI
     logger.info("Starting Uvicorn server for local development on http://0.0.0.0:7000 ...")
-    
-    try:
-        uvicorn.run(
-            app, 
-            host="0.0.0.0", 
-            port=7000,
-            # Configure for immediate shutdown
-            loop="asyncio",
-            access_log=False,  # Reduce logging overhead
-            timeout_keep_alive=5,  # Shorter keepalive
-            timeout_graceful_shutdown=2,  # Very short graceful shutdown
-        )
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received, cleaning up...")
-        cleanup_rembg_sessions()
-        clear_gpu_memory()
-        os._exit(0)  # Force exit
-    except Exception as e:
-        logger.error(f"Server error: {e}")
-        cleanup_rembg_sessions()
-        clear_gpu_memory()
-        os._exit(1)  # Force exit with error code
-    finally:
-        logger.info("Server shutdown complete")
-        os._exit(0)  # Ensure we always exit
+    uvicorn.run(app, host="0.0.0.0", port=7000)
