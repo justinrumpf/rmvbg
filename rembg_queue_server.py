@@ -134,6 +134,36 @@ WORKER_PROCESSING_REMBG = "rembg"
 WORKER_PROCESSING_PIL = "pil"
 WORKER_SAVING = "saving"
 
+def get_requester_ip(request: Request) -> str:
+    """
+    Retrieves the client's IP address.
+    Prioritizes X-Forwarded-For header if present, assuming the first IP in the list
+    is the original client. Falls back to request.client.host.
+
+    Note: For robust proxy handling, configure Uvicorn's `forwarded_allow_ips`
+    with the IP(s) of your trusted reverse proxy/proxies (e.g., '127.0.0.1' if proxy is on localhost).
+    If `forwarded_allow_ips` is correctly configured, `request.client.host`
+    should already reflect the true client IP parsed from X-Forwarded-For.
+    This function provides an additional application-level check which is common.
+    """
+    x_forwarded_for = request.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        # X-Forwarded-For can be a comma-separated list of IPs (client, proxy1, proxy2, ...).
+        # The first one is generally the original client.
+        client_ip = x_forwarded_for.split(',')[0].strip()
+        # It's good practice to log which IP source is being used, especially during setup.
+        logger.debug(f"Derived client IP from X-Forwarded-For: {client_ip} (Full header: '{x_forwarded_for}')")
+        return client_ip
+    
+    if request.client and request.client.host:
+        client_ip = request.client.host
+        logger.debug(f"Using client IP from request.client.host: {client_ip}")
+        return client_ip
+        
+    logger.warning("Could not determine client IP from X-Forwarded-For or request.client.host. Using 'unknown_client'.")
+    return "unknown_client"
+
+
 def log_worker_activity(worker_id: int, activity: str):
     with worker_lock:
         worker_activity[worker_id].append((time.time(), activity))
@@ -263,35 +293,7 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
-def get_requester_ip(request: Request) -> str:
-    """
-    Retrieves the client's IP address.
-    Prioritizes X-Forwarded-For header if present, assuming the first IP in the list
-    is the original client. Falls back to request.client.host.
 
-    Note: For robust proxy handling, configure Uvicorn's `forwarded_allow_ips`
-    with the IP(s) of your trusted reverse proxy/proxies (e.g., '127.0.0.1' if proxy is on localhost).
-    If `forwarded_allow_ips` is correctly configured, `request.client.host`
-    should already reflect the true client IP parsed from X-Forwarded-For.
-    This function provides an additional application-level check which is common.
-    """
-    x_forwarded_for = request.headers.get("x-forwarded-for")
-    if x_forwarded_for:
-        # X-Forwarded-For can be a comma-separated list of IPs (client, proxy1, proxy2, ...).
-        # The first one is generally the original client.
-        client_ip = x_forwarded_for.split(',')[0].strip()
-        # It's good practice to log which IP source is being used, especially during setup.
-        logger.debug(f"Derived client IP from X-Forwarded-For: {client_ip} (Full header: '{x_forwarded_for}')")
-        return client_ip
-    
-    if request.client and request.client.host:
-        client_ip = request.client.host
-        logger.debug(f"Using client IP from request.client.host: {client_ip}")
-        return client_ip
-        
-    logger.warning("Could not determine client IP from X-Forwarded-For or request.client.host. Using 'unknown_client'.")
-    return "unknown_client"
-    
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     global active_rembg_providers
     session_wrapper = None 
