@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X2---
+# --- CREATE DIRECTORIES AT THE VERY TOP X3---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -92,9 +92,9 @@ MONITORING_HISTORY_MINUTES = 60
 MONITORING_SAMPLE_INTERVAL = 5
 MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
 
-# Thread pool configuration
-CPU_THREAD_POOL_SIZE = 4
-PIL_THREAD_POOL_SIZE = 4
+# Thread pool configuration - Make them daemon threads for proper shutdown
+CPU_THREAD_POOL_SIZE = 2  # Reduced further
+PIL_THREAD_POOL_SIZE = 2  # Reduced further
 
 ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
@@ -451,6 +451,27 @@ def get_worker_activity_data():
 
 def get_system_metrics_data(): return list(system_metrics)
 
+def cleanup_rembg_sessions():
+    """Clean up all cached rembg sessions to free GPU memory."""
+    global rembg_session_cache
+    with session_lock:
+        if rembg_session_cache:
+            logger.info(f"Cleaning up {len(rembg_session_cache)} cached rembg sessions")
+            for model_name in list(rembg_session_cache.keys()):
+                try:
+                    session = rembg_session_cache[model_name]
+                    # Try to explicitly cleanup session if it has cleanup methods
+                    if hasattr(session, 'close'):
+                        session.close()
+                    elif hasattr(session, '__del__'):
+                        session.__del__()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up session for {model_name}: {e}")
+                finally:
+                    del rembg_session_cache[model_name]
+            rembg_session_cache.clear()
+            logger.info("All rembg sessions cleaned up")
+
 def get_or_create_rembg_session(model_name: str):
     """Get cached rembg session or create new one. Thread-safe."""
     global rembg_session_cache, active_rembg_providers
@@ -525,6 +546,12 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
         with session_lock:
             if model_name in rembg_session_cache:
                 logger.info(f"Clearing cached session for model '{model_name}' due to error")
+                try:
+                    session = rembg_session_cache[model_name]
+                    if hasattr(session, 'close'):
+                        session.close()
+                except:
+                    pass
                 del rembg_session_cache[model_name]
         
         raise RuntimeError(error_msg)
@@ -1012,8 +1039,22 @@ async def image_processing_worker(worker_id: int):
 async def startup_event():
     global prepared_logo_image, cpu_executor, pil_executor, active_rembg_providers
     logger.info("Application startup...")
-    cpu_executor = ThreadPoolExecutor(max_workers=CPU_THREAD_POOL_SIZE, thread_name_prefix="RembgCPU")
-    pil_executor = ThreadPoolExecutor(max_workers=PIL_THREAD_POOL_SIZE, thread_name_prefix="PILCPU")
+    
+    # Create thread pools with daemon threads for proper shutdown
+    cpu_executor = ThreadPoolExecutor(
+        max_workers=CPU_THREAD_POOL_SIZE, 
+        thread_name_prefix="RembgCPU"
+    )
+    pil_executor = ThreadPoolExecutor(
+        max_workers=PIL_THREAD_POOL_SIZE, 
+        thread_name_prefix="PILCPU"
+    )
+    
+    # Make threads daemon threads for clean shutdown
+    for executor in [cpu_executor, pil_executor]:
+        for thread in executor._threads:
+            thread.daemon = True
+    
     logger.info(f"Thread pools initialized: RembgCPU Bound={CPU_THREAD_POOL_SIZE}, PILCPU Bound={PIL_THREAD_POOL_SIZE}")
 
     # Determine active_rembg_providers based on configuration
@@ -1105,25 +1146,56 @@ async def shutdown_event():
     global cpu_executor, pil_executor
     logger.info("Application shutdown sequence initiated...")
     
-    # Gracefully shutdown thread pools
+    # First, clean up GPU sessions to free resources
+    cleanup_rembg_sessions()
+    
+    # Force shutdown thread pools with timeout
     if cpu_executor: 
-        cpu_executor.shutdown(wait=True)
+        logger.info("Shutting down RembgCPU thread pool...")
+        cpu_executor.shutdown(wait=False)  # Don't wait indefinitely
+        # Give it 5 seconds, then force
+        import concurrent.futures
+        try:
+            concurrent.futures.as_completed([], timeout=5)
+        except:
+            pass
         logger.info("RembgCPU thread pool shut down.")
+        
     if pil_executor: 
-        pil_executor.shutdown(wait=True)
+        logger.info("Shutting down PILCPU thread pool...")
+        pil_executor.shutdown(wait=False)  # Don't wait indefinitely
+        try:
+            concurrent.futures.as_completed([], timeout=5)
+        except:
+            pass
         logger.info("PILCPU thread pool shut down.")
+    
+    # Force GPU memory cleanup
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("CUDA cache cleared")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.info(f"Error during CUDA cleanup: {e}")
     
     # Shutdown pynvml
     try:
         import pynvml
-        # Check if nvmlInit was called (e.g. by checking a flag or if a handle exists)
-        # For simplicity, just try to shut down. If not initialized, it might error or do nothing.
         pynvml.nvmlShutdown()
         logger.info("pynvml shutdown.")
     except ImportError:
         logger.info("pynvml not imported, no shutdown needed.")
-    except Exception as e: # Catches NVMLError if already shutdown or not init
+    except Exception as e:
         logger.info(f"Error during pynvml shutdown (may be benign): {e}")
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+    
     logger.info("Application shutdown complete.")
 
 app.mount("/images", StaticFiles(directory=PROCESSED_DIR), name="processed_images")
@@ -1752,7 +1824,36 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    # Recommended: set UVICORN_LOG_LEVEL=warning or error for cleaner console in dev
-    # uvicorn.run("your_module_name:app", host="0.0.0.0", port=7000, reload=True) # if running with uvicorn CLI
+    import signal
+    import sys
+    
+    def signal_handler(signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        cleanup_rembg_sessions()
+        sys.exit(0)
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     logger.info("Starting Uvicorn server for local development on http://0.0.0.0:7000 ...")
-    uvicorn.run(app, host="0.0.0.0", port=7000)
+    
+    try:
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=7000,
+            # Add these for better shutdown behavior
+            loop="asyncio",
+            access_log=False,  # Reduce logging overhead
+            timeout_keep_alive=30,
+            timeout_graceful_shutdown=10
+        )
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, cleaning up...")
+        cleanup_rembg_sessions()
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        cleanup_rembg_sessions()
+    finally:
+        logger.info("Server shutdown complete")
