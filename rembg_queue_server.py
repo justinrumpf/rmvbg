@@ -16,7 +16,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X3---
+# --- CREATE DIRECTORIES AT THE VERY TOP X99---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -65,7 +65,7 @@ app.add_middleware(
 )
 
 # --- Configuration Constants ---
-MAX_CONCURRENT_TASKS = 2  # Reduced from 8 to prevent GPU memory issues
+MAX_CONCURRENT_TASKS = 1  # Force single worker to prevent GPU conflicts
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
@@ -363,7 +363,34 @@ def get_gpu_info():
     return gpu_data
 
 
-async def system_monitor():
+async def gpu_memory_monitor():
+    """Monitor and cleanup GPU memory periodically."""
+    while True:
+        try:
+            # Check GPU memory every 30 seconds (more frequent)
+            await asyncio.sleep(30)
+            
+            gpu_info = get_gpu_info()
+            gpu_usage_percent = (gpu_info["gpu_used_mb"] / max(gpu_info["gpu_total_mb"], 1)) * 100
+            
+            # If GPU memory usage > 70%, cleanup sessions (lower threshold)
+            if gpu_usage_percent > 70:
+                logger.warning(f"High GPU memory usage: {gpu_usage_percent:.1f}%, cleaning up sessions")
+                cleanup_rembg_sessions()
+                clear_gpu_memory()
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Log after cleanup
+                gpu_info_after = get_gpu_info()
+                gpu_usage_after = (gpu_info_after["gpu_used_mb"] / max(gpu_info_after["gpu_total_mb"], 1)) * 100
+                logger.info(f"GPU memory after cleanup: {gpu_usage_after:.1f}%")
+                
+        except Exception as e:
+            logger.error(f"Error in GPU memory monitor: {e}")
+
     while True:
         try:
             cpu_percent = psutil.cpu_percent(interval=1)
@@ -492,6 +519,32 @@ def get_or_create_rembg_session(model_name: str):
         logger.info(f"Cached new rembg session for model: {model_name}")
         return session_wrapper
 
+def clear_gpu_memory():
+    """Force clear GPU memory cache."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.debug("GPU memory cache cleared")
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"Error clearing GPU memory: {e}")
+
+def check_gpu_memory_pressure() -> bool:
+    """Check if GPU memory usage is too high."""
+    try:
+        gpu_info = get_gpu_info()
+        if gpu_info["gpu_total_mb"] > 0:
+            usage_percent = (gpu_info["gpu_used_mb"] / gpu_info["gpu_total_mb"]) * 100
+            if usage_percent > 85:  # If >85% memory used
+                logger.warning(f"High GPU memory pressure: {usage_percent:.1f}%")
+                return True
+    except Exception as e:
+        logger.warning(f"Error checking GPU memory pressure: {e}")
+    return False
+
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     """
     Synchronous rembg processing - runs in thread pool.
@@ -501,6 +554,14 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     
     try:
         logger.info(f"Rembg: Starting processing for model '{model_name}' (input size: {len(input_bytes)} bytes)")
+        
+        # Check memory pressure before processing
+        if check_gpu_memory_pressure():
+            logger.warning("High GPU memory pressure detected, clearing cache...")
+            cleanup_rembg_sessions()
+            clear_gpu_memory()
+            import gc
+            gc.collect()
         
         # Get or create session (with caching for GPU efficiency)
         session_wrapper = get_or_create_rembg_session(model_name)
@@ -535,6 +596,9 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
         
         processing_time = time.perf_counter() - start_time
         logger.info(f"Rembg: Processing completed in {processing_time:.3f}s (output size: {len(output_bytes)} bytes)")
+        
+        # Clear GPU memory after processing to prevent fragmentation
+        clear_gpu_memory()
         
         return output_bytes
         
@@ -959,29 +1023,33 @@ async def image_processing_worker(worker_id: int):
             logger.info(f"Job {job_id} (W{worker_id}): Starting rembg (model: {model_name})...")
             t_rembg_start = time.perf_counter(); loop = asyncio.get_event_loop()
             
-            # Add timeout protection for rembg processing
+            # Add timeout protection for rembg processing (shorter timeout)
             try:
                 rembg_future = loop.run_in_executor(cpu_executor, process_rembg_sync, input_bytes_for_rembg, model_name)
-                output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=120.0)  # 2 minute timeout
+                output_bytes_with_alpha = await asyncio.wait_for(rembg_future, timeout=60.0)  # Reduced to 60 seconds
             except asyncio.TimeoutError:
-                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after 120 seconds")
-                raise RuntimeError(f"Rembg processing timed out after 120 seconds for model {model_name}")
+                logger.error(f"Job {job_id} (W{worker_id}): Rembg processing timed out after 60 seconds")
+                # Force cleanup on timeout
+                cleanup_rembg_sessions()
+                clear_gpu_memory()
+                raise RuntimeError(f"Rembg processing timed out after 60 seconds for model {model_name}")
             except RuntimeError as e:
                 if REMBG_EMERGENCY_CPU_FALLBACK and "GPU" in str(e):
                     logger.warning(f"Job {job_id} (W{worker_id}): GPU rembg failed, attempting CPU fallback: {e}")
                     # Try CPU fallback
                     try:
-                        with session_lock:
-                            # Clear GPU session cache and create CPU session
-                            if model_name in rembg_session_cache:
-                                del rembg_session_cache[model_name]
+                        cleanup_rembg_sessions()  # Clear all GPU sessions
+                        clear_gpu_memory()
                         cpu_future = loop.run_in_executor(cpu_executor, process_rembg_cpu_fallback, input_bytes_for_rembg, model_name)
-                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=300.0)  # 5 minute timeout for CPU
+                        output_bytes_with_alpha = await asyncio.wait_for(cpu_future, timeout=180.0)  # 3 minute timeout for CPU
                         logger.info(f"Job {job_id} (W{worker_id}): CPU fallback successful")
                     except Exception as cpu_e:
                         logger.error(f"Job {job_id} (W{worker_id}): CPU fallback also failed: {cpu_e}")
                         raise
                 else:
+                    # For any other RuntimeError, clear sessions and re-raise
+                    cleanup_rembg_sessions()
+                    clear_gpu_memory()
                     raise
             
             rembg_time = time.perf_counter() - t_rembg_start
@@ -1131,6 +1199,10 @@ async def startup_event():
     if IP_TRACKING_ENABLED:
         asyncio.create_task(cleanup_ip_tracking())
         logger.info("IP tracking cleanup task started.")
+    
+    # Start GPU memory monitoring
+    asyncio.create_task(gpu_memory_monitor())
+    logger.info("GPU memory monitoring task started.")
     
     # Initialize pynvml once at startup for get_gpu_info to use if needed without re-init/shutdown cycles
     try:
