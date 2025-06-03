@@ -1,4 +1,62 @@
-import asyncio
+@app.on_event("shutdown")
+async def shutdown_event():
+    global cpu_executor, pil_executor
+    logger.info("Application shutdown sequence initiated...")
+    
+    # First, clean up GPU sessions to free resources 7
+    cleanup_rembg_sessions()
+    clear_gpu_memory()
+    
+    # Force shutdown thread pools with immediate termination
+    shutdown_timeout = 3  # Very short timeout
+    
+    if cpu_executor: 
+        logger.info("Shutting down RembgCPU thread pool...")
+        cpu_executor.shutdown(wait=False)  # Don't wait
+        
+        # Force terminate threads if they don't shutdown
+        if hasattr(cpu_executor, '_threads'):
+            import time
+            start_time = time.time()
+            while cpu_executor._threads and (time.time() - start_time) < shutdown_timeout:
+                time.sleep(0.1)
+            
+            # Force kill remaining threads
+            if cpu_executor._threads:
+                logger.warning(f"Force terminating {len(cpu_executor._threads)} hanging CPU threads")
+                for thread in list(cpu_executor._threads):
+                    if thread.is_alive():
+                        # This is aggressive but necessary for hanging threads
+                        import ctypes
+                        thread_id = thread.ident
+                        if thread_id:
+                            try:
+                                ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, ctypes.py_object(SystemExit))
+                                logger.info(f"Force terminated thread {thread.name}")
+                            except:
+                                pass
+        logger.info("RembgCPU thread pool shut down.")
+        
+    if pil_executor: 
+        logger.info("Shutting down PILCPU thread pool...")
+        pil_executor.shutdown(wait=False)  # Don't wait
+        
+        # Force terminate threads if they don't shutdown
+        if hasattr(pil_executor, '_threads'):
+            start_time = time.time()
+            while pil_executor._threads and (time.time() - start_time) < shutdown_timeout:
+                time.sleep(0.1)
+            
+            # Force kill remaining threads
+            if pil_executor._threads:
+                logger.warning(f"Force terminating {len(pil_executor._threads)} hanging PIL threads")
+                for thread in list(pil_executor._threads):
+                    if thread.is_alive():
+                        import ctypes
+                        thread_id = thread.ident
+                        if thread_id:
+                            try:
+                                ctimport asyncio
 import uuid
 import io
 import os
@@ -16,7 +74,7 @@ from functools import partial
 from datetime import datetime, timedelta
 from typing import Dict, List
 
-# --- CREATE DIRECTORIES AT THE VERY TOP X6---
+# --- CREATE DIRECTORIES AT THE VERY TOP X99---
 UPLOADS_DIR_STATIC = "/workspace/uploads"
 PROCESSED_DIR_STATIC = "/workspace/processed"
 BASE_DIR_STATIC = "/workspace/rmvbg"
@@ -1156,6 +1214,15 @@ async def image_processing_worker(worker_id: int):
             remove_job_from_ip_tracking(client_ip, job_id)
             
             logger.info(f"Job {job_id} (W{worker_id}) COMPLETED in {total_job_time:.4f}s. Input: {format_size(input_size_bytes)} -> Output: {format_size(output_size_bytes)}. Breakdown: Fetch={input_fetch_time:.3f}s, Rembg={rembg_time:.3f}s, PIL={pil_time:.3f}s, Save={save_time:.3f}s")
+            
+            # CRITICAL: Force cleanup and yield control after each job
+            cleanup_rembg_sessions()
+            clear_gpu_memory()
+            import gc
+            gc.collect()
+            
+            # Yield control back to event loop aggressively
+            await asyncio.sleep(0.5)  # Longer sleep to ensure event loop processes other requests
         
         except FileNotFoundError as e: 
             logger.error(f"Job {job_id} (W{worker_id}) Error: FileNotFoundError: {e}", exc_info=False); results[job_id]["status"] = "error"; results[job_id]["error_message"] = f"File not found: {e}"
@@ -1178,18 +1245,25 @@ async def image_processing_worker(worker_id: int):
                 remove_job_from_ip_tracking(client_ip, job_id)
                 logger.info(f"Job {job_id} (W{worker_id}) FAILED after {total_job_time_error:.4f}s. Error: {results[job_id].get('error_message', 'Unknown error')}")
             
-            # Force cleanup after each job to prevent accumulation
-            clear_gpu_memory()
-            import gc
-            gc.collect()
+            # CRITICAL: Always force cleanup after each job (success or failure)
+            try:
+                cleanup_rembg_sessions()
+                clear_gpu_memory()
+                import gc
+                gc.collect()
+            except Exception as cleanup_error:
+                logger.error(f"Error during job cleanup: {cleanup_error}")
             
             log_worker_activity(worker_id, WORKER_IDLE) # Ensure worker state is reset
             
-            # Add small delay to prevent rapid-fire processing that can cause deadlocks
-            await asyncio.sleep(0.1)
+            # Add longer delay to prevent event loop blocking
+            await asyncio.sleep(0.5)
             
             queue.task_done()
             logger.info(f"Worker {worker_id}: Job {job_id} completed, ready for next job")
+            
+            # Force yield control to event loop
+            await asyncio.sleep(0.1)
 
 @app.on_event("startup")
 async def startup_event():
@@ -1312,26 +1386,17 @@ async def shutdown_event():
     
     # First, clean up GPU sessions to free resources
     cleanup_rembg_sessions()
+    clear_gpu_memory()
     
-    # Force shutdown thread pools with timeout
+    # Force shutdown thread pools immediately
     if cpu_executor: 
-        logger.info("Shutting down RembgCPU thread pool...")
-        cpu_executor.shutdown(wait=False)  # Don't wait indefinitely
-        # Give it 5 seconds, then force
-        import concurrent.futures
-        try:
-            concurrent.futures.as_completed([], timeout=5)
-        except:
-            pass
+        logger.info("Force shutting down RembgCPU thread pool...")
+        cpu_executor.shutdown(wait=False)
         logger.info("RembgCPU thread pool shut down.")
         
     if pil_executor: 
-        logger.info("Shutting down PILCPU thread pool...")
-        pil_executor.shutdown(wait=False)  # Don't wait indefinitely
-        try:
-            concurrent.futures.as_completed([], timeout=5)
-        except:
-            pass
+        logger.info("Force shutting down PILCPU thread pool...")
+        pil_executor.shutdown(wait=False)
         logger.info("PILCPU thread pool shut down.")
     
     # Force GPU memory cleanup
@@ -1990,13 +2055,18 @@ if __name__ == "__main__":
     import uvicorn
     import signal
     import sys
+    import os
     
     def signal_handler(signum, frame):
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        logger.info(f"Received signal {signum}, initiating immediate shutdown...")
         cleanup_rembg_sessions()
-        sys.exit(0)
+        clear_gpu_memory()
+        
+        # Force exit
+        logger.info("Force exiting...")
+        os._exit(0)
     
-    # Register signal handlers for graceful shutdown
+    # Register signal handlers for immediate shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
@@ -2007,17 +2077,22 @@ if __name__ == "__main__":
             app, 
             host="0.0.0.0", 
             port=7000,
-            # Add these for better shutdown behavior
+            # Configure for immediate shutdown
             loop="asyncio",
             access_log=False,  # Reduce logging overhead
-            timeout_keep_alive=30,
-            timeout_graceful_shutdown=10
+            timeout_keep_alive=5,  # Shorter keepalive
+            timeout_graceful_shutdown=2,  # Very short graceful shutdown
         )
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received, cleaning up...")
         cleanup_rembg_sessions()
+        clear_gpu_memory()
+        os._exit(0)  # Force exit
     except Exception as e:
         logger.error(f"Server error: {e}")
         cleanup_rembg_sessions()
+        clear_gpu_memory()
+        os._exit(1)  # Force exit with error code
     finally:
         logger.info("Server shutdown complete")
+        os._exit(0)  # Ensure we always exit
