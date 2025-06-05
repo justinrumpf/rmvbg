@@ -3,7 +3,7 @@
 set -e
 
 echo "🔧 Updating system packages..."
-apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip cuda-libraries-12-0 nano
+apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip nano
 
 cd /workspace
 
