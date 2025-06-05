@@ -27,8 +27,9 @@
     ```
 
     This script will install the necessary dependencies and configure the RemBG server.
+    The current server install is based upon a server with this setup: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04 You may need to install different driver versions for this tuff depending on your versions. 
 
-3.  **Access the web server:** After the installation completes, your web server should be running. You can access the landing page by navigating to port 7000 (as specified in the code) in your web browser. Example: `http://your_server_ip:7000`.
+4.  **Access the web server:** After the installation completes, your web server should be running. You can access the landing page by navigating to port 7000 (as specified in the code) in your web browser. Example: `http://your_server_ip:7000`.
 
 ## Managing the Web Server Session (Using tmux)
 
