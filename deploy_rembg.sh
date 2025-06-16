@@ -46,4 +46,9 @@ source venv/bin/activate && \
 uvicorn rembg_queue_server:app --host 0.0.0.0 --port 7000
 "
 
+# PUT to resale.one to make sure that the server url is up-to-date in ShopifySiteConfig
+curl --location --request PUT "https://resale.one/api/services/app/ShopifySiteConfig/UpdateRemBGURL?ApiKey=RemBGAPIKey&RemBGURL=https%3A%2F%2F${RUNPOD_POD_ID}-7000.proxy.runpod.net%2Fsubmit" \
+--header "Content-Type: application/json" \
+--data "{}"
+
 echo "✅ Done! Your Rembg server is now running at: $proxy_url"
