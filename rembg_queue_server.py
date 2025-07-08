@@ -73,7 +73,7 @@ DEFAULT_MODEL_NAME = "birefnet"
 
 # --- GPU Configuration for Rembg ---
 REMBG_USE_GPU = True
-REMBG_PREFERRED_GPU_PROVIDERS = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'DmlExecutionProvider']
+REMBG_PREFERRED_GPU_PROVIDERS = ['CUDAExecutionProvider', 'DmlExecutionProvider']
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
 
