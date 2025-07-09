@@ -1408,7 +1408,7 @@ async def root():
                 plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 12, padding: 15 }} }} }},
                 scales: {{
                     y: {{ beginAtZero: true, title: {{ display: true, text: yLabel }} }},
-                    x: {{ title: {{ display: true, text: xLabel }}, ticks: {{ autoSkip: true, maxTicksLimit: 12, maxRotation: 0, minRotation: 0 }} }}
+                    x: {{ title: {{ display: true, text: xLabel }}, ticks: {{ autoSkip: true, maxTicksLimit: 12, maxRotation: 45, minRotation: 45 }} }}
                 }},
                 elements: {{ line: {{ tension: 0.25 }}, point: {{ radius: 1.5 }} }},
                 animation: {{ duration: 400, easing: 'easeInOutQuad' }}
