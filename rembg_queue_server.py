@@ -65,7 +65,7 @@ app.add_middleware(
 )
 
 # --- Configuration Constants ---
-MAX_CONCURRENT_TASKS = 5
+MAX_CONCURRENT_TASKS = 2
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
