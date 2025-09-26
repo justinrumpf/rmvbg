@@ -73,7 +73,7 @@ REMBG_PREFERRED_GPU_PROVIDERS = ['CUDAExecutionProvider', 'DmlExecutionProvider'
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
 
-MAX_CONCURRENT_TASKS = 16     # 16 async workers for I/O operations
+MAX_CONCURRENT_TASKS = 12    # 16 async workers for I/O operations
 MAX_QUEUE_SIZE = 5000
 ESTIMATED_TIME_PER_JOB = 15
 TARGET_SIZE = 1024
@@ -81,8 +81,8 @@ HTTP_CLIENT_TIMEOUT = 30.0
 DEFAULT_MODEL_NAME = "u2net"
 
 # Thread pool configuration - optimized for 32 vCPU
-CPU_THREAD_POOL_SIZE = 12     # rembg is CPU-intensive
-PIL_THREAD_POOL_SIZE = 8      # PIL post-processing
+CPU_THREAD_POOL_SIZE = 8     # rembg is CPU-intensive
+PIL_THREAD_POOL_SIZE = 6      # PIL post-processing
 rembg_session = None
 session_lock = threading.Lock()
 
