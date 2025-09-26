@@ -10,6 +10,7 @@ import time
 import psutil
 import threading
 import warnings
+from typing import List
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -105,7 +106,8 @@ EXPECTED_API_KEY = "secretApiKey"
 
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
-active_rembg_providers: list[str] = list(REMBG_CPU_PROVIDERS)
+from typing import List
+active_rembg_providers: List[str] = list(REMBG_CPU_PROVIDERS)
 
 server_start_time = time.time()
 job_history = []
