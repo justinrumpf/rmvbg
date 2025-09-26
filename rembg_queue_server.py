@@ -73,7 +73,7 @@ HTTP_CLIENT_TIMEOUT = 30.0
 DEFAULT_MODEL_NAME = "birefnet"
 
 # --- GPU Configuration for Rembg ---
-REMBG_USE_GPU = True
+REMBG_USE_GPU = False
 REMBG_PREFERRED_GPU_PROVIDERS = ['CUDAExecutionProvider', 'DmlExecutionProvider']
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
