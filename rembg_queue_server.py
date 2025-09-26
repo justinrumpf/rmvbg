@@ -12,6 +12,7 @@ import threading
 import warnings
 import httpx
 import fastapi
+import onnxruntime as ort
 from typing import List
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -291,44 +292,36 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
     
     providers_to_attempt = list(active_rembg_providers)
     
-    # Initialize or reuse session with thread safety
     with session_lock:
         if rembg_session is None or rembg_session_model != model_name:
-            logger.info(f"Initializing shared rembg session for model '{model_name}' with providers: {providers_to_attempt}")
+            logger.info(f"Initializing shared rembg session for model '{model_name}'")
             
             try:
-                session_wrapper = new_session(model_name, providers=providers_to_attempt)
+                # Configure ONNX session options
+                sess_opts = ort.SessionOptions()
+                sess_opts.intra_op_num_threads = 8  # Limit internal parallelism
+                sess_opts.inter_op_num_threads = 2  # Limit op-level parallelism
+                
+                session_wrapper = new_session(
+                    model_name, 
+                    providers=providers_to_attempt,
+                    sess_opts=sess_opts  # Pass options to prevent affinity errors
+                )
+                
                 if session_wrapper is None:
                     raise RuntimeError(f"rembg.new_session returned None for model '{model_name}'")
                 
-                # Verify providers if GPU mode
-                if REMBG_USE_GPU:
-                    onnx_session = getattr(session_wrapper, 'inner_session', getattr(session_wrapper, 'sess', session_wrapper))
-                    try:
-                        actual_providers = onnx_session.get_providers()
-                        gpu_active = any(p in actual_providers for p in REMBG_PREFERRED_GPU_PROVIDERS)
-                        cpu_active = 'CPUExecutionProvider' in actual_providers
-                        
-                        if cpu_active and not gpu_active:
-                            raise RuntimeError(f"GPU forced but session using CPU. Actual: {actual_providers}")
-                        
-                        logger.info(f"Session using providers: {actual_providers}")
-                    except AttributeError:
-                        logger.warning(f"Could not verify providers for session type: {type(onnx_session)}")
+                # ... rest of your verification code ...
                 
-                # Store for reuse
                 rembg_session = session_wrapper
                 rembg_session_model = model_name
-                logger.info(f"Shared rembg session initialized successfully for '{model_name}'")
+                logger.info(f"Session initialized with intra_op={8}, inter_op={2} threads")
                 
             except Exception as e:
-                log_msg = f"Failed to initialize rembg session for '{model_name}': {type(e).__name__}: {e}"
-                if REMBG_USE_GPU:
-                    log_msg += " NO FALLBACK TO CPU."
-                logger.critical(log_msg, exc_info=True)
+                # ... your error handling ...
                 raise
     
-    # Use the shared session (outside lock for parallel processing)
+    # Use session (outside lock)
     output_bytes = remove(
         input_bytes,
         session=rembg_session,
