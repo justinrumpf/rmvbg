@@ -10,6 +10,8 @@ import time
 import psutil
 import threading
 import warnings
+import httpx
+import fastapi
 from typing import List
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
