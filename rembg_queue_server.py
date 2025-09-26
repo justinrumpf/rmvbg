@@ -65,28 +65,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Configuration Constants ---
-MAX_CONCURRENT_TASKS = 2
-MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 15
-TARGET_SIZE = 1024
-HTTP_CLIENT_TIMEOUT = 30.0
-DEFAULT_MODEL_NAME = "birefnet"
-
 # --- GPU Configuration for Rembg ---
 REMBG_USE_GPU = False
 REMBG_PREFERRED_GPU_PROVIDERS = ['CUDAExecutionProvider', 'DmlExecutionProvider']
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
 
+MAX_CONCURRENT_TASKS = 16     # 16 async workers for I/O operations
+MAX_QUEUE_SIZE = 5000
+ESTIMATED_TIME_PER_JOB = 15
+TARGET_SIZE = 1024
+HTTP_CLIENT_TIMEOUT = 30.0
+DEFAULT_MODEL_NAME = "u2net"
+
+# Thread pool configuration - optimized for 32 vCPU
+CPU_THREAD_POOL_SIZE = 12     # rembg is CPU-intensive
+PIL_THREAD_POOL_SIZE = 8      # PIL post-processing
+
+
 # --- Monitoring Configuration ---
 MONITORING_HISTORY_MINUTES = 60
 MONITORING_SAMPLE_INTERVAL = 5
 MAX_MONITORING_SAMPLES = (MONITORING_HISTORY_MINUTES * 60) // MONITORING_SAMPLE_INTERVAL
-
-# Thread pool configuration
-CPU_THREAD_POOL_SIZE = 2
-PIL_THREAD_POOL_SIZE = 2
 
 ENABLE_LOGO_WATERMARK = False
 LOGO_MAX_WIDTH = 150
