@@ -12,7 +12,7 @@ aiofiles
 Pillow
 requests
 httpx
-
+psutil
 numpy
 scipy
 opencv-python
