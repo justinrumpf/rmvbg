@@ -113,7 +113,7 @@ EXPECTED_API_KEY = "secretApiKey"
 cpu_executor: ThreadPoolExecutor = None
 pil_executor: ThreadPoolExecutor = None
 from typing import List
-active_rembg_providers: List[str] = list(REMBG_CPU_PROVIDERS)
+active_rembg_providers: List[str] = list(REMBG_PREFERRED_GPU_PROVIDERS)
 
 server_start_time = time.time()
 job_history = []
