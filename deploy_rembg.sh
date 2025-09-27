@@ -3,23 +3,22 @@
 set -e
 
 echo "🔧 Updating system packages..."
-apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip nano
+apt update && apt install -y python3-pip python3-venv ffmpeg git curl tmux unzip cuda-libraries-12-0 nano
 
 cd /workspace
 
-# Clone or update the repo
+# Clone the repo if it doesn't exist
 if [ -d "rmvbg" ]; then
-    echo "📥 Updating existing rmvbg repository..."
-    cd rmvbg
-    git fetch origin
-    git reset --hard origin/main  # or origin/master, depending on your branch
-    cd ..
+    echo "⚠️  Directory 'rmvbg' already exists. Skipping clone."
 else
-    echo "📥 Cloning rmvbg repository..."
     git -c credential.helper= clone https://github.com/justinrumpf/rmvbg.git
 fi
 
 cd rmvbg
+
+# 🔁 Prompt for Pod ID and update Python file
+# read -p "🌐 Enter your RunPod Pod ID (e.g., abc123): " pod_id
+# proxy_url="https://${pod_id}-7000.proxy.runpod.net"
 
 # Use POD ID in proxy url
 proxy_url="https://${RUNPOD_POD_ID}-7000.proxy.runpod.net"
