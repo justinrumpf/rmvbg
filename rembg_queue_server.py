@@ -69,22 +69,24 @@ app.add_middleware(
 )
 
 # --- GPU Configuration for Rembg ---
-REMBG_USE_GPU = False
+REMBG_USE_GPU = True
 REMBG_PREFERRED_GPU_PROVIDERS = ['CUDAExecutionProvider', 'DmlExecutionProvider']
 REMBG_CPU_PROVIDERS = ['CPUExecutionProvider']
 
 
-MAX_CONCURRENT_TASKS = 12    # 16 async workers for I/O operations
+MAX_CONCURRENT_TASKS = 4      # GPU can only handle a few jobs simultaneously
 MAX_QUEUE_SIZE = 5000
-ESTIMATED_TIME_PER_JOB = 15
+ESTIMATED_TIME_PER_JOB = 2    # GPU is much faster, ~2-3 seconds per job
 TARGET_SIZE = 1024
 HTTP_CLIENT_TIMEOUT = 30.0
-DEFAULT_MODEL_NAME = "u2net"
+DEFAULT_MODEL_NAME = "birefnet-general"  # Use birefnet now that GPU works
 
-# Thread pool configuration - optimized for 32 vCPU
-CPU_THREAD_POOL_SIZE = 8     # rembg is CPU-intensive
-PIL_THREAD_POOL_SIZE = 6      # PIL post-processing
+# Thread pools not really needed with GPU + session reuse
+CPU_THREAD_POOL_SIZE = 1      # Just for executor
+PIL_THREAD_POOL_SIZE = 4      # PIL still benefits from some parallelism
+
 rembg_session = None
+rembg_session_model = None    # You're missing this variable
 session_lock = threading.Lock()
 
 # --- Monitoring Configuration ---
@@ -287,41 +289,22 @@ def get_requester_ip(request: Request) -> str:
     # logger.warning("Could not determine client IP. Using 'unknown_client'.")
     return "unknown_client"
 
+
 def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
-    global active_rembg_providers, rembg_session, rembg_session_model
-    
-    providers_to_attempt = list(active_rembg_providers)
+    global rembg_session, rembg_session_model
     
     with session_lock:
         if rembg_session is None or rembg_session_model != model_name:
             logger.info(f"Initializing shared rembg session for model '{model_name}'")
             
-            try:
-                # Configure ONNX session options
-                sess_opts = ort.SessionOptions()
-                sess_opts.intra_op_num_threads = 8  # Limit internal parallelism
-                sess_opts.inter_op_num_threads = 2  # Limit op-level parallelism
-                
-                session_wrapper = new_session(
-                    model_name, 
-                    providers=providers_to_attempt,
-                    sess_opts=sess_opts  # Pass options to prevent affinity errors
-                )
-                
-                if session_wrapper is None:
-                    raise RuntimeError(f"rembg.new_session returned None for model '{model_name}'")
-                
-                # ... rest of your verification code ...
-                
-                rembg_session = session_wrapper
-                rembg_session_model = model_name
-                logger.info(f"Session initialized with intra_op={8}, inter_op={2} threads")
-                
-            except Exception as e:
-                # ... your error handling ...
-                raise
+            # Create session with GPU providers
+            rembg_session = new_session(
+                model_name,
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            )
+            rembg_session_model = model_name
+            logger.info(f"Session initialized successfully")
     
-    # Use session (outside lock)
     output_bytes = remove(
         input_bytes,
         session=rembg_session,
@@ -329,6 +312,7 @@ def process_rembg_sync(input_bytes: bytes, model_name: str) -> bytes:
         alpha_matting=True
     )
     return output_bytes
+
 
 def process_pil_sync(input_bytes: bytes, target_size: int, prepared_logo: Image.Image = None, enable_logo: bool = False, logo_margin: int = 20) -> bytes:
     img_rgba = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
